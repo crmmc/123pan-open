@@ -1,6 +1,5 @@
-<div align="center">
-  <img src="src/icon.ico" alt="123pan" width="120" height="120">
-  
+<div align="center">  
+
   # 🚀 [123pan](https://www.123panng.top)
   
   <p>突破限制 · 高效下载 · 简单易用</p>
@@ -12,35 +11,58 @@
     <a href="https://github.com/Qxyz17/123pan/releases"><img src="https://img.shields.io/github/downloads/Qxyz17/123pan/total" alt="Downloads"></a>
   </div>
   <br>
-  <img src="./doc/img/image.png" width="600"><img>
+  <img src="./doc/image.png" width="600"><img>
 
 </div>
 
 ## 介绍
 123pan是一款基于Python开发的高效下载辅助工具，通过模拟安卓客户端协议，帮助用户绕过123云盘的自用下载流量限制，实现无阻碍下载体验。
 
-## 项目结构
+## 项目源码结构
 ```
 .
-├── doc
-│   └── img
-│       └── image.png
-├── LICENSE
-├── README.md
-└── src
-    ├── 123pan.py
-    ├── api.py
-    ├── config.py
-    ├── icon.ico
-    ├── log.py
-    ├── main_window.py
-    ├── requirements.txt
-    ├── themes.py
-    ├── threading_utils.py
-    ├── ui_theme_manager.py
-    └── ui_widgets.py
+├── 123pan.pro
+├── 123pan.py
+├── app
+│   ├── common
+│   │   ├── api.py
+│   │   ├── config.py
+│   │   ├── log.py
+│   │   ├── resource.py
+│   │   └── style_sheet.py
+│   ├── resource
+│   │   ├── qss
+│   │   │   ├── dark
+│   │   │   │   ├── gallery_interface.qss
+│   │   │   │   ├── home_interface.qss
+│   │   │   │   ├── icon_interface.qss
+│   │   │   │   ├── link_card.qss
+│   │   │   │   ├── navigation_view_interface.qss
+│   │   │   │   ├── sample_card.qss
+│   │   │   │   ├── setting_interface.qss
+│   │   │   │   └── view_interface.qss
+│   │   │   └── light
+│   │   │       ├── gallery_interface.qss
+│   │   │       ├── home_interface.qss
+│   │   │       ├── icon_interface.qss
+│   │   │       ├── link_card.qss
+│   │   │       ├── navigation_view_interface.qss
+│   │   │       ├── sample_card.qss
+│   │   │       ├── setting_interface.qss
+│   │   │       └── view_interface.qss
+│   │   └── resource.qrc
+│   └── view
+│       ├── file_interface.py
+│       ├── login_window.py
+│       ├── main_window.py
+│       ├── setting_interface.py
+│       └── transfer_interface.py
+├── build.sh
+├── requirements.txt
+├── resource_build.bat
+└── resource_build.sh
 
-4 directories, 14 files
+8 directories, 33 files
 ```
 
 ## 使用
@@ -48,7 +70,7 @@
 如果你的电脑是windows系统或者linux发行版，可以直接下载打包后的文件并运行。  
 下载地址：
 - Github: https://github.com/123panNextGen/123pan/releases/
-- Website(CloudFlare cdn): https://download.123panng.top/
+- Website(CloudFlare CDN, 更新可能不及时): https://download.123panng.top/
 
 其他系统以及开发请参考下方的源码运行。
 

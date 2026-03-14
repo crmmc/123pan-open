@@ -1,6 +1,3 @@
-# https://github.com/123panNextGen/123pan
-# src/log.py
-
 import logging
 import platform
 import os
