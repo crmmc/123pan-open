@@ -1,37 +1,64 @@
-from PyQt6.QtCore import Qt, pyqtSignal, QEasingCurve, QUrl, QSize, QTimer
-from PyQt6.QtGui import QIcon, QDesktopServices, QColor
-from PyQt6.QtWidgets import QApplication, QHBoxLayout, QFrame, QWidget, QDialog, QMessageBox, QVBoxLayout, QFormLayout, QLineEdit, QPushButton
+from PyQt6.QtCore import Qt
+from PyQt6.QtWidgets import QApplication, QVBoxLayout, QFormLayout, QHBoxLayout, QDialog
 
-from qfluentwidgets import (NavigationAvatarWidget, NavigationItemPosition, MessageBox, FluentWindow,
-                            SplashScreen, SystemThemeListener, isDarkTheme)
-from qfluentwidgets import FluentIcon as FIF
+from qfluentwidgets import (
+    LineEdit,
+    PrimaryPushButton,
+    PushButton,
+    MessageBox,
+    TitleLabel,
+)
 
 from ..common.api import Pan123
 from ..common.config import ConfigManager
 
+
 class LoginDialog(QDialog):
     """登录对话框"""
-    
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("登录123云盘")
-        self.resize(420, 150)
-        self.setWindowFlags(self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint)
+        self.resize(420, 220)
+        self.setWindowFlags(
+            self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
+        )
 
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(40, 30, 40, 30)
+        layout.setSpacing(20)
+
+        # 标题
+        title = TitleLabel("欢迎使用123云盘")
+        layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
 
         form = QFormLayout()
-        self.le_user = QLineEdit()
-        self.le_pass = QLineEdit()
-        self.le_pass.setEchoMode(QLineEdit.EchoMode.Password)
-        form.addRow("用户名：", self.le_user)
-        form.addRow("密码：", self.le_pass)
+        form.setSpacing(15)
+
+        # 用户名输入框
+        self.le_user = LineEdit()
+        self.le_user.setPlaceholderText("请输入用户名")
+        form.addRow("用户名", self.le_user)
+
+        # 密码输入框
+        self.le_pass = LineEdit()
+        self.le_pass.setPlaceholderText("请输入密码")
+        self.le_pass.setEchoMode(LineEdit.EchoMode.Password)
+        form.addRow("密码", self.le_pass)
+
         layout.addLayout(form)
 
         h = QHBoxLayout()
         h.addStretch()
-        self.btn_ok = QPushButton("登录")
-        self.btn_cancel = QPushButton("取消")
+
+        # 登录按钮
+        self.btn_ok = PrimaryPushButton("登录")
+        self.btn_ok.setMinimumWidth(100)
+
+        # 取消按钮
+        self.btn_cancel = PushButton("取消")
+        self.btn_cancel.setMinimumWidth(100)
+
         h.addWidget(self.btn_ok)
         h.addWidget(self.btn_cancel)
         layout.addLayout(h)
@@ -48,7 +75,7 @@ class LoginDialog(QDialog):
 
     def on_ok(self):
         """登录处理"""
-        
+
         user = self.le_user.text().strip()
         pwd = self.le_pass.text()
         if not user or not pwd:
@@ -58,9 +85,13 @@ class LoginDialog(QDialog):
         try:
             # 构造123pan并登录
             try:
-                self.pan = Pan123(readfile=False, user_name=user, pass_word=pwd, input_pwd=False)
+                self.pan = Pan123(
+                    readfile=False, user_name=user, pass_word=pwd, input_pwd=False
+                )
             except Exception:
-                self.pan = Pan123(readfile=False, user_name=user, pass_word=pwd, input_pwd=False)
+                self.pan = Pan123(
+                    readfile=False, user_name=user, pass_word=pwd, input_pwd=False
+                )
             if not getattr(self.pan, "authorization", None):
                 code = self.pan.login()
                 if code != 200 and code != 0:
