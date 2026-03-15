@@ -1,5 +1,5 @@
 import importlib
-import os
+from pathlib import Path
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtCore import QRunnable, QThreadPool, pyqtSignal, QObject
@@ -512,8 +512,9 @@ class FileInterface(QWidget):
         if file_paths:
             # 添加上传任务到传输界面
             for file_path in file_paths:
-                file_name = os.path.basename(file_path)
-                file_size = os.path.getsize(file_path)
+                path = Path(file_path)
+                file_name = path.name
+                file_size = path.stat().st_size
                 if self.transfer_interface:
                     self.transfer_interface.add_upload_task(
                         file_name, file_size, file_path, self.current_dir_id
@@ -550,7 +551,7 @@ class FileInterface(QWidget):
         # 获取配置
         ask_download_location = ConfigManager.get_setting("askDownloadLocation", True)
         default_download_path = ConfigManager.get_setting(
-            "defaultDownloadPath", os.path.join(os.path.expanduser("~"), "Downloads")
+            "defaultDownloadPath", str(Path.home() / "Downloads")
         )
 
         save_path = None

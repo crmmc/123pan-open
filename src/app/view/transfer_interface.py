@@ -8,7 +8,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QCoreApplication
 from PyQt6.QtGui import QFont
-import os
+from pathlib import Path
 import requests
 
 # 导入Pan123类
@@ -214,11 +214,12 @@ class DownloadThread(QThread):
         """从URL下载文件"""
 
         # 确保保存路径存在
-        if not os.path.exists(save_path):
-            os.makedirs(save_path)
+        save_dir = Path(save_path)
+        if not save_dir.exists():
+            save_dir.mkdir(parents=True, exist_ok=True)
 
-        file_path = os.path.join(save_path, file_name)
-        temp_path = file_path + ".tmp"
+        file_path = save_dir / file_name
+        temp_path = file_path.with_suffix(file_path.suffix + ".tmp")
 
         # 发送请求
         response = requests.get(url, stream=True, timeout=30)
@@ -241,16 +242,16 @@ class DownloadThread(QThread):
                                 last_progress = progress
 
             # 重命名临时文件
-            if os.path.exists(temp_path):
-                if os.path.exists(file_path):
-                    os.remove(file_path)
-                os.rename(temp_path, file_path)
+            if temp_path.exists():
+                if file_path.exists():
+                    file_path.unlink()
+                temp_path.rename(file_path)
             else:
                 raise Exception("临时文件不存在")
         except Exception as e:
             # 清理临时文件
-            if os.path.exists(temp_path):
-                os.remove(temp_path)
+            if temp_path.exists():
+                temp_path.unlink()
             raise e
 
 
