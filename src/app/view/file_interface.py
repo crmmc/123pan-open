@@ -16,7 +16,9 @@ from PyQt6.QtWidgets import (
     QTableWidgetItem,
     QInputDialog,
     QFileDialog,
+    QMenu,
 )
+from PyQt6.QtGui import QAction
 
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
@@ -25,6 +27,7 @@ from qfluentwidgets import (
     TreeWidget,
     PushButton,
     InfoBar,
+    Action,
 )
 
 from ..common.style_sheet import StyleSheet
@@ -137,6 +140,9 @@ class FileInterface(QWidget):
     def __initWidget(self):
         StyleSheet.VIEW_INTERFACE.apply(self)
         self.__connectSignalToSlot()
+        # 为文件表格添加右键菜单
+        self.fileTable.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.fileTable.customContextMenuRequested.connect(self.__onFileTableContextMenu)
         self.__loadPanAndData()
 
     def __connectSignalToSlot(self):
@@ -715,3 +721,24 @@ class FileInterface(QWidget):
             else:
                 # 显示错误信息
                 InfoBar.error(title="删除失败", content="文件不存在", parent=self)
+
+    def __onFileTableContextMenu(self, position):
+        """文件表格右键菜单"""
+        # 获取鼠标点击位置的行
+        index = self.fileTable.indexAt(position)
+        if not index.isValid():
+            return
+
+        # 选择右键点击的行
+        self.fileTable.selectRow(index.row())
+
+        # 创建右键菜单
+        menu = QMenu(self)
+
+        # 添加删除菜单项
+        delete_action = QAction(FIF.DELETE.icon(), "删除", self)
+        delete_action.triggered.connect(self.__deleteFile)
+        menu.addAction(delete_action)
+
+        # 显示菜单
+        menu.exec(self.fileTable.mapToGlobal(position))

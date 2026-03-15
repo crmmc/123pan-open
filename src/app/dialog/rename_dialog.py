@@ -37,6 +37,7 @@ class NewFolderDialog(QDialog):
         self.name_input = LineEdit()
         self.name_input.setText("新建文件夹")
         self.name_input.selectAll()
+        self.name_input.returnPressed.connect(self.accept)
         layout.addWidget(self.name_input)
 
         # 按钮布局
