@@ -19,7 +19,8 @@ class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("登录123云盘")
-        self.resize(420, 220)
+        self.resize(460, 320)
+        self.setFixedSize(460, 320)
         self.setWindowFlags(
             self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
         )
