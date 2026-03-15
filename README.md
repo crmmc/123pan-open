@@ -5,10 +5,12 @@
   <p>突破限制 · 高效下载 · 简单易用</p>
   
   <div>
-    <a href="https://github.com/Qxyz17/123pan/stargazers"><img src="https://img.shields.io/github/stars/Qxyz17/123pan" alt="Stars"></a>
-    <a href="https://github.com/Qxyz17/123pan/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
-    <a href="https://www.python.org/"><img src="https://img.shields.io/badge/python-3.12%2B-blue" alt="Python Version"></a>
-    <a href="https://github.com/Qxyz17/123pan/releases"><img src="https://img.shields.io/github/downloads/Qxyz17/123pan/total" alt="Downloads"></a>
+    <a href="https://github.com/123pannextgen/123pan/stargazers"><img src="https://img.shields.io/github/stars/123pannextgen/123pan" alt="Stars"></a>
+    <a href="https://github.com/123pannextgen/123pan/issues"><img src="https://img.shields.io/github/issues/123pannextgen/123pan"></a>
+    <a href="https://github.com/123pannextgen/123pan/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
+    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue" alt="Python Version"></a>
+    <a href="https://github.com/123pannextgen/123pan/releases"><img src="https://img.shields.io/github/v/tag/123pannextgen/123pan?label=release" alt="latest_release"></a>
+    <a href="https://github.com/123pannextgen/123pan/releases"><img src="https://img.shields.io/github/downloads/123pannextgen/123pan/total" alt="Downloads"></a>
   </div>
   <br>
   <img src="./doc/image.png" width="600"><img>
@@ -23,6 +25,8 @@
 
 ```
 src
+├── 123pan.pro
+├── 123pan.py
 ├── app
 │   ├── common
 │   │   ├── api.py
@@ -30,10 +34,6 @@ src
 │   │   ├── log.py
 │   │   ├── resource.py
 │   │   └── style_sheet.py
-│   ├── dialog
-│   │   ├── __init__.py
-│   │   └── rename_dialog.py
-│   ├── download
 │   ├── resource
 │   │   ├── qss
 │   │   │   ├── dark
@@ -59,13 +59,14 @@ src
 │       ├── file_interface.py
 │       ├── login_window.py
 │       ├── main_window.py
+│       ├── rename_window.py
 │       ├── setting_interface.py
 │       └── transfer_interface.py
-├── 123pan.pro
-├── 123pan.py
 ├── build.sh
 ├── resource_build.bat
 └── resource_build.sh
+
+8 directories, 33 files
 ```
 
 ## 使用
@@ -104,7 +105,7 @@ uv run src/123pan.py
 
 ## 技术说明
 
-默认会在系统`C:\Users%USERNAME%\AppData\Roaming\Qxyz17\123pan`或`~/.config/Qxyz17/123pan`创建配置文件和日志。
+默认会在系统`C:\Users%USERNAME%\AppData\Roaming\123pannextgen\123pan`或`~/.config/123pannextgen/123pan`创建配置文件和日志。
 
 ```json
 {
@@ -113,6 +114,7 @@ uv run src/123pan.py
   "authorization": "令牌",
   "deviceType": "驱动类型",
   "osVersion": "安卓版本",
+  "loginuuid": "登陆UUID" ，
   "settings": {
     "defaultDownloadPath": "默认下载路径",
     "askDownloadLocation": 开关
@@ -136,14 +138,14 @@ uv run src/123pan.py
 - 不要提交未测试的代码
 - 不要提交无意义的内容
 - 不要提交涉及隐私的内容
-- 请向dev分支提交pr
+- 不要向main分支提交pr
 
 我们还提供了开发交流群，可以在用户交流群中联系管理员获得。
 
 ## 使用协议
 
 本程序使用[Apache 2.0](./LICENSE)协议。  
-本工具仅用于学习研究，请勿用于商业用途，使用者需遵守123云盘用户协议，滥用可能导致账号限制。
+**本工具仅用于学习研究，请勿用于商业用途，使用者需遵守123云盘用户协议，滥用可能导致账号限制。**
 
 ---
 
