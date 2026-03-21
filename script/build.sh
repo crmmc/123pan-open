@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-project=$(realpath $(dirname $0))
+project=$(realpath $(dirname $0)/..)
 
 if [ "$(uname -s)" = "Linux" ]; then
   OUT_NAME=123pan
