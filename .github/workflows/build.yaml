@@ -44,7 +44,7 @@ jobs:
       - name: Build with Nuitka
         working-directory: src
         run: |
-          bash ./build.sh
+          bash ../script/build.sh
         shell: bash
 
       # Windows artifact upload
