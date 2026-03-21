@@ -88,20 +88,25 @@ class LoginDialog(QDialog):
             return
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            # 构造123pan并登录（优先读取已保存的设备信息，避免每次创建新设备）
-            self.pan = Pan123(readfile=True, input_pwd=False)
+            # 读取配置文件中的用户名，判断是否是换账号登录
+            config = ConfigManager.load_config()
+            saved_user = config.get("userName", "")
 
-            # 覆盖用户名/密码（配置文件可能保存了旧账号）
-            self.pan.user_name = user
-            self.pan.password = pwd
+            # 如果是不同的账号，或者需要强制重新登录，则不使用旧的 authorization
+            if saved_user != user:
+                # 换账号登录，使用新的用户名密码，不读取旧的 authorization
+                self.pan = Pan123(readfile=False, user_name=user, password=pwd)
+            else:
+                # 同账号登录，优先读取已保存的设备信息，避免每次创建新设备
+                self.pan = Pan123(readfile=True, user_name=user, password=pwd)
 
-            if not getattr(self.pan, "authorization", None):
-                code = self.pan.login()
-                if code != 200 and code != 0:
-                    self.login_error = f"登录失败，返回码: {code}"
-                    QApplication.restoreOverrideCursor()
-                    MessageBox.critical(self, "登录失败", self.login_error)
-                    return
+            # 无论是否换账号，都尝试登录以确保 authorization 有效
+            code = self.pan.login()
+            if code != 200 and code != 0:
+                self.login_error = f"登录失败，返回码: {code}"
+                QApplication.restoreOverrideCursor()
+                MessageBox.critical(self, "登录失败", self.login_error)
+                return
         except Exception as e:
             self.login_error = str(e)
             QApplication.restoreOverrideCursor()

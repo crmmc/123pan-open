@@ -4,7 +4,7 @@
 
 # 版本信息
 YEAR = 2026
-VERSION = "3.0.2"
+VERSION = "3.0.3"
 ABOUT_URL = "https://github.com/123panNextGen/123pan"
 
 # 设备类型列表
