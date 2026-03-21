@@ -53,24 +53,9 @@ jobs:
           sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0
 
       - name: Build with Nuitka
-        # working-directory: src
-        shell: bash
         run: |
-          if [ "$RUNNER_OS" = "Windows" ]; then
-            OUTPUT="../123pan.exe"
-            EXTRA_ARGS="--windows-disable-console"
-          else
-            OUTPUT="../123pan"
-            EXTRA_ARGS=""
-          fi
-
-          uv run -m nuitka 123pan.py \
-            --onefile \
-            --enable-plugin=pyqt6 \
-            --assume-yes-for-downloads \
-            --lto=yes \
-            --output-filename="$OUTPUT" \
-            $EXTRA_ARGS
+          bash script/build.sh
+        shell: bash
 
       # Windows artifact upload
       - name: Upload Windows artifact
