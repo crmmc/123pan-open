@@ -4,6 +4,17 @@ on:
   push:
     tags:
       - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号 (例如: v3.0.3)'
+        required: true
+        type: string
+      prerelease:
+        description: '是否为预发布版本'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -42,9 +53,9 @@ jobs:
           sudo apt-get install -y libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 libxcb-render-util0 libxcb-shape0 libxcb-xfixes0 libxcb-xinerama0
           
       - name: Build with Nuitka
-        working-directory: src
+        # working-directory: src
         run: |
-          bash ../script/build.sh
+          bash ./script/build.sh
         shell: bash
 
       # Windows artifact upload
@@ -53,7 +64,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: 123pan-windows
-          path: src/123pan.exe
+          path: 123pan.exe
 
       # Linux artifact upload
       - name: Upload Linux artifact
@@ -61,12 +72,13 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: 123pan-linux
-          path: src/123pan
+          path: 123pan
 
   release:
     name: Create GitHub Release
     needs: build
     runs-on: ubuntu-latest
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Download Windows artifact
@@ -83,12 +95,21 @@ jobs:
           name: 123pan-linux
           path: ./artifacts/linux
 
+      - name: Set version for manual trigger
+        if: github.event_name == 'workflow_dispatch'
+        run: echo "VERSION=${{ github.event.inputs.version }}" >> $GITHUB_ENV
+
+      - name: Set version for push trigger
+        if: github.event_name == 'push'
+        run: echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          name: ${{ github.ref_name }}
+          tag_name: ${{ env.VERSION }}
+          name: ${{ env.VERSION }}
           files: |
             ./artifacts/windows/123pan.exe
             ./artifacts/linux/123pan
+          prerelease: ${{ github.event.inputs.prerelease || false }}
           generate_release_notes: false
