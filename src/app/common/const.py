@@ -7,6 +7,9 @@ YEAR = 2026
 VERSION = "3.0.3"
 ABOUT_URL = "https://github.com/123panNextGen/123pan"
 
+# 云盘最大容量（字节）默认 10TB
+MAX_STORAGE_CAPACITY = 10 * 1024 * 1024 * 1024 * 1024  # 10TB
+
 # 设备类型列表
 all_device_type = [
     "MI-ONE PLUS", "MI-ONE C1", "MI-ONE", "2012051", "2012053", "2012052", "2012061", "2012062", "2013012",

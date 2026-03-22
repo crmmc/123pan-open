@@ -27,12 +27,20 @@ from qfluentwidgets import (
     PushButton,
     InfoBar,
     Action,
+    CardWidget,
+    BodyLabel,
+    IconWidget,
+    ProgressBar,
 )
 
 from ..common.style_sheet import StyleSheet
 from ..common.api import format_file_size
+from ..common.const import MAX_STORAGE_CAPACITY
+from ..common.log import get_logger
 from .newfolder_window import NewFolderDialog
 from .rename_window import RenameDialog
+
+logger = get_logger(__name__)
 
 Pan123 = importlib.import_module("app.common.api").Pan123
 
@@ -104,12 +112,45 @@ class FileInterface(QWidget):
         self.treeFrame.setObjectName("frame")
         self.treeLayout = QVBoxLayout(self.treeFrame)
         self.treeLayout.setContentsMargins(0, 8, 0, 0)
-        self.treeLayout.setSpacing(0)
+        self.treeLayout.setSpacing(8)
 
         self.folderTree = TreeWidget(self.treeFrame)
         self.folderTree.setHeaderHidden(True)
         self.folderTree.setUniformRowHeights(True)
         self.treeLayout.addWidget(self.folderTree)
+
+        # 添加云盘占用大小卡片
+        self.storageCard = CardWidget(self.treeFrame)
+        self.storageLayout = QVBoxLayout(self.storageCard)
+        self.storageLayout.setContentsMargins(12, 8, 12, 8)
+        self.storageLayout.setSpacing(8)
+
+        # 第一行：图标、标签和容量文本
+        self.storageTopLayout = QHBoxLayout()
+        self.storageTopLayout.setSpacing(8)
+
+        self.storageIcon = IconWidget(FIF.CLOUD.icon(), self.storageCard)
+        self.storageIcon.setFixedSize(20, 20)
+        self.storageTopLayout.addWidget(self.storageIcon)
+
+        self.storageLabel = BodyLabel("云盘空间", self.storageCard)
+        self.storageTopLayout.addWidget(self.storageLabel)
+
+        self.storageValueLabel = BodyLabel("-- / --", self.storageCard)
+        self.storageValueLabel.setStyleSheet("font-size: 12px; color: gray;")
+        self.storageTopLayout.addWidget(self.storageValueLabel, 0, Qt.AlignmentFlag.AlignRight)
+
+        self.storageTopLayout.addStretch()
+        self.storageLayout.addLayout(self.storageTopLayout)
+
+        # 第二行：进度条
+        self.storageProgressBar = ProgressBar(self.storageCard)
+        self.storageProgressBar.setRange(0, 100)
+        self.storageProgressBar.setValue(0)
+        self.storageProgressBar.setFixedHeight(6)
+        self.storageLayout.addWidget(self.storageProgressBar)
+
+        self.treeLayout.addWidget(self.storageCard)
 
         self.listFrame = QFrame(self)
         self.listFrame.setObjectName("frame")
@@ -174,6 +215,8 @@ class FileInterface(QWidget):
             self.__loadCurrentList()
             self.__updateBreadcrumb()
             self.__updateBackButtonState()
+            # 统计并更新云盘存储信息
+            self.load_and_update_storage_info()
         except Exception as e:
             self.__setErrorBreadcrumb(f"初始化失败: {e}")
             self.backButton.setEnabled(False)
@@ -733,13 +776,13 @@ class FileInterface(QWidget):
 
         # 根据配置决定是否询问下载位置
         if ask_download_location:
-            # 选择保存文件
+            # 开启时：直接保存到默认目录，不询问文件名
+            save_path = str(Path(default_download_path) / file_name)
+        else:
+            # 关闭时：在默认目录下询问文件名
             save_path, _ = QFileDialog.getSaveFileName(
                 self, "保存文件", str(Path(default_download_path) / file_name)
             )
-        else:
-            # 直接使用默认下载位置
-            save_path = str(Path(default_download_path) / file_name)
 
         if save_path:
             # 获取文件大小
@@ -772,6 +815,8 @@ class FileInterface(QWidget):
     def __refreshFileList(self):
         """刷新文件列表"""
         self.__loadCurrentList()
+        # 同时更新云盘存储信息
+        self.load_and_update_storage_info()
 
     def __deleteFile(self, file_id=None, file_name=None):
         """删除文件"""
@@ -1099,3 +1144,103 @@ class FileInterface(QWidget):
 
         # 显示菜单
         menu.exec(self.fileTable.mapToGlobal(position))
+
+    def update_storage_info(self, used_text):
+        """更新云盘存储信息"""
+        max_capacity = MAX_STORAGE_CAPACITY
+        total_text = format_file_size(max_capacity)
+
+        # 解析 used_text 来获取字节数，用于计算百分比
+        # 格式示例: "1.5 GB", "512 MB", "2 KB", "1024 B"
+        try:
+            parts = used_text.split()
+            if len(parts) == 2:
+                value = float(parts[0])
+                unit = parts[1].upper()
+
+                # 转换为字节
+                if unit == "GB":
+                    used_bytes = int(value * 1024 * 1024 * 1024)
+                elif unit == "MB":
+                    used_bytes = int(value * 1024 * 1024)
+                elif unit == "KB":
+                    used_bytes = int(value * 1024)
+                else:  # B
+                    used_bytes = int(value)
+
+                # 计算使用百分比
+                usage_percent = (used_bytes / max_capacity * 100) if max_capacity > 0 else 0
+            else:
+                usage_percent = 0
+        except Exception as e:
+            logger.error(f"解析存储信息时发生错误: {e}")
+            usage_percent = 0
+
+        # 更新进度条
+        self.storageProgressBar.setValue(int(usage_percent))
+
+        # 更新文本显示
+        self.storageValueLabel.setText(f"{used_text} / {total_text}")
+
+    def calculate_total_storage(self, dir_id=0):
+        """
+        统计指定目录下的总存储使用量
+
+        Args:
+            dir_id: 目录ID，默认为0（根目录）
+
+        Returns:
+            格式化后的总存储使用量字符串（如 "1.5 GB"）
+        """
+        total_size_mb = 0.0
+
+        try:
+            # 获取当前目录的文件列表，使用 all=True 确保获取所有文件
+            code, items = self.pan.get_dir_by_id(dir_id, save=False, all=True, limit=1000)
+
+            if code != 0 or not items:
+                return "0 B"
+
+            # 遍历文件列表
+            for item in items:
+                file_size = int(item.get("Size", 0) or 0)
+                # 先转换为MB，再累计
+                file_size_mb = file_size / (1024 * 1024)
+                total_size_mb += file_size_mb
+
+        except Exception as e:
+            # 如果某个目录访问失败，返回0
+            logger.error(f"统计目录 {dir_id} 时发生错误: {e}")
+            return "0 B"
+
+        # 将MB转换回字节，然后格式化
+        total_size_bytes = int(total_size_mb * 1024 * 1024)
+        return format_file_size(total_size_bytes)
+
+    def load_and_update_storage_info(self):
+        """统计并更新云盘存储信息"""
+        if not self.pan:
+            return
+
+        # 创建后台任务来统计存储信息
+        class StorageTask(QRunnable):
+            class StorageSignals(QObject):
+                finished = pyqtSignal(str)  # formatted storage size string
+
+            def __init__(self, file_interface):
+                super().__init__()
+                self.file_interface = file_interface
+                self.signals = self.StorageSignals()
+
+            def run(self):
+                try:
+                    total_size = self.file_interface.calculate_total_storage(0)
+                    self.signals.finished.emit(total_size)
+                except Exception as e:
+                    logger.error(f"统计存储信息时发生错误: {e}")
+                    self.signals.finished.emit("0 B")
+
+        # 创建并启动任务
+        task = StorageTask(self)
+        task.signals.finished.connect(self.update_storage_info)
+        QThreadPool.globalInstance().start(task)

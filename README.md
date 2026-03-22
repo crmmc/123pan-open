@@ -24,49 +24,60 @@
 ## 项目源码结构
 
 ```
-src
-├── 123pan.pro
-├── 123pan.py
-├── app
-│   ├── common
-│   │   ├── api.py
-│   │   ├── config.py
-│   │   ├── log.py
-│   │   ├── resource.py
-│   │   └── style_sheet.py
-│   ├── resource
-│   │   ├── qss
-│   │   │   ├── dark
-│   │   │   │   ├── gallery_interface.qss
-│   │   │   │   ├── home_interface.qss
-│   │   │   │   ├── icon_interface.qss
-│   │   │   │   ├── link_card.qss
-│   │   │   │   ├── navigation_view_interface.qss
-│   │   │   │   ├── sample_card.qss
-│   │   │   │   ├── setting_interface.qss
-│   │   │   │   └── view_interface.qss
-│   │   │   └── light
-│   │   │       ├── gallery_interface.qss
-│   │   │       ├── home_interface.qss
-│   │   │       ├── icon_interface.qss
-│   │   │       ├── link_card.qss
-│   │   │       ├── navigation_view_interface.qss
-│   │   │       ├── sample_card.qss
-│   │   │       ├── setting_interface.qss
-│   │   │       └── view_interface.qss
-│   │   └── resource.qrc
-│   └── view
-│       ├── file_interface.py
-│       ├── login_window.py
-│       ├── main_window.py
-│       ├── rename_window.py
-│       ├── setting_interface.py
-│       └── transfer_interface.py
-├── build.sh
-├── resource_build.bat
-└── resource_build.sh
-
-8 directories, 33 files
+123pan
+├── config
+├── doc
+│   ├── api.md
+│   ├── image.png  (lfs)
+│   └── todo.md
+├── script
+│   ├── build.sh
+│   └── lint.sh
+├── src
+│   ├── app
+│   │   ├── common
+│   │   │   ├── api.py
+│   │   │   ├── config.py
+│   │   │   ├── const.py
+│   │   │   ├── log.py
+│   │   │   ├── resource.py
+│   │   │   └── style_sheet.py
+│   │   ├── resource
+│   │   │   ├── qss
+│   │   │   │   ├── dark
+│   │   │   │   │   ├── gallery_interface.qss
+│   │   │   │   │   ├── home_interface.qss
+│   │   │   │   │   ├── icon_interface.qss
+│   │   │   │   │   ├── link_card.qss
+│   │   │   │   │   ├── navigation_view_interface.qss
+│   │   │   │   │   ├── sample_card.qss
+│   │   │   │   │   ├── setting_interface.qss
+│   │   │   │   │   └── view_interface.qss
+│   │   │   │   └── light
+│   │   │   │       ├── gallery_interface.qss
+│   │   │   │       ├── home_interface.qss
+│   │   │   │       ├── icon_interface.qss
+│   │   │   │       ├── link_card.qss
+│   │   │   │       ├── navigation_view_interface.qss
+│   │   │   │       ├── sample_card.qss
+│   │   │   │       ├── setting_interface.qss
+│   │   │   │       └── view_interface.qss
+│   │   │   └── resource.qrc
+│   │   └── view
+│   │       ├── cloud_interface.py
+│   │       ├── file_interface.py
+│   │       ├── login_window.py
+│   │       ├── main_window.py
+│   │       ├── newfolder_window.py
+│   │       ├── rename_window.py
+│   │       ├── setting_interface.py
+│   │       └── transfer_interface.py
+│   ├── 123pan.pro
+│   └── 123pan.py
+├── LICENSE
+├── README.md
+├── pyproject.toml
+└── uv.lock
 ```
 
 ## 使用
