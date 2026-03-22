@@ -4,18 +4,7 @@ import platform
 import sys
 from pathlib import Path
 
-from qfluentwidgets import (
-    BoolValidator,
-    ConfigItem,
-    FolderListValidator,
-    FolderValidator,
-    OptionsConfigItem,
-    OptionsValidator,
-    QConfig,
-    RangeConfigItem,
-    RangeValidator,
-    Theme,
-)
+
 
 from .log import get_logger
 
@@ -25,39 +14,6 @@ logger = get_logger(__name__)
 def isWin11():
     return sys.platform == "win32" and sys.getwindowsversion().build >= 22000
 
-
-class Config(QConfig):
-    """Config of application"""
-
-    # folders
-    musicFolders = ConfigItem("Folders", "LocalMusic", [], FolderListValidator())
-    downloadFolder = ConfigItem(
-        "Folders", "Download", str(Path.home() / "Downloads"), FolderValidator()
-    )
-
-    # main window
-    micaEnabled = ConfigItem("MainWindow", "MicaEnabled", isWin11(), BoolValidator())
-    dpiScale = OptionsConfigItem(
-        "MainWindow",
-        "DpiScale",
-        "Auto",
-        OptionsValidator([1, 1.25, 1.5, 1.75, 2, "Auto"]),
-        restart=True,
-    )
-
-    # Material
-    blurRadius = RangeConfigItem(
-        "Material", "AcrylicBlurRadius", 15, RangeValidator(0, 40)
-    )
-
-    # software update
-    checkUpdateAtStartUp = ConfigItem(
-        "Update", "CheckUpdateAtStartUp", True, BoolValidator()
-    )
-
-
-cfg = Config()
-cfg.themeMode.value = Theme.AUTO
 
 # 配置文件路径
 if platform.system() == "Windows":

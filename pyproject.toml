@@ -13,7 +13,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["nuitka>=4.0.5"]
-lint = ["pylint>=4.0.5"]
+lint = ["pylint>=4.0.5", "mypy>=1.19.1"]
 
 [[tool.uv.index]]
 url = "https://mirrors.aliyun.com/pypi/simple/"

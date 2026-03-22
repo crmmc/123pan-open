@@ -1,3 +1,5 @@
+from pathlib import Path
+
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFileDialog
 from PyQt6.QtCore import Qt, QUrl
 from PyQt6.QtGui import QDesktopServices
@@ -12,7 +14,7 @@ from qfluentwidgets import (
 )
 from qfluentwidgets import FluentIcon as FIF
 
-from ..common.config import cfg, isWin11, ConfigManager
+from ..common.config import isWin11, ConfigManager
 from ..common.const import YEAR, ABOUT_URL, VERSION
 from ..common.style_sheet import StyleSheet
 
@@ -34,7 +36,7 @@ class SettingInterface(ScrollArea):
             self.tr("选择文件夹"),
             FIF.DOWNLOAD,
             self.tr("下载目录"),
-            cfg.get(cfg.downloadFolder),
+            ConfigManager.get_setting("defaultDownloadPath", str(Path.home() / "Downloads")),
             self.musicInThisPCGroup,
         )
 
@@ -55,7 +57,7 @@ class SettingInterface(ScrollArea):
             FIF.TRANSPARENT,
             self.tr("Mica 效果"),
             self.tr("在窗口和表面上应用半透明效果"),
-            cfg.micaEnabled,
+            isWin11(),
             self.personalGroup,
         )
 
@@ -109,10 +111,9 @@ class SettingInterface(ScrollArea):
     def __onDownloadFolderCardClicked(self):
         """download folder card clicked slot"""
         folder = QFileDialog.getExistingDirectory(self, self.tr("Choose folder"), "./")
-        if not folder or cfg.get(cfg.downloadFolder) == folder:
+        if not folder or ConfigManager.get_setting("defaultDownloadPath") == folder:
             return
 
-        cfg.set(cfg.downloadFolder, folder)
         self.downloadFolderCard.setContent(folder)
 
         # 同时更新默认下载位置
