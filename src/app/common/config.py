@@ -46,6 +46,8 @@ class ConfigManager:
             "settings": {
                 "defaultDownloadPath": str(Path.home() / "Downloads"),
                 "askDownloadLocation": True,
+                "retryMaxAttempts": 3,
+                "retryBackoffFactor": 0.5,
             },
         }
 

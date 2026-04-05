@@ -1,7 +1,9 @@
 import concurrent.futures
 import hashlib
 import json
+import math
 import os
+import queue
 import random
 import re
 import threading
@@ -10,12 +12,316 @@ import uuid
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 from .config import ConfigManager
 from .const import all_device_type, all_os_versions
 from .log import get_logger
 
 logger = get_logger(__name__)
+
+
+def _stream_download_from_url(
+    redirect_url, out_path, signals=None, task=None, overwrite=False
+):
+    """多线程/单线程流式下载核心函数。
+
+    从 redirect_url 下载文件到 out_path，支持：
+    - 多线程分片下载（>2MB 且服务端支持 Range）
+    - 暂停/取消（通过 task._pause_event / task.is_cancelled）
+    - 进度回调（通过 signals.progress.emit(int)）
+
+    Args:
+        redirect_url: 下载直链
+        out_path: 目标文件路径（Path 对象）
+        signals: 需要有 .progress.emit(int) 接口
+        task: 需要有 ._pause_event (threading.Event) 和 .is_cancelled (bool)
+        overwrite: True 时覆盖已存在文件，False 时抛 FileExistsError
+
+    Returns:
+        out_path 或 "已取消"
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    temp = out_path.with_suffix(out_path.suffix + ".123pan")
+
+    if out_path.exists():
+        if overwrite:
+            out_path.unlink()
+        else:
+            raise FileExistsError(str(out_path))
+
+    total = 0
+    accept_ranges = False
+    try:
+        head = requests.head(redirect_url, allow_redirects=True, timeout=30)
+        head.raise_for_status()
+        total = int(head.headers.get("Content-Length", 0) or 0)
+        accept_ranges = head.headers.get("Accept-Ranges", "").lower() == "bytes"
+    except Exception:
+        try:
+            with requests.get(redirect_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                total = int(r.headers.get("Content-Length", 0) or 0)
+                accept_ranges = (
+                    r.headers.get("Accept-Ranges", "").lower() == "bytes"
+                )
+        except Exception:
+            total = 0
+            accept_ranges = False
+
+    try:
+        if accept_ranges and total and total > 1024 * 1024 * 2:
+            # 自适应并发分片下载
+            PART_SIZE = 5 * 1024 * 1024  # 每个分片 5MB
+            num_parts = math.ceil(total / PART_SIZE)
+            io_chunk_size = min(
+                1024 * 1024, max(8192, PART_SIZE // 100)
+            )
+
+            max_allowed = ConfigManager.get_setting("maxDownloadThreads", 8)
+            max_allowed = min(max(1, int(max_allowed)), 16)
+
+            # 分片队列
+            part_queue = queue.Queue()
+            for i in range(num_parts):
+                start = i * PART_SIZE
+                end = min(start + PART_SIZE - 1, total - 1)
+                part_queue.put((i, start, end))
+
+            # 共享状态
+            downloaded = [0]
+            dl_lock = threading.Lock()
+            last_progress_time = [0]
+            active_workers = [0]
+            max_workers = [max_allowed]  # 遇 429 下调
+            failed = [False]
+            rate_limit_count = [0]  # 全局 429 计数，防止死循环
+            MAX_RATE_LIMITS = 50
+
+            def _notify_conn_info():
+                if signals and hasattr(signals, "conn_info"):
+                    signals.conn_info.emit(active_workers[0], max_workers[0])
+
+            def worker():
+                with dl_lock:
+                    active_workers[0] += 1
+                    _notify_conn_info()
+                try:
+                    while not failed[0]:
+                        if task and task.is_cancelled:
+                            return
+                        try:
+                            idx, start, end = part_queue.get_nowait()
+                        except queue.Empty:
+                            return
+
+                        part_path = Path(str(temp) + f".part{idx}")
+                        headers = {"Range": f"bytes={start}-{end}"}
+                        retry_count = 0  # 仅计网络错误，429 不计入
+                        success = False
+
+                        while retry_count < 3 and not failed[0]:
+                            if task:
+                                try:
+                                    task._pause_event.wait()
+                                except Exception:
+                                    pass
+                                if task.is_cancelled:
+                                    return
+                            try:
+                                with requests.get(
+                                    redirect_url,
+                                    headers=headers,
+                                    stream=True,
+                                    timeout=60,
+                                ) as r:
+                                    if r.status_code == 429:
+                                        # 429: 收缩并发上限，分片放回队列稍后重试
+                                        with dl_lock:
+                                            rate_limit_count[0] += 1
+                                            if rate_limit_count[0] > MAX_RATE_LIMITS:
+                                                logger.error("429 次数过多，下载终止")
+                                                failed[0] = True
+                                                return
+                                            new_max = max(1, active_workers[0] - 1)
+                                            if new_max < max_workers[0]:
+                                                max_workers[0] = new_max
+                                                logger.warning(
+                                                    f"429 限流，并发上限调整为 {new_max}"
+                                                )
+                                            _notify_conn_info()
+                                        # 分片放回队列
+                                        part_queue.put((idx, start, end))
+                                        # 全局冷却，让 CDN 恢复
+                                        time.sleep(2)
+                                        break  # 跳出重试循环，回到外层取下一个分片
+                                    r.raise_for_status()
+                                    with open(part_path, "wb") as pf:
+                                        for chunk in r.iter_content(
+                                            chunk_size=io_chunk_size
+                                        ):
+                                            if task:
+                                                try:
+                                                    task._pause_event.wait()
+                                                except Exception:
+                                                    pass
+                                                if task.is_cancelled:
+                                                    return
+                                            if chunk:
+                                                pf.write(chunk)
+                                                with dl_lock:
+                                                    downloaded[0] += len(chunk)
+                                                    ct = time.time()
+                                                    if (
+                                                        ct - last_progress_time[0]
+                                                        > 0.1
+                                                    ):
+                                                        if total and signals:
+                                                            signals.progress.emit(
+                                                                int(
+                                                                    downloaded[0]
+                                                                    * 100
+                                                                    / total
+                                                                )
+                                                            )
+                                                        last_progress_time[0] = ct
+                                    success = True
+                                    break
+                            except requests.exceptions.RequestException as e:
+                                retry_count += 1
+                                if retry_count >= 3:
+                                    logger.error(f"分片 {idx} 失败: {e}")
+                                    failed[0] = True
+                                    return
+                                logger.warning(
+                                    f"分片 {idx} 第 {retry_count} 次重试: {e}"
+                                )
+                                time.sleep(2**retry_count)
+
+                        # success 判断：只有非 429 原因才会到这里且 success=False
+                        # 429 时已通过 break 跳出，由外层 while 继续取任务
+                        if not success and not failed[0]:
+                            # 分片因非 429 原因失败（理论上不会到这里，但作为兜底）
+                            part_queue.put((idx, start, end))
+                            break
+                finally:
+                    with dl_lock:
+                        active_workers[0] -= 1
+                        _notify_conn_info()
+
+            # 渐进式启动 worker
+            threads = []
+            for i in range(max_allowed):
+                if part_queue.empty() or failed[0]:
+                    break
+                if task and task.is_cancelled:
+                    break
+                t = threading.Thread(
+                    target=worker, name=f"download_worker_{i}", daemon=True
+                )
+                threads.append(t)
+                t.start()
+                # 渐进探测间隔，给 CDN 反应时间
+                if i < max_allowed - 1 and not part_queue.empty():
+                    time.sleep(0.3)
+                    with dl_lock:
+                        if i + 1 >= max_workers[0]:
+                            break
+
+            for t in threads:
+                t.join()
+
+            if task and task.is_cancelled:
+                for i in range(num_parts):
+                    p = Path(str(temp) + f".part{i}")
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                return "已取消"
+
+            if failed[0]:
+                for i in range(num_parts):
+                    p = Path(str(temp) + f".part{i}")
+                    if p.exists():
+                        try:
+                            p.unlink()
+                        except OSError:
+                            pass
+                raise RuntimeError("分片下载失败")
+
+            # 合并分片文件
+            try:
+                with open(temp, "wb") as out_f:
+                    for i in range(num_parts):
+                        p = Path(str(temp) + f".part{i}")
+                        try:
+                            with open(p, "rb") as pf:
+                                while True:
+                                    chunk = pf.read(1024 * 1024)
+                                    if not chunk:
+                                        break
+                                    out_f.write(chunk)
+                            p.unlink()
+                        except OSError as e:
+                            logger.error(f"合并分片文件 {i} 时出错: {e}")
+                            if p.exists():
+                                try:
+                                    p.unlink()
+                                except OSError:
+                                    pass
+                            raise RuntimeError(f"合并分片文件失败: {e}")
+            except OSError as e:
+                logger.error(f"创建临时文件时出错: {e}")
+                raise RuntimeError("合并分片文件失败")
+
+            if task and task.is_cancelled:
+                if temp.exists():
+                    try:
+                        temp.unlink()
+                    except OSError:
+                        pass
+                return "已取消"
+
+            temp.replace(out_path)
+            return out_path
+        else:
+            with requests.get(redirect_url, stream=True, timeout=30) as r:
+                r.raise_for_status()
+                done = 0
+                with open(temp, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if task:
+                            try:
+                                task._pause_event.wait()
+                            except Exception:
+                                pass
+                            if task.is_cancelled:
+                                f.close()
+                                if temp.exists():
+                                    temp.unlink()
+                                return "已取消"
+                        if chunk:
+                            f.write(chunk)
+                            done += len(chunk)
+                            if total and signals:
+                                signals.progress.emit(int(done * 100 / total))
+            if task and task.is_cancelled:
+                if temp.exists():
+                    temp.unlink()
+                return "已取消"
+            temp.replace(out_path)
+            return out_path
+    except Exception:
+        if temp.exists():
+            try:
+                temp.unlink()
+            except Exception:
+                pass
+        raise
 
 
 class Pan123:
@@ -45,6 +351,17 @@ class Pan123:
         self.file_list = []
         self.dir_list = []
         self.name_dict = {}
+        # 创建带重试的 session，仅在网络错误时重试
+        retry = Retry(
+            total=ConfigManager.get_setting("retryMaxAttempts", 3),
+            backoff_factor=ConfigManager.get_setting("retryBackoffFactor", 0.5),
+            allowed_methods=["GET", "POST", "PUT", "HEAD"],
+            raise_on_status=False,
+        )
+        adapter = HTTPAdapter(max_retries=retry)
+        self.session = requests.Session()
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
         if readfile:
             self.read_ini(user_name, password, input_pwd, authorization)
         else:
@@ -77,7 +394,7 @@ class Pan123:
     def login(self):
         """登录123云盘账户并获取授权令牌"""
         data = {"type": 1, "passport": self.user_name, "password": self.password}
-        login_res = requests.post(
+        login_res = self.session.post(
             "https://www.123pan.com/b/api/user/sign_in",
             headers=self.header_logined,
             data=data,
@@ -166,7 +483,7 @@ class Pan123:
                 "OnlyLookAbnormalFile": 0,
             }
             try:
-                a = requests.get(
+                a = self.session.get(
                     base_url, headers=self.header_logined, params=params, timeout=30
                 )
             except requests.exceptions.Timeout:
@@ -247,7 +564,7 @@ class Pan123:
                 "size": file_detail["Size"],
             }
 
-        link_res = requests.post(
+        link_res = self.session.post(
             down_request_url,
             headers=self.header_logined,
             data=json.dumps(down_request_data),
@@ -355,7 +672,7 @@ class Pan123:
             + str(recycle_id)
             + "&trashed=true&&Page=1"
         )
-        recycle_res = requests.get(url, headers=self.header_logined, timeout=10)
+        recycle_res = self.session.get(url, headers=self.header_logined, timeout=10)
         json_recycle = recycle_res.json()
         recycle_list = json_recycle["data"]["InfoList"]
         self.recycle_list = recycle_list
@@ -379,7 +696,7 @@ class Pan123:
             "fileTrashInfoList": file_detail,
             "operation": operation,
         }
-        delete_res = requests.post(
+        delete_res = self.session.post(
             "https://www.123pan.com/a/api/file/trash",
             data=json.dumps(data_delete),
             headers=self.header_logined,
@@ -401,7 +718,7 @@ class Pan123:
             bool: 是否成功
         """
         data = {"driveId": 0, "fileId": file_id, "fileName": new_name}
-        rename_res = requests.post(
+        rename_res = self.session.post(
             "https://www.123pan.com/a/api/file/rename",
             data=json.dumps(data),
             headers=self.header_logined,
@@ -429,7 +746,7 @@ class Pan123:
             "sharePwd": share_pwd or "",
             "event": "shareCreate",
         }
-        share_res = requests.post(
+        share_res = self.session.post(
             "https://www.123pan.com/a/api/share/create",
             headers=self.header_logined,
             data=json.dumps(data),
@@ -464,7 +781,7 @@ class Pan123:
             "duplicate": 0,
         }
 
-        up_res = requests.post(
+        up_res = self.session.post(
             "https://www.123pan.com/b/api/file/upload_request",
             headers=self.header_logined,
             data=list_up_request,
@@ -496,7 +813,7 @@ class Pan123:
             "uploadId": upload_id,
             "storageNode": storage_node,
         }
-        start_res = requests.post(
+        start_res = self.session.post(
             "https://www.123pan.com/b/api/file/s3_list_upload_parts",
             headers=self.header_logined,
             data=json.dumps(start_data),
@@ -530,7 +847,7 @@ class Pan123:
                 get_link_url = (
                     "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch"
                 )
-                get_link_res = requests.post(
+                get_link_res = self.session.post(
                     get_link_url,
                     headers=self.header_logined,
                     data=json.dumps(get_link_data),
@@ -554,7 +871,7 @@ class Pan123:
             "uploadId": upload_id,
             "storageNode": storage_node,
         }
-        requests.post(
+        self.session.post(
             uploaded_list_url,
             headers=self.header_logined,
             data=json.dumps(uploaded_comp_data),
@@ -563,7 +880,7 @@ class Pan123:
         compmultipart_up_url = (
             "https://www.123pan.com/b/api/file/s3_complete_multipart_upload"
         )
-        requests.post(
+        self.session.post(
             compmultipart_up_url,
             headers=self.header_logined,
             data=json.dumps(uploaded_comp_data),
@@ -574,7 +891,7 @@ class Pan123:
             time.sleep(3)
         close_up_session_url = "https://www.123pan.com/b/api/file/upload_complete"
         close_up_session_data = {"fileId": up_file_id}
-        close_up_session_res = requests.post(
+        close_up_session_res = self.session.post(
             close_up_session_url,
             headers=self.header_logined,
             data=json.dumps(close_up_session_data),
@@ -686,7 +1003,7 @@ class Pan123:
             "event": "newCreateFolder",
             "operateType": 1,
         }
-        res_mk = requests.post(
+        res_mk = self.session.post(
             url, headers=self.header_logined, data=json.dumps(data_mk), timeout=10
         )
         try:
@@ -732,216 +1049,9 @@ class Pan123:
             fname = file_detail["FileName"]
 
         out_path = Path(download_dir) / fname
-        temp = out_path.with_suffix(out_path.suffix + ".123pan")
-
-        Path(download_dir).mkdir(parents=True, exist_ok=True)
-
-        if out_path.exists():
-            # 由调用者决定覆盖行为
-            raise FileExistsError(str(out_path))
-
-        total = 0
-        accept_ranges = False
-        try:
-            head = requests.head(redirect_url, allow_redirects=True, timeout=30)
-            head.raise_for_status()
-            total = int(head.headers.get("Content-Length", 0) or 0)
-            accept_ranges = head.headers.get("Accept-Ranges", "").lower() == "bytes"
-        except Exception:
-            try:
-                with requests.get(redirect_url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    total = int(r.headers.get("Content-Length", 0) or 0)
-                    accept_ranges = (
-                        r.headers.get("Accept-Ranges", "").lower() == "bytes"
-                    )
-            except Exception:
-                total = 0
-                accept_ranges = False
-
-        try:
-            if accept_ranges and total and total > 1024 * 1024 * 2:
-                # 支持配置的线程数,默认最大8线程
-                from .config import ConfigManager
-
-                max_download_threads = ConfigManager.get_setting(
-                    "maxDownloadThreads", 8
-                )
-                max_download_threads = min(
-                    max(1, int(max_download_threads)), 16
-                )  # 限制在1-16之间
-
-                # 根据文件大小动态调整线程数
-                num_threads = min(
-                    max_download_threads,
-                    max(1, int(total / (10 * 1024 * 1024))),  # 每10MB使用一个线程
-                )
-
-                # 动态调整 chunk_size
-                chunk_size = min(
-                    1024 * 1024, max(8192, total // (num_threads * 100))
-                )  # 8KB - 1MB
-
-                part_size = total // num_threads
-                downloaded = [0]
-                dl_lock = threading.Lock()
-                last_progress_time = [0]  # 用于控制进度更新频率
-
-                def download_range(start, end, index):
-                    part_path = Path(str(temp) + f".part{index}")
-                    headers = {"Range": f"bytes={start}-{end}"}
-                    try:
-                        with requests.get(
-                            redirect_url, headers=headers, stream=True, timeout=30
-                        ) as r:
-                            r.raise_for_status()
-                            with open(part_path, "wb") as pf:
-                                for chunk in r.iter_content(chunk_size=chunk_size):
-                                    if task:
-                                        try:
-                                            task._pause_event.wait()
-                                        except Exception:
-                                            pass
-                                        if task.is_cancelled:
-                                            return False
-                                    if chunk:
-                                        pf.write(chunk)
-                                        with dl_lock:
-                                            downloaded[0] += len(chunk)
-                                            # 限制进度更新频率,避免过于频繁的UI更新
-                                            current_time = time.time()
-                                            if (
-                                                current_time - last_progress_time[0]
-                                                > 0.1
-                                            ):  # 每100ms更新一次
-                                                if total and signals:
-                                                    signals.progress.emit(
-                                                        int(downloaded[0] * 100 / total)
-                                                    )
-                                                last_progress_time[0] = current_time
-                        return True
-                    except requests.exceptions.RequestException as e:
-                        logger.error(f"下载分片 {index} 失败: {e}")
-                        if part_path.exists():
-                            try:
-                                part_path.unlink()
-                            except OSError:
-                                pass
-                        return False
-                    except Exception as e:
-                        logger.error(f"下载分片 {index} 时发生未知错误: {e}")
-                        if part_path.exists():
-                            try:
-                                part_path.unlink()
-                            except OSError:
-                                pass
-                        return False
-
-                futures = []
-                try:
-                    with concurrent.futures.ThreadPoolExecutor(
-                        max_workers=num_threads, thread_name_prefix="download_range"
-                    ) as exe:
-                        for i in range(num_threads):
-                            start = i * part_size
-                            end = (
-                                (start + part_size - 1)
-                                if i < num_threads - 1
-                                else (total - 1)
-                            )
-                            futures.append(exe.submit(download_range, start, end, i))
-
-                        ok = True
-                        for f in concurrent.futures.as_completed(futures):
-                            if not f.result():
-                                ok = False
-                                break
-
-                    if not ok:
-                        raise RuntimeError("分片下载失败")
-                except concurrent.futures.CancelledError:
-                    logger.warning("下载任务被取消")
-                    raise RuntimeError("下载任务被取消")
-
-                if task and task.is_cancelled:
-                    for i in range(num_threads):
-                        p = Path(str(temp) + f".part{i}")
-                        if p.exists():
-                            try:
-                                p.unlink()
-                            except OSError:
-                                pass
-                    return "已取消"
-
-                # 合并分片文件,使用更高效的方式
-                try:
-                    with open(temp, "wb") as out_f:
-                        for i in range(num_threads):
-                            p = Path(str(temp) + f".part{i}")
-                            try:
-                                with open(p, "rb") as pf:
-                                    while True:
-                                        chunk = pf.read(1024 * 1024)  # 使用更大的缓冲区
-                                        if not chunk:
-                                            break
-                                        out_f.write(chunk)
-                                p.unlink()
-                            except OSError as e:
-                                logger.error(f"合并分片文件 {i} 时出错: {e}")
-                                if p.exists():
-                                    try:
-                                        p.unlink()
-                                    except OSError:
-                                        pass
-                                raise RuntimeError(f"合并分片文件失败: {e}")
-                except OSError as e:
-                    logger.error(f"创建临时文件时出错: {e}")
-                    raise RuntimeError("合并分片文件失败")
-
-                if task and task.is_cancelled:
-                    if temp.exists():
-                        try:
-                            temp.unlink()
-                        except OSError:
-                            pass
-                    return "已取消"
-
-                temp.replace(out_path)
-                return out_path
-            else:
-                with requests.get(redirect_url, stream=True, timeout=30) as r:
-                    r.raise_for_status()
-                    done = 0
-                    with open(temp, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=8192):
-                            if task:
-                                try:
-                                    task._pause_event.wait()
-                                except Exception:
-                                    pass
-                                if task.is_cancelled:
-                                    f.close()
-                                    if temp.exists():
-                                        temp.unlink()
-                                    return "已取消"
-                            if chunk:
-                                f.write(chunk)
-                                done += len(chunk)
-                                if total and signals:
-                                    signals.progress.emit(int(done * 100 / total))
-                if task and task.is_cancelled:
-                    if temp.exists():
-                        temp.unlink()
-                    return "已取消"
-                temp.replace(out_path)
-                return out_path
-        except Exception:
-            if temp.exists():
-                try:
-                    temp.unlink()
-                except Exception:
-                    pass
-            raise
+        return _stream_download_from_url(
+            redirect_url, out_path, signals=signals, task=task
+        )
 
     def upload_file_stream(
         self, file_path, dup_choice=1, task_id=None, signals=None, task=None
@@ -981,12 +1091,12 @@ class Pan123:
         }
         url = "https://www.123pan.com/b/api/file/upload_request"
         headers = self.header_logined.copy()
-        res = requests.post(url, headers=headers, data=list_up_request, timeout=30)
+        res = self.session.post(url, headers=headers, data=list_up_request, timeout=30)
         res_json = res.json()
         code = res_json.get("code", -1)
         if code == 5060:
             list_up_request["duplicate"] = dup_choice
-            res = requests.post(
+            res = self.session.post(
                 url, headers=headers, data=json.dumps(list_up_request), timeout=30
             )
             res_json = res.json()
@@ -1022,7 +1132,7 @@ class Pan123:
                 get_link_url = (
                     "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch"
                 )
-                get_link_res = requests.post(
+                get_link_res = self.session.post(
                     get_link_url,
                     headers=headers,
                     data=json.dumps(get_link_data),
@@ -1049,7 +1159,7 @@ class Pan123:
             "uploadId": upload_id,
             "storageNode": storage_node,
         }
-        requests.post(
+        self.session.post(
             uploaded_list_url,
             headers=headers,
             data=json.dumps(uploaded_comp_data),
@@ -1058,7 +1168,7 @@ class Pan123:
         compmultipart_up_url = (
             "https://www.123pan.com/b/api/file/s3_complete_multipart_upload"
         )
-        requests.post(
+        self.session.post(
             compmultipart_up_url,
             headers=headers,
             data=json.dumps(uploaded_comp_data),
@@ -1068,7 +1178,7 @@ class Pan123:
             time.sleep(3)
         close_up_session_url = "https://www.123pan.com/b/api/file/upload_complete"
         close_up_session_data = {"fileId": up_file_id}
-        close_res = requests.post(
+        close_res = self.session.post(
             close_up_session_url,
             headers=headers,
             data=json.dumps(close_up_session_data),
