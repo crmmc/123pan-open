@@ -11,10 +11,13 @@ from qfluentwidgets import (
     SwitchSettingCard,
     ScrollArea,
     PrimaryPushSettingCard,
+    SettingCard,
+    SpinBox,
 )
 from qfluentwidgets import FluentIcon as FIF
 
-from ..common.config import isWin11, ConfigManager
+from ..common.config import isWin11
+from ..common.database import Database
 from ..common.const import YEAR, ABOUT_URL, VERSION
 from ..common.style_sheet import StyleSheet
 
@@ -30,13 +33,13 @@ class SettingInterface(ScrollArea):
         self.settingLabel = QLabel(self.tr("设置"), self)
 
         self.musicInThisPCGroup = SettingCardGroup(
-            self.tr("下载设置"), self.scrollWidget
+            self.tr("传输设置"), self.scrollWidget
         )
         self.downloadFolderCard = PushSettingCard(
             self.tr("选择文件夹"),
             FIF.DOWNLOAD,
             self.tr("下载目录"),
-            ConfigManager.get_setting("defaultDownloadPath", str(Path.home() / "Downloads")),
+            Database.instance().get_config("defaultDownloadPath", str(Path.home() / "Downloads")),
             self.musicInThisPCGroup,
         )
 
@@ -49,8 +52,88 @@ class SettingInterface(ScrollArea):
         )
         # 手动设置开关状态
         self.askDownloadLocationCard.setChecked(
-            ConfigManager.get_setting("askDownloadLocation", True)
+            Database.instance().get_config("askDownloadLocation", True)
         )
+
+        # 下载线程数
+        self.downloadThreadsCard = SettingCard(
+            FIF.DOWNLOAD,
+            self.tr("下载线程数"),
+            self.tr("并发下载的最大线程数（1-16）"),
+            self.musicInThisPCGroup,
+        )
+        self.downloadThreadsSpinBox = SpinBox(self.downloadThreadsCard)
+        self.downloadThreadsSpinBox.setRange(1, 16)
+        self.downloadThreadsSpinBox.setValue(
+            int(Database.instance().get_config("maxDownloadThreads", 3))
+        )
+        self.downloadThreadsSpinBox.setFixedWidth(120)
+        self.downloadThreadsCard.hBoxLayout.addWidget(self.downloadThreadsSpinBox)
+        self.downloadThreadsCard.hBoxLayout.addSpacing(16)
+
+        # 上传线程数
+        self.uploadThreadsCard = SettingCard(
+            FIF.UP,
+            self.tr("上传线程数"),
+            self.tr("并发上传的最大线程数（1-16）"),
+            self.musicInThisPCGroup,
+        )
+        self.uploadThreadsSpinBox = SpinBox(self.uploadThreadsCard)
+        self.uploadThreadsSpinBox.setRange(1, 16)
+        self.uploadThreadsSpinBox.setValue(
+            int(Database.instance().get_config("maxUploadThreads", 16))
+        )
+        self.uploadThreadsSpinBox.setFixedWidth(120)
+        self.uploadThreadsCard.hBoxLayout.addWidget(self.uploadThreadsSpinBox)
+        self.uploadThreadsCard.hBoxLayout.addSpacing(16)
+
+        # 同时下载任务数
+        self.concurrentDownloadsCard = SettingCard(
+            FIF.DOWNLOAD,
+            self.tr("同时下载任务数"),
+            self.tr("允许同时进行的下载任务数（1-5）"),
+            self.musicInThisPCGroup,
+        )
+        self.concurrentDownloadsSpinBox = SpinBox(self.concurrentDownloadsCard)
+        self.concurrentDownloadsSpinBox.setRange(1, 5)
+        self.concurrentDownloadsSpinBox.setValue(
+            int(Database.instance().get_config("maxConcurrentDownloads", 3))
+        )
+        self.concurrentDownloadsSpinBox.setFixedWidth(120)
+        self.concurrentDownloadsCard.hBoxLayout.addWidget(self.concurrentDownloadsSpinBox)
+        self.concurrentDownloadsCard.hBoxLayout.addSpacing(16)
+
+        # 同时上传任务数
+        self.concurrentUploadsCard = SettingCard(
+            FIF.UP,
+            self.tr("同时上传任务数"),
+            self.tr("允许同时进行的上传任务数（1-5）"),
+            self.musicInThisPCGroup,
+        )
+        self.concurrentUploadsSpinBox = SpinBox(self.concurrentUploadsCard)
+        self.concurrentUploadsSpinBox.setRange(1, 5)
+        self.concurrentUploadsSpinBox.setValue(
+            int(Database.instance().get_config("maxConcurrentUploads", 3))
+        )
+        self.concurrentUploadsSpinBox.setFixedWidth(120)
+        self.concurrentUploadsCard.hBoxLayout.addWidget(self.concurrentUploadsSpinBox)
+        self.concurrentUploadsCard.hBoxLayout.addSpacing(16)
+
+        # 重试次数
+        self.retryAttemptsCard = SettingCard(
+            FIF.SYNC,
+            self.tr("最大重试次数"),
+            self.tr("网络请求失败后的最大重试次数（1-10）"),
+            self.musicInThisPCGroup,
+        )
+        self.retryAttemptsSpinBox = SpinBox(self.retryAttemptsCard)
+        self.retryAttemptsSpinBox.setRange(1, 10)
+        self.retryAttemptsSpinBox.setValue(
+            int(Database.instance().get_config("retryMaxAttempts", 3))
+        )
+        self.retryAttemptsSpinBox.setFixedWidth(120)
+        self.retryAttemptsCard.hBoxLayout.addWidget(self.retryAttemptsSpinBox)
+        self.retryAttemptsCard.hBoxLayout.addSpacing(16)
 
         self.personalGroup = SettingCardGroup(self.tr("个性化"), self.scrollWidget)
         self.micaCard = SwitchSettingCard(
@@ -96,6 +179,11 @@ class SettingInterface(ScrollArea):
         # add cards to group
         self.musicInThisPCGroup.addSettingCard(self.downloadFolderCard)
         self.musicInThisPCGroup.addSettingCard(self.askDownloadLocationCard)
+        self.musicInThisPCGroup.addSettingCard(self.downloadThreadsCard)
+        self.musicInThisPCGroup.addSettingCard(self.uploadThreadsCard)
+        self.musicInThisPCGroup.addSettingCard(self.concurrentDownloadsCard)
+        self.musicInThisPCGroup.addSettingCard(self.concurrentUploadsCard)
+        self.musicInThisPCGroup.addSettingCard(self.retryAttemptsCard)
 
         self.personalGroup.addSettingCard(self.micaCard)
 
@@ -111,24 +199,29 @@ class SettingInterface(ScrollArea):
     def __onDownloadFolderCardClicked(self):
         """download folder card clicked slot"""
         folder = QFileDialog.getExistingDirectory(self, self.tr("Choose folder"), "./")
-        if not folder or ConfigManager.get_setting("defaultDownloadPath") == folder:
+        if not folder or Database.instance().get_config("defaultDownloadPath") == folder:
             return
-
         self.downloadFolderCard.setContent(folder)
-
-        # 同时更新默认下载位置
-        config = ConfigManager.load_config()
-        config["settings"]["defaultDownloadPath"] = folder
-        ConfigManager.save_config(config)
+        Database.instance().set_config("defaultDownloadPath", folder)
 
     def __onAskDownloadLocationChanged(self, checked):
         """ask download location changed slot"""
-        # 加载当前配置
-        config = ConfigManager.load_config()
-        # 更新askDownloadLocation的值
-        config["settings"]["askDownloadLocation"] = checked
-        # 保存配置
-        ConfigManager.save_config(config)
+        Database.instance().set_config("askDownloadLocation", checked)
+
+    def __onDownloadThreadsChanged(self, value):
+        Database.instance().set_config("maxDownloadThreads", value)
+
+    def __onUploadThreadsChanged(self, value):
+        Database.instance().set_config("maxUploadThreads", value)
+
+    def __onConcurrentDownloadsChanged(self, value):
+        Database.instance().set_config("maxConcurrentDownloads", value)
+
+    def __onConcurrentUploadsChanged(self, value):
+        Database.instance().set_config("maxConcurrentUploads", value)
+
+    def __onRetryAttemptsChanged(self, value):
+        Database.instance().set_config("retryMaxAttempts", value)
 
     def __connectSignalToSlot(self):
         """connect signal to slot"""
@@ -138,6 +231,21 @@ class SettingInterface(ScrollArea):
         self.downloadFolderCard.clicked.connect(self.__onDownloadFolderCardClicked)
         self.askDownloadLocationCard.checkedChanged.connect(
             self.__onAskDownloadLocationChanged
+        )
+        self.downloadThreadsSpinBox.valueChanged.connect(
+            self.__onDownloadThreadsChanged
+        )
+        self.uploadThreadsSpinBox.valueChanged.connect(
+            self.__onUploadThreadsChanged
+        )
+        self.concurrentDownloadsSpinBox.valueChanged.connect(
+            self.__onConcurrentDownloadsChanged
+        )
+        self.concurrentUploadsSpinBox.valueChanged.connect(
+            self.__onConcurrentUploadsChanged
+        )
+        self.retryAttemptsSpinBox.valueChanged.connect(
+            self.__onRetryAttemptsChanged
         )
 
         # personalization

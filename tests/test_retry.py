@@ -20,16 +20,11 @@ class TestSessionRetryConfig:
     """验证 Pan123.__init__ 创建的 session 带有正确的 Retry 配置"""
 
     def _create_pan_with_config(self, retry_max=3, backoff=0.5):
-        with patch("src.app.common.api.ConfigManager") as MockConfig:
-            MockConfig.load_config.return_value = {
-                "userName": "u", "passWord": "p", "authorization": "Bearer t",
-                "deviceType": "MI5", "osVersion": "Android_12", "loginuuid": "abc",
-                "settings": {"retryMaxAttempts": retry_max, "retryBackoffFactor": backoff},
-            }
-            MockConfig.get_setting.side_effect = lambda k, d=None: {
+        db = MagicMock()
+        db.get_config.side_effect = lambda k, d=None: {
                 "retryMaxAttempts": retry_max, "retryBackoffFactor": backoff,
             }.get(k, d)
-
+        with patch("src.app.common.api.Database.instance", return_value=db):
             with patch("requests.Session.get") as mock_get, \
                  patch("requests.Session.post") as mock_post:
                 mock_get.return_value = _make_mock_response(200, {

@@ -38,6 +38,9 @@ requires-dist = [
 ]
 provides-extras = ["build", "lint", "test"]
 
+[package.metadata.requires-dev]
+dev = []
+
 [[package]]
 name = "astroid"
 version = "4.0.4"

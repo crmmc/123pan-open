@@ -3,6 +3,7 @@ from unittest.mock import MagicMock, patch
 
 from PyQt6.QtCore import QEvent
 
+from src.app.view import file_interface as fi_module
 from src.app.view.file_interface import FileInterface
 
 
@@ -127,3 +128,105 @@ def test_drag_highlight_clears_on_drop():
 
     assert result is True
     viewport_mock.setStyleSheet.assert_called_once_with("")
+
+
+def test_prepare_upload_task_skips_failed_file_but_keeps_other_uploads(tmp_path):
+    ok_file = tmp_path / "ok.txt"
+    ok_file.write_text("ok", encoding="utf-8")
+    missing_file = tmp_path / "missing.txt"
+    task = FileInterface.PrepareUploadTask(
+        pan=MagicMock(),
+        target_dir_id=9,
+        local_paths=[str(ok_file), str(missing_file)],
+    )
+    results = []
+    task.signals.finished.connect(lambda uploads, created, folders, error: results.append(
+        (uploads, created, folders, error)
+    ))
+
+    task.run()
+
+    uploads, created_dir_count, folder_items, error = results[0]
+    assert uploads == [
+        {
+            "file_name": "ok.txt",
+            "file_size": 2,
+            "local_path": str(ok_file),
+            "target_dir_id": 9,
+        }
+    ]
+    assert created_dir_count == 0
+    assert folder_items == []
+    assert "missing.txt" in error
+
+
+def test_prepare_upload_task_stops_when_folder_creation_fails(tmp_path):
+    folder = tmp_path / "folder"
+    folder.mkdir()
+    pan = MagicMock()
+    pan.prepare_folder_upload.side_effect = RuntimeError("429")
+    task = FileInterface.PrepareUploadTask(
+        pan=pan,
+        target_dir_id=9,
+        local_paths=[str(folder)],
+    )
+    results = []
+    task.signals.finished.connect(lambda uploads, created, folders, error: results.append(
+        (uploads, created, folders, error)
+    ))
+
+    task.run()
+
+    assert results[0] == ([], 0, [], "429")
+
+
+def test_create_upload_button_group_uses_split_push_button(monkeypatch):
+    created_actions = []
+
+    class _FakeMenu:
+        def addAction(self, action):
+            created_actions.append(action)
+
+    class _FakeDropButton:
+        def setToolTip(self, text):
+            self.tooltip = text
+
+    class _FakeSplitButton:
+        def __init__(self, text, parent, icon):
+            self.text = text
+            self.parent = parent
+            self.icon = icon
+            self.flyout = None
+            self.drop_icon = None
+            self.height = None
+            self.dropButton = _FakeDropButton()
+
+        def setFlyout(self, flyout):
+            self.flyout = flyout
+
+        def setDropIcon(self, icon):
+            self.drop_icon = icon
+
+    monkeypatch.setattr("src.app.view.file_interface.RoundMenu", lambda parent=None: _FakeMenu())
+    monkeypatch.setattr("src.app.view.file_interface.SplitPushButton", _FakeSplitButton)
+    monkeypatch.setattr(
+        "src.app.view.file_interface.Action",
+        lambda icon, text, triggered=None: {
+            "icon": icon,
+            "text": text,
+            "triggered": triggered,
+        },
+    )
+
+    fi = MagicMock()
+    fi.topBarFrame = object()
+    fi._FileInterface__uploadFile = MagicMock()
+    fi._FileInterface__uploadFolder = MagicMock()
+
+    FileInterface._FileInterface__createUploadButtonGroup(fi)
+
+    assert fi.uploadButton.text == "上传文件"
+    assert fi.uploadButton.drop_icon == fi_module.FIF.DOWN
+    assert fi.uploadButton.dropButton.tooltip == "更多上传方式"
+    assert [action["text"] for action in created_actions] == ["上传文件", "上传文件夹"]
+    assert fi.uploadButtonGroup is fi.uploadButton
