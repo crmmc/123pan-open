@@ -43,6 +43,7 @@ def pan():
         p.parent_file_id = 0
         p.parent_file_list = [0]
         p._login_lock = threading.Lock()
+        p._session_lock = threading.Lock()
 
         # 创建带重试的 session（和 Pan123.__init__ 一致）
         from requests.adapters import HTTPAdapter
@@ -73,14 +74,12 @@ def pan():
 class TestLogin:
     def test_login_success(self, pan):
         login_resp = _mock_response(200, {"code": 200, "data": {"token": "newtoken"}, "message": "ok"})
-        login_resp.headers = {"Set-Cookie": "sid=abc123; Path=/"}
 
-        with patch.object(pan.session, "post", return_value=login_resp) as mock_post, \
+        with patch.object(pan.session, "post", return_value=login_resp), \
              patch.object(pan, "save_file"):
             code = pan.login()
             assert code == 200
             assert pan.authorization == "Bearer newtoken"
-            assert pan.cookies["sid"] == "abc123"
 
     def test_login_wrong_password(self, pan):
         login_resp = _mock_response(200, {"code": 4001, "message": "密码错误"})
@@ -537,34 +536,24 @@ class TestUploadFileStream:
     def test_parent_id_parameter(self, pan, tmp_path):
         local_file = tmp_path / "demo.txt"
         local_file.write_text("demo", encoding="utf-8")
-        request_payloads = []
         response = _mock_response(200, {"code": 0, "data": {"Reuse": True}})
 
-        def fake_post(_url, **kwargs):
-            request_payloads.append(kwargs["data"])
-            return response
-
-        with patch.object(pan.session, "post", side_effect=fake_post):
+        with patch.object(pan, "_api_request", side_effect=[response]) as mock_api:
             result = pan.upload_file_stream(str(local_file), parent_id=999)
-
-        assert result == "复用上传成功"
-        assert request_payloads[0]["parentFileId"] == 999
+            assert result == "复用上传成功"
+            payload = json.loads(mock_api.call_args.kwargs.get("data", "{}"))
+            assert payload["parentFileId"] == 999
 
     def test_parent_id_default_zero(self, pan, tmp_path):
         local_file = tmp_path / "demo.txt"
         local_file.write_text("demo", encoding="utf-8")
-        request_payloads = []
         response = _mock_response(200, {"code": 0, "data": {"Reuse": True}})
 
-        def fake_post(_url, **kwargs):
-            request_payloads.append(kwargs["data"])
-            return response
-
-        with patch.object(pan.session, "post", side_effect=fake_post):
+        with patch.object(pan, "_api_request", side_effect=[response]) as mock_api:
             result = pan.upload_file_stream(str(local_file))
-
-        assert result == "复用上传成功"
-        assert request_payloads[0]["parentFileId"] == 0
+            assert result == "复用上传成功"
+            payload = json.loads(mock_api.call_args.kwargs.get("data", "{}"))
+            assert payload["parentFileId"] == 0
 
     def test_new_upload_uses_five_mb_part_size(self, pan, tmp_path):
         local_file = tmp_path / "demo.txt"

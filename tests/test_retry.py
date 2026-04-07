@@ -50,18 +50,17 @@ class TestSessionRetryConfig:
         assert adapter.max_retries.total == 5
         assert adapter.max_retries.backoff_factor == 1.0
 
-    def test_session_retry_zero_disables(self):
+    def test_session_retry_zero_clamped_to_one(self):
         p = self._create_pan_with_config(retry_max=0)
         adapter = p.session.get_adapter("https://www.123pan.com")
-        assert adapter.max_retries.total == 0
+        assert adapter.max_retries.total == 1  # _safe_int min_val=1
 
-    def test_session_retry_no_status_forcelist(self):
-        """5xx 不触发重试"""
+    def test_session_retry_status_forcelist(self):
+        """5xx 触发重试"""
         p = self._create_pan_with_config()
         adapter = p.session.get_adapter("https://www.123pan.com")
-        # 未设置 status_forcelist 时为空
         forcelist = adapter.max_retries.status_forcelist
-        assert not forcelist  # None, set(), or frozenset()
+        assert set(forcelist) == {500, 502, 503, 504}
 
     def test_session_retry_allowed_methods(self):
         p = self._create_pan_with_config()

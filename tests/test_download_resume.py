@@ -169,7 +169,7 @@ def test_stream_download_raises_on_final_hash_mismatch(tmp_path, monkeypatch):
     total_size = PART_SIZE
     content = b"z" * total_size
     out_path = tmp_path / "broken.bin"
-    task = _make_resume_task(out_path, "not-the-real-md5")
+    task = _make_resume_task(out_path, "0000000000000000deadbeef00000000")
 
     def fake_head(url, allow_redirects=True, timeout=30):
         return _MockResponse(

@@ -1,7 +1,7 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from PyQt6.QtCore import QEvent
+from PySide6.QtCore import QEvent
 
 from src.app.view import file_interface as fi_module
 from src.app.view.file_interface import FileInterface
