@@ -32,14 +32,6 @@ def has_saved_credentials(db):
     return bool(user_name and pass_word)
 
 
-def should_auto_login(db):
-    return bool(db.get_config("autoLogin", False) and has_saved_credentials(db))
-
-
-def update_auto_login_setting(enabled):
-    Database.instance().set_config("autoLogin", bool(enabled))
-
-
 def login_with_credentials(user, pwd):
     db = Database.instance()
     saved_user = db.get_config("userName", "")
@@ -49,6 +41,26 @@ def login_with_credentials(user, pwd):
     if code not in {0, 200}:
         raise RuntimeError(f"登录失败，返回码: {code}")
     return pan
+
+
+def try_token_probe(db):
+    """用已有 token 调 user_info API 探测有效性。
+    成功返回 Pan123 对象，失败返回 None。
+    """
+    token = db.get_config("authorization", "")
+    if not token:
+        return None
+    try:
+        pan = Pan123(readfile=True, user_name="", password="", authorization=token)
+        user_data = pan.user_info()
+        if user_data is not None:
+            logger.info("Token 探测成功，跳过登录")
+            return pan
+    except Exception as exc:
+        logger.warning(f"Token 探测异常: {exc}")
+    # token 无效或过期，清除
+    db.set_config("authorization", "")
+    return None
 
 
 class LoginDialog(QDialog):
@@ -85,8 +97,12 @@ class LoginDialog(QDialog):
         self.le_pass.setEchoMode(LineEdit.EchoMode.Password)
         form.addRow("密码", self.le_pass)
 
-        self.cb_auto_login = QCheckBox("自动登录")
-        form.addRow("", self.cb_auto_login)
+        self.cb_remember_password = QCheckBox("记住密码")
+        self.cb_stay_logged_in = QCheckBox("保持登录")
+        checkbox_layout = QHBoxLayout()
+        checkbox_layout.addWidget(self.cb_remember_password)
+        checkbox_layout.addWidget(self.cb_stay_logged_in)
+        form.addRow("", checkbox_layout)
 
         layout.addLayout(form)
 
@@ -115,7 +131,13 @@ class LoginDialog(QDialog):
         db = Database.instance()
         self.le_user.setText(db.get_config("userName", ""))
         self.le_pass.setText(db.get_config("passWord", ""))
-        self.cb_auto_login.setChecked(bool(db.get_config("autoLogin", False)))
+        self.cb_remember_password.setChecked(bool(db.get_config("rememberPassword", False)))
+        self.cb_stay_logged_in.setChecked(bool(db.get_config("stayLoggedIn", True)))
+        self.cb_remember_password.stateChanged.connect(self._on_remember_password_changed)
+
+    def _on_remember_password_changed(self, state):
+        if not state:
+            Database.instance().set_config("passWord", "")
 
     def on_ok(self):
         """登录处理"""
@@ -164,11 +186,29 @@ class LoginDialog(QDialog):
             QApplication.restoreOverrideCursor()
 
         try:
-            if hasattr(self.pan, "save_file"):
-                self.pan.save_file()
-            update_auto_login_setting(self.cb_auto_login.isChecked())
+            db = Database.instance()
+            # 始终保存 userName 和设备信息
+            db.set_config("userName", user)
+            db.set_config("deviceType", self.pan.devicetype)
+            db.set_config("osVersion", self.pan.osversion)
+            db.set_config("loginuuid", self.pan.loginuuid)
+
+            # 按用户选择保存密码
+            if self.cb_remember_password.isChecked():
+                db.set_config("passWord", pwd)
+            else:
+                db.set_config("passWord", "")
+
+            # 按用户选择保存 token
+            if self.cb_stay_logged_in.isChecked():
+                db.set_config("authorization", self.pan.authorization)
+            else:
+                db.set_config("authorization", "")
+
+            # 保存 checkbox 状态
+            db.set_config("rememberPassword", self.cb_remember_password.isChecked())
+            db.set_config("stayLoggedIn", self.cb_stay_logged_in.isChecked())
         except (IOError, OSError) as e:
-            # 忽略配置文件保存失败,不影响登录流程
             logger.warning(f"保存配置失败: {e}")
         except Exception as e:
             logger.error(f"保存配置时发生未知错误: {e}")
