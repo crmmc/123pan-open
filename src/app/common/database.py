@@ -253,7 +253,7 @@ class Database:
             return None
         return dict(row)
 
-    def get_download_tasks(self, account_name: str = None) -> list[dict]:
+    def get_download_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
             if account_name:
                 rows = self._conn.execute(
@@ -372,7 +372,7 @@ class Database:
             return None
         return dict(row)
 
-    def get_upload_tasks(self, account_name: str = None) -> list[dict]:
+    def get_upload_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
             if account_name:
                 rows = self._conn.execute(
