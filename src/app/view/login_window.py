@@ -131,31 +131,26 @@ class LoginDialog(QDialog):
         except requests.exceptions.ConnectTimeout as e:
             self.login_error = f"连接超时，服务器无响应: {e}"
             logger.error(self.login_error, exc_info=True)
-            QApplication.restoreOverrideCursor()
             MessageBox("登录失败", self.login_error, self).exec()
             return
         except requests.exceptions.ReadTimeout as e:
             self.login_error = f"读取超时，服务器响应过慢: {e}"
             logger.error(self.login_error, exc_info=True)
-            QApplication.restoreOverrideCursor()
             MessageBox("登录失败", self.login_error, self).exec()
             return
         except requests.exceptions.ConnectionError as e:
             self.login_error = f"网络连接失败，请检查网络: {e}"
             logger.error(self.login_error, exc_info=True)
-            QApplication.restoreOverrideCursor()
             MessageBox("登录失败", self.login_error, self).exec()
             return
         except requests.exceptions.RequestException as e:
             self.login_error = f"请求异常: {e}"
             logger.error(self.login_error, exc_info=True)
-            QApplication.restoreOverrideCursor()
             MessageBox("登录失败", self.login_error, self).exec()
             return
         except RuntimeError as e:
             self.login_error = str(e)
             logger.error(self.login_error)
-            QApplication.restoreOverrideCursor()
             MessageBox("登录失败", self.login_error, self).exec()
             return
         except Exception as e:
@@ -163,7 +158,6 @@ class LoginDialog(QDialog):
             logger.error(
                 "登录异常:\n%s", traceback.format_exc()
             )
-            QApplication.restoreOverrideCursor()
             MessageBox("登录异常", self.login_error, self).exec()
             return
         finally:

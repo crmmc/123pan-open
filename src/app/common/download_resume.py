@@ -4,6 +4,7 @@ import queue
 import shutil
 import threading
 import time
+import uuid
 from pathlib import Path
 
 import requests
@@ -297,7 +298,7 @@ def _download_part(
             })
             part["attempt"] = 0
             return "ok"
-        except (requests.RequestException, RuntimeError) as exc:
+        except (requests.RequestException, RuntimeError, OSError) as exc:
             _reset_partial_download(
                 part_path, downloaded, progress_lock,
                 attempt_downloaded, signals, total, resume_id, index,
@@ -439,6 +440,12 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
     _notify_status(signals, "合并中")
     merged_path = get_merged_path(resume_id)
     merged_path.parent.mkdir(parents=True, exist_ok=True)
+    # 清理旧的合并文件（防止上次合并中断残留）
+    if merged_path.exists():
+        try:
+            merged_path.unlink()
+        except OSError:
+            pass
     try:
         with open(merged_path, "wb") as output:
             for part in part_plan:
@@ -468,13 +475,14 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
             cleanup_temp_dir(resume_id)
         return "已取消"
 
-    # etag 校验
-    expected_etag = (resume_task.etag or "").strip().lower()
-    actual_etag = _compute_md5(merged_path).lower()
-    if expected_etag and actual_etag != expected_etag:
-        cleanup_temp_dir(resume_id)
-        Database.instance().delete_download_task(resume_id)
-        raise RuntimeError("整文件校验失败，需要重新下载")
+    # etag 校验（去引号；分片格式如 md5-3 跳过校验）
+    expected_etag = (resume_task.etag or "").strip().strip('"').lower()
+    if expected_etag and "-" not in expected_etag:
+        actual_etag = _compute_md5(merged_path).lower()
+        if actual_etag != expected_etag:
+            cleanup_temp_dir(resume_id)
+            Database.instance().delete_download_task(resume_id)
+            raise RuntimeError("整文件校验失败，需要重新下载")
 
     # 移动到目标位置
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -488,7 +496,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
 def _download_single_stream(redirect_url, out_path, total, signals, task, speed_tracker):
     temp_dir = CONFIG_DIR / "tmp" / "single_stream"
     temp_dir.mkdir(parents=True, exist_ok=True)
-    temp_path = temp_dir / out_path.name
+    temp_path = temp_dir / f"{uuid.uuid4().hex}_{out_path.name}"
     _notify_status(signals, "下载中")
     with requests.get(redirect_url, stream=True, timeout=30) as response:
         response.raise_for_status()

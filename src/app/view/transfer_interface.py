@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 import uuid
 
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
@@ -21,7 +22,7 @@ from qfluentwidgets import (
 from qfluentwidgets import FluentIcon as FIF
 
 from ..common.api import format_file_size
-from ..common.database import Database
+from ..common.database import Database, UPLOAD_PART_SIZE
 from ..common.download_metadata import (
     DOWNLOAD_METADATA_VERSION,
     LEGACY_RESUME_TASK_ERROR,
@@ -69,7 +70,7 @@ def format_speed(bps: float) -> str:
 
 
 def format_eta(seconds: float) -> str:
-    if seconds < 0:
+    if seconds <= 0:
         return "--"
     if seconds < 60:
         return f"{int(seconds)}秒"
@@ -112,7 +113,7 @@ class UploadTask(TransferTask):
         self.upload_id_s3 = ""
         self.up_file_id = 0
         self.total_parts = 0
-        self.block_size = 8388608
+        self.block_size = UPLOAD_PART_SIZE
         self.etag = ""
 
 
@@ -142,6 +143,8 @@ class DownloadTask(TransferTask):
         self.active_workers = 0
         self.max_workers = 0
         self.thread = None
+        self.is_cancelled = False
+        self.pause_requested = False
         self.cleanup_on_cancel = False
 
 
@@ -235,15 +238,13 @@ class DownloadThread(QThread):
         super().__init__()
         self.task = task
         self.pan = pan
-        self.pause_requested = False
-        self.is_cancelled = False
 
     def pause(self):
-        self.pause_requested = True
+        self.task.pause_requested = True
 
     def cancel(self):
-        self.is_cancelled = True
-        self.pause_requested = False
+        self.task.is_cancelled = True
+        self.task.pause_requested = False
 
     def _resolve_download_detail(self):
         file_detail = resolve_download_file_detail(
@@ -281,7 +282,7 @@ class DownloadThread(QThread):
 
             result = _stream_download_from_url(
                 download_url, Path(self.task.save_path),
-                signals=_SignalsAdapter(self), task=self,
+                signals=_SignalsAdapter(self), task=self.task,
                 overwrite=True, resume_task=self.task,
                 speed_tracker=self.task.speed_tracker,
             )
@@ -492,6 +493,8 @@ class TransferInterface(QWidget):
             task.status = record.get("status", "失败")
             if task.status == "上传中":
                 task.status = "已暂停"
+                if task.db_task_id:
+                    db.update_upload_task(task.db_task_id, status="已暂停")
             # 恢复 S3 session 字段
             task.bucket = record.get("bucket", "")
             task.storage_node = record.get("storage_node", "")
@@ -499,7 +502,7 @@ class TransferInterface(QWidget):
             task.upload_id_s3 = record.get("upload_id_s3", "")
             task.up_file_id = record.get("up_file_id", 0)
             task.total_parts = record.get("total_parts", 0)
-            task.block_size = record.get("block_size", 8388608)
+            task.block_size = record.get("block_size", UPLOAD_PART_SIZE)
             task.etag = record.get("etag", "")
             self.upload_tasks.append(task)
         self.__update_upload_table()
@@ -629,7 +632,13 @@ class TransferInterface(QWidget):
     def __update_task_progress(self, task, progress):
         task.progress = progress
         if isinstance(task, DownloadTask):
-            Database.instance().update_download_task(task.resume_id, progress=progress)
+            now = time.time()
+            last_p = getattr(task, '_last_db_progress', -1)
+            last_t = getattr(task, '_last_db_progress_time', 0.0)
+            if abs(progress - last_p) >= 1 or (now - last_t) > 2.0:
+                Database.instance().update_download_task(task.resume_id, progress=progress)
+                task._last_db_progress = progress
+                task._last_db_progress_time = now
         elif isinstance(task, UploadTask) and task.db_task_id:
             Database.instance().update_upload_task(task.db_task_id, progress=progress)
         self.__refresh_table_for(task)
@@ -638,6 +647,16 @@ class TransferInterface(QWidget):
         task.status = status
         terminal = status in {"失败", "已完成", "已取消", "已暂停"}
         if terminal:
+            # H7: 从线程列表中移除，防止内存泄漏
+            if task.thread:
+                try:
+                    task.thread.disconnect()
+                except TypeError:
+                    pass
+                if isinstance(task, UploadTask) and task.thread in self.upload_threads:
+                    self.upload_threads.remove(task.thread)
+                elif isinstance(task, DownloadTask) and task.thread in self.download_threads:
+                    self.download_threads.remove(task.thread)
             task.thread = None
             task.active_workers = 0
             task.max_workers = 0
@@ -723,7 +742,7 @@ class TransferInterface(QWidget):
         task.upload_id_s3 = info.get("upload_id", "")
         task.up_file_id = info.get("up_file_id", 0)
         task.total_parts = info.get("total_parts", 0)
-        task.block_size = info.get("block_size", 8388608)
+        task.block_size = info.get("block_size", UPLOAD_PART_SIZE)
         task.etag = info.get("etag", "")
         if task.db_task_id:
             Database.instance().update_upload_task(

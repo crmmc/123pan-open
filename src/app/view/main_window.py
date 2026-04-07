@@ -1,3 +1,5 @@
+import time
+
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import QApplication, QDialog
 
@@ -23,6 +25,7 @@ class MainWindow(FluentWindow):
         super().__init__()
         self.setWindowTitle("123pan")
         self.resize(900, 600)
+        self._last_file_refresh_time = 0.0
 
         # 初始化子页面
         self.file_interface = FileInterface(self)
@@ -57,7 +60,10 @@ class MainWindow(FluentWindow):
     def _onPageChanged(self, index):
         widget = self.stackedWidget.widget(index)
         if widget is self.file_interface and hasattr(self, "pan"):
-            self.file_interface.refresh()
+            now = time.time()
+            if now - self._last_file_refresh_time > 30:
+                self.file_interface.refresh()
+                self._last_file_refresh_time = now
 
     def _startup_login_flow(self):
         db = Database.instance()
@@ -80,7 +86,6 @@ class MainWindow(FluentWindow):
                     self,
                 ).exec()
             if dlg.exec() != QDialog.DialogCode.Accepted:
-                # QMessageBox.information(self, "提示", "未登录，程序将退出。")
                 QTimer.singleShot(0, self.close)
                 return
             self.pan = dlg.get_pan()
@@ -98,28 +103,45 @@ class MainWindow(FluentWindow):
         # 连接退出登录信号
         self.cloud_interface.logoutRequested.connect(self.handle_logout)
 
+    def _stop_all_transfers(self):
+        """取消所有正在进行的传输任务并等待线程退出。"""
+        threads_to_wait = []
+        for task in self.transfer_interface.upload_tasks:
+            if task.thread and task.status == "上传中":
+                task.thread.cancel()
+                threads_to_wait.append(task.thread)
+        for task in self.transfer_interface.download_tasks:
+            if task.thread and task.status in ("下载中", "校验中", "合并中"):
+                task.thread.cancel()
+                threads_to_wait.append(task.thread)
+        for thread in threads_to_wait:
+            thread.wait(5000)
+
+    def closeEvent(self, event):
+        """H6: 关闭窗口时取消/等待传输线程。"""
+        self._stop_all_transfers()
+        event.accept()
+
     def clear_login_config(self):
         """清除登录配置信息"""
         db = Database.instance()
         for key in ("userName", "passWord", "authorization", "deviceType", "osVersion", "loginuuid"):
             db.set_config(key, "")
+        db.set_config("autoLogin", False)
 
     def handle_logout(self):
         """处理退出登录请求"""
-        # 确认对话框
         msg = MessageBox("退出登录", "确定要退出登录吗？", self)
         if msg.exec():
-            # 清除登录配置
+            # M8: 退出登录前停止传输
+            self._stop_all_transfers()
             self.clear_login_config()
-            # 显示登录对话框
             dlg = LoginDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
-                # 登录成功，更新 pan 对象
                 self.pan = dlg.get_pan()
                 self.file_interface.pan = self.pan
                 self.file_interface.reload()
                 self.transfer_interface.set_pan(self.pan)
                 self.cloud_interface.set_pan(self.pan)
             else:
-                # 用户取消登录，关闭程序
                 self.close()

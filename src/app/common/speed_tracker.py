@@ -13,7 +13,7 @@ class SpeedTracker:
 
     def __init__(self):
         # worker 线程写入，UI 线程 flush 消费
-        self._pending: deque[tuple[float, int]] = deque()
+        self._pending: deque[tuple[float, int]] = deque(maxlen=50000)
         # flush 后的滑动窗口（仅 UI 线程访问）
         self._samples: deque[tuple[float, int]] = deque()
         self._last_speed = 0.0

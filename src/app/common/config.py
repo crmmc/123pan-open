@@ -10,6 +10,8 @@ def isWin11():
 
 # 配置文件路径
 if platform.system() == "Windows":
-    CONFIG_DIR = Path(os.environ.get("APPDATA", "")) / "Qxyz17" / "123pan"
+    CONFIG_DIR = Path(os.environ.get("APPDATA", "") or (Path.home() / "AppData" / "Roaming")) / "Qxyz17" / "123pan"
+elif platform.system() == "Darwin":
+    CONFIG_DIR = Path.home() / "Library" / "Application Support" / "Qxyz17" / "123pan"
 else:
     CONFIG_DIR = Path.home() / ".config" / "Qxyz17" / "123pan"

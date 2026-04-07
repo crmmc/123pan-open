@@ -48,6 +48,28 @@ from .search_window import SearchDialog
 
 logger = get_logger(__name__)
 
+# Windows 保留名
+_WINDOWS_RESERVED = frozenset(
+    "CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 "
+    "LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9".split()
+)
+
+
+def _sanitize_filename(name: str) -> str:
+    """H10: 过滤非法字符和保留名，防止路径注入。"""
+    import re as _re
+    name = _re.sub(r'[<>:"|?*\\]', '_', name)
+    name = name.rstrip('. ')
+    if not name:
+        name = "_unnamed"
+    stem = Path(name).stem.upper()
+    if stem in _WINDOWS_RESERVED:
+        name = "_" + name
+    if len(name) > 200:
+        ext = Path(name).suffix
+        name = name[:200 - len(ext)] + ext
+    return name
+
 
 class FileInterface(QWidget):
     """文件页面（仅浏览）"""
@@ -62,6 +84,9 @@ class FileInterface(QWidget):
         self.is_loading_tree = False
         self.is_updating_breadcrumb = False
         self.transfer_interface = None
+
+        # H9: 异步加载请求 ID，防止旧回调覆盖新数据
+        self._load_request_id = 0
 
         # 排序模式: 0=按名称, 2=按大小
         self.sort_mode = 0
@@ -493,11 +518,17 @@ class FileInterface(QWidget):
         # 使用后台线程加载文件列表，避免阻塞主线程
         self.fileTable.setRowCount(0)
 
+        # H9: 递增请求 ID，回调时比对
+        self._load_request_id += 1
+        current_request_id = self._load_request_id
+
         # 创建任务
         task = self.LoadListTask(self.__fetchDirList, self.current_dir_id)
 
         # 连接信号
-        task.signals.finished.connect(self.__onLoadListFinished)
+        task.signals.finished.connect(
+            lambda items, err, rid=current_request_id: self.__onLoadListFinished(items, err, rid)
+        )
 
         # 提交任务到线程池
         QThreadPool.globalInstance().start(task)
@@ -509,9 +540,11 @@ class FileInterface(QWidget):
             code, items = self.pan.get_dir_by_id(
                 dir_id, save=False, all=True, limit=100, search_data=search_data
             )
-            return items if code == 0 else []
+            if code != 0:
+                raise RuntimeError(f"获取文件列表失败，返回码: {code}")
+            return items
         except Exception:
-            return []
+            raise
 
     # 后台加载文件列表的信号和任务类
     class LoadListTask(QRunnable):
@@ -633,6 +666,7 @@ class FileInterface(QWidget):
         self.path_stack = self.path_stack[: target_index + 1]
         self.current_dir_id = target_dir_id
         self.__loadCurrentList()
+        self.__updateBreadcrumb()
 
         tree_item = self.__findTreeItemById(target_dir_id)
         if tree_item:
@@ -768,8 +802,11 @@ class FileInterface(QWidget):
             self.fileTable.setItem(row, 1, type_item)
             self.fileTable.setItem(row, 2, size_item)
 
-    def __onLoadListFinished(self, file_items, error):
+    def __onLoadListFinished(self, file_items, error, request_id=None):
         """加载文件列表完成后的回调 - 只负责UI更新"""
+        # H9: 丢弃过期的回调结果
+        if request_id is not None and request_id != self._load_request_id:
+            return
         if error:
             InfoBar.error(
                 title="加载失败",
@@ -845,6 +882,13 @@ class FileInterface(QWidget):
                 file_id = child.data(0, Qt.ItemDataRole.UserRole)
                 if file_id:
                     existing_items[file_id] = child
+
+            # M10: 删除不在新 folder_items 中的节点
+            new_ids = {int(f.get("FileId", 0)) for f in folder_items}
+            for file_id, child in list(existing_items.items()):
+                if file_id not in new_ids:
+                    current_item.removeChild(child)
+                    del existing_items[file_id]
 
             # 添加新的文件夹
             for folder in folder_items:
@@ -999,6 +1043,8 @@ class FileInterface(QWidget):
             if file_type == 1:
                 file_name += ".zip"
 
+            file_name = _sanitize_filename(file_name)
+
             if download_dir is not None:
                 save_path = str(Path(download_dir) / file_name)
             else:
@@ -1102,11 +1148,13 @@ class FileInterface(QWidget):
 
         # 加载目标目录内容，完成后选中文件
         self.fileTable.setRowCount(0)
+        self._load_request_id += 1
+        current_request_id = self._load_request_id
         task = self.LoadListTask(self.__fetchDirList, target_dir_id)
 
         if select_file_id is not None:
-            def on_loaded(file_items, err):
-                self.__onLoadListFinished(file_items, err)
+            def on_loaded(file_items, err, rid=current_request_id):
+                self.__onLoadListFinished(file_items, err, rid)
                 if not err:
                     for row in range(self.fileTable.rowCount()):
                         name_item = self.fileTable.item(row, 0)
@@ -1116,7 +1164,9 @@ class FileInterface(QWidget):
                             break
             task.signals.finished.connect(on_loaded)
         else:
-            task.signals.finished.connect(self.__onLoadListFinished)
+            task.signals.finished.connect(
+                lambda items, err, rid=current_request_id: self.__onLoadListFinished(items, err, rid)
+            )
 
         QThreadPool.globalInstance().start(task)
 

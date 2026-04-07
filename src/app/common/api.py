@@ -9,12 +9,13 @@ import threading
 import time
 import uuid
 from pathlib import Path
+from urllib.parse import urlparse
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .database import Database
+from .database import Database, UPLOAD_PART_SIZE, _safe_int
 from .const import all_device_type, all_os_versions
 from .log import get_logger
 
@@ -24,11 +25,20 @@ INITIAL_BACKOFF_SECONDS = 1.0
 MAX_BACKOFF_SECONDS = 30.0
 BACKOFF_MULTIPLIER = 2
 MAX_CREATE_DIR_RETRIES = 10
-UPLOAD_PART_SIZE = 5 * 1024 * 1024
 
 
 class RateLimitError(RuntimeError):
     """API 返回 HTTP 429 限流。"""
+
+
+def _parse_json_response(response):
+    """统一解析 JSON 响应，避免裸 .json() 崩溃。"""
+    try:
+        return response.json()
+    except (ValueError, KeyError) as exc:
+        raise RuntimeError(
+            f"JSON 解析失败 (HTTP {response.status_code}): {response.text[:200]}"
+        ) from exc
 
 
 class Pan123:
@@ -48,7 +58,6 @@ class Pan123:
         self.osversion = random.choice(all_os_versions)
         self.loginuuid = uuid.uuid4().hex
 
-        self.cookies = None
         self.recycle_list = None
         self.list = []
         self.total = 0
@@ -58,15 +67,17 @@ class Pan123:
         # 创建带重试的 session，仅在网络错误时重试
         db = Database.instance()
         retry = Retry(
-            total=db.get_config("retryMaxAttempts", 3),
+            total=_safe_int(db.get_config("retryMaxAttempts", 3), default=3, min_val=1, max_val=10),
             backoff_factor=db.get_config("retryBackoffFactor", 0.5),
             allowed_methods=["GET", "POST", "PUT", "HEAD"],
             raise_on_status=False,
+            status_forcelist=[500, 502, 503, 504],
         )
         adapter = HTTPAdapter(max_retries=retry)
         self.session = requests.Session()
         self.session.mount("https://", adapter)
         self.session.mount("http://", adapter)
+        self._session_lock = threading.Lock()
         if readfile:
             self.read_ini(user_name, password, input_pwd, authorization)
         else:
@@ -85,7 +96,6 @@ class Pan123:
             "platform": "android",
             "devicetype": self.devicetype,
             "devicename": "Xiaomi",
-            "host": "www.123pan.com",
             "app-version": "61",
             "x-app-version": "2.4.0",
         }
@@ -100,32 +110,25 @@ class Pan123:
     def _login_without_lock(self):
         """登录123云盘账户并获取授权令牌"""
         data = {"type": 1, "passport": self.user_name, "password": self.password}
-        login_res = self.session.post(
-            "https://www.123pan.com/b/api/user/sign_in",
-            headers=self.header_logined,
-            data=data,
-            timeout=(3, 5),
-        )
+        with self._session_lock:
+            login_res = self.session.post(
+                "https://www.123pan.com/b/api/user/sign_in",
+                headers=self.header_logined,
+                data=json.dumps(data),
+                timeout=(3, 5),
+            )
 
-        res_sign = login_res.json()
-        res_code_login = res_sign["code"]
+        res_sign = _parse_json_response(login_res)
+        res_code_login = res_sign.get("code", -1)
         if res_code_login != 200:
             logger.error("code = 1 Error:" + str(res_code_login))
             logger.error(res_sign.get("message", ""))
             return res_code_login
-        set_cookies = login_res.headers.get("Set-Cookie", "")
-        set_cookies_list = {}
 
-        for cookie in set_cookies.split(";"):
-            if "=" in cookie:
-                key, value = cookie.strip().split("=", 1)
-                set_cookies_list[key] = value
-            else:
-                set_cookies_list[cookie.strip()] = None
-
-        self.cookies = set_cookies_list
-
-        token = res_sign["data"]["token"]
+        token = res_sign.get("data", {}).get("token", "")
+        if not token:
+            logger.error("登录响应缺少 token")
+            return -1
         self.authorization = "Bearer " + token
         self.header_logined["authorization"] = self.authorization
         self.save_file()
@@ -158,7 +161,11 @@ class Pan123:
             request_kwargs = self._prepare_request_kwargs(kwargs)
             request_headers = request_kwargs.get("headers", {})
             request_authorization = request_headers.get("authorization")
-            response = method(url, **request_kwargs)
+            with self._session_lock:
+                response = method(url, **request_kwargs)
+            # 统一检测 429
+            if response.status_code == 429:
+                raise RateLimitError(f"API 返回 429 限流: {url}")
             try:
                 response_json = response.json()
             except ValueError:
@@ -184,14 +191,7 @@ class Pan123:
             logger.error("保存账号失败: %s", e)
 
     def get_dir_by_id(self, file_id, save=True, all=False, limit=100, search_data=""):
-        """按文件夹ID获取文件列表（支持分页）
-
-        Args:
-            file_id: 文件夹ID
-            save: 是否保存结果到列表
-            all: 是否强制获取所有文件
-            limit: 每页限制数量
-        """
+        """按文件夹ID获取文件列表（支持分页）"""
         get_pages = 3
         page = 1 if all or not save else self.file_page * get_pages + 1
         length_now = 0 if all or not save else len(self.list)
@@ -217,6 +217,9 @@ class Pan123:
                     self.session.get,
                     base_url, headers=self.header_logined, params=params, timeout=30
                 )
+            except RateLimitError:
+                logger.error("获取文件列表触发 429 限流")
+                return -1, []
             except requests.exceptions.Timeout:
                 logger.error(f"请求超时: {base_url}")
                 return -1, []
@@ -226,15 +229,16 @@ class Pan123:
             except requests.exceptions.RequestException as e:
                 logger.error(f"请求异常: {e}")
                 return -1, []
-            text = response.json()
-            res_code_getdir = text["code"]
+            text = _parse_json_response(response)
+            res_code_getdir = text.get("code", -1)
             if res_code_getdir != 0:
                 logger.error("code = 2 Error:" + str(res_code_getdir))
                 logger.error(text.get("message", ""))
                 return res_code_getdir, []
-            lists_page = text["data"]["InfoList"]
+            data = text.get("data") or {}
+            lists_page = data.get("InfoList") or []
             lists += lists_page
-            total = text["data"]["Total"]
+            total = data.get("Total", 0)
             length_now += len(lists_page)
             page += 1
             times += 1
@@ -255,28 +259,28 @@ class Pan123:
         self.total = total
         self.file_page += 1
         if save:
-            self.list = self.list + lists
+            self.list.extend(lists)
 
         return res_code_getdir, lists
 
     def link_by_fileDetail(self, file_detail, showlink=True):
         """按文件详情获取下载链接"""
-        type_detail = file_detail["Type"]
+        type_detail = file_detail.get("Type", 0)
 
         if type_detail == 1:
             down_request_url = "https://www.123pan.com/a/api/file/batch_download_info"
-            down_request_data = {"fileIdList": [{"fileId": int(file_detail["FileId"])}]}
+            down_request_data = {"fileIdList": [{"fileId": int(file_detail.get("FileId", 0))}]}
 
         else:
             down_request_url = "https://www.123pan.com/a/api/file/download_info"
             down_request_data = {
                 "driveId": 0,
-                "etag": file_detail["Etag"],
-                "fileId": file_detail["FileId"],
-                "s3keyFlag": file_detail["S3KeyFlag"],
-                "type": file_detail["Type"],
-                "fileName": file_detail["FileName"],
-                "size": file_detail["Size"],
+                "etag": file_detail.get("Etag", ""),
+                "fileId": file_detail.get("FileId", 0),
+                "s3keyFlag": file_detail.get("S3KeyFlag", False),
+                "type": file_detail.get("Type", 0),
+                "fileName": file_detail.get("FileName", ""),
+                "size": file_detail.get("Size", 0),
             }
 
         link_res = self._api_request(
@@ -286,24 +290,29 @@ class Pan123:
             data=json.dumps(down_request_data),
             timeout=10,
         )
-        link_res_json = link_res.json()
-        res_code_download = link_res_json["code"]
+        link_res_json = _parse_json_response(link_res)
+        res_code_download = link_res_json.get("code", -1)
         if res_code_download != 0:
             logger.error("获取下载链接失败，返回码: " + str(res_code_download))
             logger.error(link_res_json.get("message", ""))
             return res_code_download
-        down_load_url = link_res.json()["data"]["DownloadUrl"]
-        next_to_get = requests.get(
-            down_load_url, timeout=10, allow_redirects=False
-        ).text
-        url_pattern = re.compile(r"href='(https?://[^']+)'")
+        down_load_url = link_res_json.get("data", {}).get("DownloadUrl", "")
+        if not down_load_url:
+            logger.error("响应中缺少 DownloadUrl")
+            return -1
+        with self._session_lock:
+            next_to_get = self.session.get(
+                down_load_url, timeout=10, allow_redirects=False
+            ).text
+        url_pattern = re.compile(r"""href=["'](https?://[^"']+)["']""")
         matches = url_pattern.findall(next_to_get)
         if not matches:
             logger.error("未找到重定向链接，响应内容: %s", next_to_get[:200])
             return -1
         redirect_url = matches[0]
         if showlink:
-            logger.info(f"获取下载链接成功: {redirect_url}")
+            parsed = urlparse(redirect_url)
+            logger.info(f"获取下载链接成功: {parsed.hostname}")
 
         return redirect_url
 
@@ -314,7 +323,7 @@ class Pan123:
             "https://www.123pan.com/a/api/file/list/new?driveId=0&limit=100&next=0"
             "&orderBy=fileId&orderDirection=desc&parentFileId="
             + str(recycle_id)
-            + "&trashed=true&&Page=1"
+            + "&trashed=true&Page=1"
         )
         recycle_res = self._api_request(
             self.session.get,
@@ -322,8 +331,8 @@ class Pan123:
             headers=self.header_logined,
             timeout=10,
         )
-        json_recycle = recycle_res.json()
-        recycle_list = json_recycle["data"]["InfoList"]
+        json_recycle = _parse_json_response(recycle_res)
+        recycle_list = json_recycle.get("data", {}).get("InfoList", [])
         self.recycle_list = recycle_list
 
     def delete_file(self, file, by_num=True, operation=True):
@@ -349,21 +358,13 @@ class Pan123:
             headers=self.header_logined,
             timeout=10,
         )
-        dele_json = delete_res.json()
+        dele_json = _parse_json_response(delete_res)
         logger.debug(f"删除文件响应: {dele_json}")
         message = dele_json.get("message", "")
         logger.info(f"删除文件消息: {message}")
 
     def rename_file(self, file_id, new_name):
-        """重命名文件或文件夹
-
-        Args:
-            file_id: 文件或文件夹的ID
-            new_name: 新的文件名
-
-        Returns:
-            bool: 是否成功
-        """
+        """重命名文件或文件夹"""
         data = {"driveId": 0, "fileId": file_id, "fileName": new_name}
         rename_res = self._api_request(
             self.session.post,
@@ -372,7 +373,7 @@ class Pan123:
             headers=self.header_logined,
             timeout=10,
         )
-        rename_json = rename_res.json()
+        rename_json = _parse_json_response(rename_res)
         code = rename_json.get("code", -1)
         logger.debug(f"重命名文件响应: {rename_json}")
         if code != 0:
@@ -383,15 +384,7 @@ class Pan123:
         return True
 
     def move_file(self, file_id_list, target_parent_id):
-        """移动文件或文件夹到目标目录
-
-        Args:
-            file_id_list: 文件ID列表，如 [123, 456]
-            target_parent_id: 目标父文件夹ID
-
-        Returns:
-            bool: 是否成功
-        """
+        """移动文件或文件夹到目标目录"""
         data = {
             "fileIdList": [{"FileId": fid} for fid in file_id_list],
             "parentFileId": target_parent_id,
@@ -403,7 +396,7 @@ class Pan123:
             headers=self.header_logined,
             timeout=10,
         )
-        move_json = move_res.json()
+        move_json = _parse_json_response(move_res)
         code = move_json.get("code", -1)
         logger.debug(f"移动文件响应: {move_json}")
         if code != 0:
@@ -414,19 +407,14 @@ class Pan123:
         return True
 
     def user_info(self):
-        """获取用户信息（已用空间、总容量、VIP 等）
-
-        Returns:
-            dict: 用户信息，包含 SpaceUsed, SpacePermanent 等
-            None: 失败时返回 None
-        """
+        """获取用户信息（已用空间、总容量、VIP 等）"""
         res = self._api_request(
             self.session.get,
             "https://api.123pan.cn/b/api/user/info",
             headers=self.header_logined,
             timeout=10,
         )
-        res_json = res.json()
+        res_json = _parse_json_response(res)
         code = res_json.get("code", -1)
         if code != 0:
             message = res_json.get("message", "")
@@ -435,15 +423,7 @@ class Pan123:
         return res_json.get("data")
 
     def file_details(self, file_ids):
-        """获取文件/文件夹详情
-
-        Args:
-            file_ids: 文件ID列表，如 [123, 456]
-
-        Returns:
-            dict: 详情数据，包含 fileNum, dirNum, totalSize, paths 等
-            None: 失败时返回 None
-        """
+        """获取文件/文件夹详情"""
         data = {"file_ids": file_ids}
         res = self._api_request(
             self.session.post,
@@ -452,7 +432,7 @@ class Pan123:
             headers=self.header_logined,
             timeout=10,
         )
-        res_json = res.json()
+        res_json = _parse_json_response(res)
         code = res_json.get("code", -1)
         if code != 0:
             message = res_json.get("message", "")
@@ -481,10 +461,12 @@ class Pan123:
             data=json.dumps(data),
             timeout=10,
         )
-        share_res_json = share_res.json()
+        share_res_json = _parse_json_response(share_res)
         if share_res_json.get("code", -1) != 0:
             raise RuntimeError(f"分享失败: {share_res_json.get('message', '')}")
-        share_key = share_res_json["data"]["ShareKey"]
+        share_key = share_res_json.get("data", {}).get("ShareKey", "")
+        if not share_key:
+            raise RuntimeError("分享响应缺少 ShareKey")
         share_url = "https://www.123pan.com/s/" + share_key
         return share_url
 
@@ -551,8 +533,6 @@ class Pan123:
             data=json.dumps(data_mk),
             timeout=10,
         )
-        if res_mk.status_code == 429:
-            raise RateLimitError(f"创建目录 '{dirname}' 触发 429 限流")
         try:
             res_json = res_mk.json()
         except json.decoder.JSONDecodeError:
@@ -562,8 +542,8 @@ class Pan123:
         code_mkdir = res_json.get("code", -1)
 
         if code_mkdir == 0:
-            logger.info(f"创建成功: {res_json['data']['FileId']}")
-            return res_json["data"]["Info"]["FileId"]
+            logger.info(f"创建成功: {res_json.get('data', {}).get('FileId')}")
+            return res_json.get("data", {}).get("Info", {}).get("FileId")
         logger.error(f"创建失败: {res_json}")
         raise RuntimeError(
             f"创建目录 '{dirname}' 失败: code={code_mkdir}, "
@@ -699,12 +679,7 @@ class Pan123:
         self, file_path, dup_choice=1, task_id=None, signals=None, task=None,
         speed_tracker=None, resume_info=None, parent_id=0,
     ):
-        """上传文件（分块），支持断点续传、progress 回调与取消/暂停控制。
-
-        resume_info: dict with keys bucket, storage_node, upload_key,
-            upload_id, up_file_id, total_parts, block_size, etag, done_parts.
-            If provided, skips MD5 and upload_request, resumes from saved session.
-        """
+        """上传文件（分块），支持断点续传、progress 回调与取消/暂停控制。"""
         file_path = file_path.replace('"', "").replace("\\", "/")
         file_path_obj = Path(file_path)
         file_name = file_path_obj.name
@@ -722,11 +697,37 @@ class Pan123:
             upload_key = resume_info["upload_key"]
             upload_id = resume_info["upload_id"]
             up_file_id = resume_info["up_file_id"]
-            block_size = resume_info.get("block_size", 8388608)
+            block_size = resume_info.get("block_size", UPLOAD_PART_SIZE)
             total_parts = resume_info.get("total_parts") or (
                 math.ceil(fsize / block_size) if fsize > 0 else 1
             )
             done_parts = resume_info.get("done_parts", set())
+
+            # C4: 用服务端实际存在的 parts 与本地记录做交集
+            try:
+                list_data = {
+                    "bucket": bucket,
+                    "key": upload_key,
+                    "uploadId": upload_id,
+                    "storageNode": storage_node,
+                }
+                with self._session_lock:
+                    list_res = self.session.post(
+                        "https://www.123pan.com/b/api/file/s3_list_upload_parts",
+                        headers=headers,
+                        data=json.dumps(list_data),
+                        timeout=30,
+                    )
+                list_json = _parse_json_response(list_res)
+                if list_json.get("code", -1) == 0:
+                    server_parts_data = list_json.get("data", {}).get("parts") or []
+                    server_part_numbers = {int(p.get("PartNumber", 0)) for p in server_parts_data}
+                    if server_part_numbers:
+                        done_parts = done_parts & server_part_numbers
+            except Exception as exc:
+                logger.warning("验证服务端已上传分块失败，将重新上传所有分块: %s", exc)
+                done_parts = set()
+
             logger.info(
                 "断点续传: %s/%s 块已完成", len(done_parts), total_parts
             )
@@ -762,7 +763,7 @@ class Pan123:
                 data=json.dumps(list_up_request),
                 timeout=30,
             )
-            res_json = res.json()
+            res_json = _parse_json_response(res)
             code = res_json.get("code", -1)
             if code == 5060:
                 list_up_request["duplicate"] = dup_choice
@@ -773,20 +774,20 @@ class Pan123:
                     data=json.dumps(list_up_request),
                     timeout=30,
                 )
-                res_json = res.json()
+                res_json = _parse_json_response(res)
                 code = res_json.get("code", -1)
             if code != 0:
                 raise RuntimeError(
                     "上传请求失败: " + json.dumps(res_json, ensure_ascii=False)
                 )
-            data = res_json["data"]
+            data = res_json.get("data") or {}
             if data.get("Reuse"):
                 return "复用上传成功"
-            bucket = data["Bucket"]
-            storage_node = data["StorageNode"]
-            upload_key = data["Key"]
-            upload_id = data["UploadId"]
-            up_file_id = data["FileId"]
+            bucket = data.get("Bucket", "")
+            storage_node = data.get("StorageNode", "")
+            upload_key = data.get("Key", "")
+            upload_id = data.get("UploadId", "")
+            up_file_id = data.get("FileId", 0)
             block_size = UPLOAD_PART_SIZE
             total_parts = math.ceil(fsize / block_size) if fsize > 0 else 1
             done_parts = set()
@@ -814,7 +815,7 @@ class Pan123:
             data=json.dumps(init_data),
             timeout=30,
         )
-        init_json = init_res.json()
+        init_json = _parse_json_response(init_res)
         if init_json.get("code", -1) != 0:
             raise RuntimeError(
                 "初始化上传会话失败: " + json.dumps(init_json, ensure_ascii=False)
@@ -834,10 +835,9 @@ class Pan123:
         max_workers = min(
             max(
                 1,
-                int(
-                    Database.instance().get_config(
-                        "maxUploadThreads", 16
-                    )
+                _safe_int(
+                    Database.instance().get_config("maxUploadThreads", 16),
+                    default=16, min_val=1, max_val=16,
                 ),
             ),
             16,
@@ -887,7 +887,7 @@ class Pan123:
                         logger.debug("上传 worker 因任务停止退出")
                         return
                     with progress_lock:
-                        if active_workers[0] > allowed_workers[0]:
+                        if active_workers[0] > allowed_workers[0] and active_workers[0] > 1:
                             logger.debug(
                                 "上传 worker 为满足并发上限退出: active=%s, allowed=%s",
                                 active_workers[0],
@@ -932,13 +932,16 @@ class Pan123:
                                 data=json.dumps(url_data),
                                 timeout=30,
                             )
-                            url_json = url_res.json()
+                            url_json = _parse_json_response(url_res)
                             if url_json.get("code", -1) != 0:
                                 raise requests.RequestException(
                                     "获取上传链接失败: "
                                     + json.dumps(url_json, ensure_ascii=False)
                                 )
-                            url = url_json["data"]["presignedUrls"][str(pn)]
+                            presigned_urls = url_json.get("data", {}).get("presignedUrls", {})
+                            url = presigned_urls.get(str(pn), "")
+                            if not url:
+                                raise requests.RequestException(f"分块 {pn} 无 presigned URL")
 
                             with open(file_path, "rb") as f:
                                 f.seek(offset)
@@ -1067,32 +1070,52 @@ class Pan123:
             "uploadId": upload_id,
             "storageNode": storage_node,
         }
-        self._api_request(
+        # C2: 检查 s3_list_upload_parts 和 s3_complete_multipart_upload 返回值
+        list_res = self._api_request(
             self.session.post,
             "https://www.123pan.com/b/api/file/s3_list_upload_parts",
             headers=headers,
             data=json.dumps(uploaded_comp_data),
             timeout=30,
         )
-        self._api_request(
+        list_json = _parse_json_response(list_res)
+        if list_json.get("code", -1) != 0:
+            raise RuntimeError(
+                "列出上传分块失败: " + json.dumps(list_json, ensure_ascii=False)
+            )
+
+        complete_res = self._api_request(
             self.session.post,
             "https://www.123pan.com/b/api/file/s3_complete_multipart_upload",
             headers=headers,
             data=json.dumps(uploaded_comp_data),
             timeout=30,
         )
-        if fsize > 64 * 1024 * 1024:
-            time.sleep(3)
+        complete_json = _parse_json_response(complete_res)
+        if complete_json.get("code", -1) != 0:
+            raise RuntimeError(
+                "合并上传分块失败: " + json.dumps(complete_json, ensure_ascii=False)
+            )
+
+        # M19: 轮询 upload_complete 替代盲等 sleep(3)
         close_up_session_data = {"fileId": up_file_id}
-        close_res = self._api_request(
-            self.session.post,
-            "https://www.123pan.com/b/api/file/upload_complete",
-            headers=headers,
-            data=json.dumps(close_up_session_data),
-            timeout=30,
-        )
-        cr = close_res.json()
-        if cr.get("code", -1) != 0:
+        max_complete_retries = 5
+        for attempt in range(max_complete_retries):
+            if attempt > 0:
+                time.sleep(min(2 ** attempt, 8))
+            close_res = self._api_request(
+                self.session.post,
+                "https://www.123pan.com/b/api/file/upload_complete",
+                headers=headers,
+                data=json.dumps(close_up_session_data),
+                timeout=30,
+            )
+            cr = _parse_json_response(close_res)
+            if cr.get("code", -1) == 0:
+                return up_file_id
+            if attempt < max_complete_retries - 1:
+                logger.warning("upload_complete 未就绪 (attempt %d): %s", attempt + 1, cr.get("message", ""))
+                continue
             raise RuntimeError(
                 "上传完成确认失败: " + json.dumps(cr, ensure_ascii=False)
             )
