@@ -1,9 +1,9 @@
 from pathlib import Path
 import uuid
 
-from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
-from PyQt6.QtGui import QDesktopServices
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtGui import QDesktopServices
+from PySide6.QtWidgets import (
     QComboBox,
     QFrame,
     QHBoxLayout,
@@ -147,13 +147,13 @@ class DownloadTask(TransferTask):
 
 class UploadThread(QThread):
     """上传线程，支持暂停、取消与断点续传。"""
-    progress_updated = pyqtSignal(int)
-    status_updated = pyqtSignal(str)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-    conn_info_updated = pyqtSignal(int, int)
-    session_info = pyqtSignal(dict)
-    part_done = pyqtSignal(int, str)
+    progress_updated = Signal(int)
+    status_updated = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+    conn_info_updated = Signal(int, int)
+    session_info = Signal(dict)
+    part_done = Signal(int, str)
 
     def __init__(self, task, pan):
         super().__init__()
@@ -225,11 +225,11 @@ class UploadThread(QThread):
 
 class DownloadThread(QThread):
     """下载线程，支持暂停、取消与恢复。"""
-    progress_updated = pyqtSignal(int)
-    status_updated = pyqtSignal(str)
-    finished = pyqtSignal()
-    error = pyqtSignal(str)
-    conn_info_updated = pyqtSignal(int, int)
+    progress_updated = Signal(int)
+    status_updated = Signal(str)
+    finished = Signal()
+    error = Signal(str)
+    conn_info_updated = Signal(int, int)
 
     def __init__(self, task, pan):
         super().__init__()

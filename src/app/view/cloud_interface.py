@@ -1,6 +1,6 @@
-from PyQt6.QtCore import Qt, pyqtSignal
-from PyQt6.QtGui import QFont
-from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QFont
+from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel
 
 from qfluentwidgets import (
     FluentIcon as FIF,
@@ -26,7 +26,7 @@ class CloudInterface(QWidget):
     """云盘页面"""
 
     # 定义退出登录信号
-    logoutRequested = pyqtSignal()
+    logoutRequested = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)

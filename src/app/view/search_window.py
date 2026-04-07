@@ -1,6 +1,6 @@
-from PyQt6.QtCore import Qt, QRunnable, QThreadPool, pyqtSignal, QObject, QRect
-from PyQt6.QtGui import QPen, QColor, QFontMetrics
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt, QRunnable, QThreadPool, Signal, QObject, QRect
+from PySide6.QtGui import QPen, QColor, QFontMetrics
+from PySide6.QtWidgets import (
     QDialog,
     QVBoxLayout,
     QHBoxLayout,
@@ -138,7 +138,7 @@ class SearchDialog(QDialog):
         self.statusLabel.setText("搜索中...")
 
         class SearchSignals(QObject):
-            finished = pyqtSignal(object, str)
+            finished = Signal(object, str)
 
         class SearchTask(QRunnable):
             def __init__(self, pan, text, signals):
@@ -193,7 +193,7 @@ class SearchDialog(QDialog):
                 pid_to_sample_fid[pid] = int(item.get("FileId", 0))
 
         class PathSignals(QObject):
-            finished = pyqtSignal(object)
+            finished = Signal(object)
 
         class FetchPathsTask(QRunnable):
             def __init__(self, pan, pid_to_fid, signals):

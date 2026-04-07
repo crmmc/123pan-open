@@ -1,8 +1,8 @@
 from pathlib import Path
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtCore import QEvent, QRunnable, QThreadPool, pyqtSignal, QObject
-from PyQt6.QtWidgets import (
+from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, QRunnable, QThreadPool, Signal, QObject
+from PySide6.QtWidgets import (
     QAbstractItemView,
     QDialog,
     QFrame,
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMenu,
 )
-from PyQt6.QtGui import QAction, QShortcut, QKeySequence
+from PySide6.QtGui import QAction, QShortcut, QKeySequence
 
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
@@ -516,7 +516,7 @@ class FileInterface(QWidget):
     # 后台加载文件列表的信号和任务类
     class LoadListTask(QRunnable):
         class LoadListSignals(QObject):
-            finished = pyqtSignal(list, str)  # file_items, error
+            finished = Signal(list, str)  # file_items, error
 
         def __init__(self, fetch_method, dir_id, search_data=""):
             super().__init__()
@@ -535,7 +535,7 @@ class FileInterface(QWidget):
 
     class PrepareUploadTask(QRunnable):
         class PrepareUploadSignals(QObject):
-            finished = pyqtSignal(list, int, list, str)
+            finished = Signal(list, int, list, str)
 
         def __init__(self, pan, target_dir_id, local_paths):
             super().__init__()
@@ -655,7 +655,7 @@ class FileInterface(QWidget):
 
             # 创建任务执行创建文件夹操作
             class CreateFolderSignals(QObject):
-                finished = pyqtSignal(
+                finished = Signal(
                     bool, str, str, list, list
                 )  # result, folder_name, error, file_items, folder_items
 
@@ -1053,7 +1053,7 @@ class FileInterface(QWidget):
             select_file_id = file_id
 
         class JumpSignals(QObject):
-            finished = pyqtSignal(object, int, object, str)
+            finished = Signal(object, int, object, str)
 
         class JumpTask(QRunnable):
             def __init__(self, pan, file_id, target_dir_id, select_file_id, signals):
@@ -1170,7 +1170,7 @@ class FileInterface(QWidget):
 
         # 创建批量删除任务
         class DeleteFilesSignals(QObject):
-            finished = pyqtSignal(int, int, str, list, list)
+            finished = Signal(int, int, str, list, list)
 
         class DeleteFilesTask(QRunnable):
             def __init__(self, pan, delete_list, current_dir_id, signals):
@@ -1295,7 +1295,7 @@ class FileInterface(QWidget):
 
         # 创建任务执行重命名操作
         class RenameFileSignals(QObject):
-            finished = pyqtSignal(
+            finished = Signal(
                 bool, str, str, str, list, list
             )  # success, old_name, new_name, error, file_items, folder_items
 
@@ -1432,7 +1432,7 @@ class FileInterface(QWidget):
         file_id_list = [fid for fid, _ in move_list]
 
         class MoveFilesSignals(QObject):
-            finished = pyqtSignal(bool, int, str, str)
+            finished = Signal(bool, int, str, str)
 
         class MoveFilesTask(QRunnable):
             def __init__(self, pan, file_id_list, target_id, target_name, signals):
@@ -1485,7 +1485,7 @@ class FileInterface(QWidget):
         file_name = name_item.text()
 
         class FileDetailsSignals(QObject):
-            finished = pyqtSignal(str, object, str)
+            finished = Signal(str, object, str)
 
         class FileDetailsTask(QRunnable):
             def __init__(self, pan, file_id, file_name, signals):
@@ -1598,7 +1598,7 @@ class FileInterface(QWidget):
 
     class StorageTask(QRunnable):
         class StorageSignals(QObject):
-            finished = pyqtSignal(object)
+            finished = Signal(object)
 
         def __init__(self, pan):
             super().__init__()

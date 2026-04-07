@@ -1,9 +1,9 @@
 import platform
 import sys
 
-from PyQt6 import QtWidgets
-from PyQt6.QtCore import Qt
-from PyQt6.QtGui import QFont
+from PySide6 import QtWidgets
+from PySide6.QtCore import Qt
+from PySide6.QtGui import QFont
 from qfluentwidgets import FluentTranslator, Theme, setTheme
 
 from app.view.main_window import MainWindow

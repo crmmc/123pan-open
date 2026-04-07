@@ -12,7 +12,7 @@
 </div>
 <div>
   <img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python">
-  <img src="https://img.shields.io/badge/PyQt6-Fluent%20Design-41CD52?logo=qt&logoColor=white" alt="PyQt6">
+  <img src="https://img.shields.io/badge/PySide6-Fluent%20Design-41CD52?logo=qt&logoColor=white" alt="PySide6">
   <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
   <a href="https://github.com/crmmc/123pan/actions/workflows/build.yaml"><img src="https://img.shields.io/github/actions/workflow/status/crmmc/123pan/build.yaml?label=build&logo=github" alt="Build"></a>
   <a href="https://github.com/crmmc/123pan/actions/workflows/test.yaml"><img src="https://img.shields.io/github/actions/workflow/status/crmmc/123pan/test.yaml?label=tests&logo=github" alt="Tests"></a>
@@ -28,7 +28,7 @@
 
 ---
 
-> 基于 [123panNextGen/123pan](https://github.com/123panNextGen/123pan) 重构，采用 PyQt6 + Fluent Design 全新界面，新增多线程传输、断点续传、完整文件管理等功能。采用安卓客户端的 api 端点，实现更稳定的多线程上传功能。解决官方 pc 客户端的上传功能不能跑满多宽带负载均衡的问题。
+> 基于 [123panNextGen/123pan](https://github.com/123panNextGen/123pan) 重构，采用 PySide6 + Fluent Design 全新界面，新增多线程传输、断点续传、完整文件管理等功能。采用安卓客户端的 api 端点，实现更稳定的多线程上传功能。解决官方 pc 客户端的上传功能不能跑满多宽带负载均衡的问题。
 
 ## 特性亮点
 
@@ -36,7 +36,7 @@
 |:---|:---|
 | 🚀 多线程传输 | 下载/上传支持 1–16 线程并发，充分利用带宽 |
 | 🔁 断点续传 | 下载和上传均支持断点续传，大文件传输不怕中断 |
-| 🎨 Fluent Design | 基于 PyQt6-Fluent-Widgets，现代化流畅设计风格 |
+| 🎨 Fluent Design | 基于 PySide6-Fluent-Widgets，现代化流畅设计风格 |
 | 📁 完整文件管理 | 文件夹树 + 面包屑导航 + 拖拽上传 + 右键菜单 + 批量操作 |
 | 📋 任务管理 | 暂停/继续/取消/重试，实时速度与进度，状态筛选 |
 | 💾 持久化存储 | SQLite 替代 JSON，任务状态跨会话保留 |
@@ -111,7 +111,7 @@ bash script/build.sh
 
 | 组件 | 技术 |
 |:---|:---|
-| GUI 框架 | PyQt6 + PyQt6-Fluent-Widgets |
+| GUI 框架 | PySide6 + PySide6-Fluent-Widgets |
 | 数据存储 | SQLite（配置 + 任务持久化） |
 | 打包工具 | Nuitka（编译为单文件可执行） |
 | 包管理 | uv |

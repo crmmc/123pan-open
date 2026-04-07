@@ -32,7 +32,7 @@ esac
 
   uv run -m nuitka src/123pan.py \
     --onefile \
-    --enable-plugin=pyqt6 \
+    --enable-plugin=pyside6 \
     --assume-yes-for-downloads \
     "${EXTRA_ARGS[@]}" \
     --output-filename="${OUT_NAME}" \
