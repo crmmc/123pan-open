@@ -1,26 +1,10 @@
-from PyQt6.QtCore import Qt, pyqtSignal, QEasingCurve, QUrl, QSize, QTimer
-from PyQt6.QtGui import QIcon, QDesktopServices, QColor
-from PyQt6.QtWidgets import (
-    QApplication,
-    QHBoxLayout,
-    QFrame,
-    QWidget,
-    QDialog,
-    QMessageBox,
-    QVBoxLayout,
-    QFormLayout,
-    QLineEdit,
-    QPushButton,
-)
+from PyQt6.QtCore import Qt, QTimer
+from PyQt6.QtWidgets import QApplication, QDialog
 
 from qfluentwidgets import (
-    NavigationAvatarWidget,
     NavigationItemPosition,
     MessageBox,
     FluentWindow,
-    SplashScreen,
-    SystemThemeListener,
-    isDarkTheme,
 )
 from qfluentwidgets import FluentIcon as FIF
 
@@ -31,7 +15,6 @@ from .cloud_interface import CloudInterface
 from .login_window import LoginDialog, login_with_credentials, should_auto_login
 
 from ..common import resource
-from ..common.api import Pan123
 from ..common.database import Database
 
 
@@ -74,7 +57,7 @@ class MainWindow(FluentWindow):
     def _onPageChanged(self, index):
         widget = self.stackedWidget.widget(index)
         if widget is self.file_interface and hasattr(self, "pan"):
-            self.file_interface._FileInterface__refreshFileList()
+            self.file_interface.refresh()
 
     def _startup_login_flow(self):
         db = Database.instance()
@@ -104,7 +87,7 @@ class MainWindow(FluentWindow):
 
         # 将 pan 对象传递给 file_interface 并刷新文件列表
         self.file_interface.pan = self.pan
-        self.file_interface._FileInterface__loadPanAndData()
+        self.file_interface.reload()
 
         # 将 pan 对象传递给 transfer_interface
         self.transfer_interface.set_pan(self.pan)
@@ -124,7 +107,6 @@ class MainWindow(FluentWindow):
     def handle_logout(self):
         """处理退出登录请求"""
         # 确认对话框
-        from qfluentwidgets import MessageBox
         msg = MessageBox("退出登录", "确定要退出登录吗？", self)
         if msg.exec():
             # 清除登录配置
@@ -135,7 +117,7 @@ class MainWindow(FluentWindow):
                 # 登录成功，更新 pan 对象
                 self.pan = dlg.get_pan()
                 self.file_interface.pan = self.pan
-                self.file_interface._FileInterface__loadPanAndData()
+                self.file_interface.reload()
                 self.transfer_interface.set_pan(self.pan)
                 self.cloud_interface.set_pan(self.pan)
             else:

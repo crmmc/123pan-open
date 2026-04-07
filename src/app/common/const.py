@@ -2,10 +2,31 @@
 应用常量定义
 """
 
-# 版本信息
+# 版本信息 — 构建时由 CI 注入，开发环境回退到 git 命令获取
 YEAR = 2026
-VERSION = "3.0.5"
 ABOUT_URL = "https://github.com/crmmc/123pan"
+
+# CI 构建时会替换下面两行的占位符
+_BUILD_COMMIT = "dev"
+_BUILD_TIME = ""
+
+
+def _detect_version():
+    """开发环境下用 git 获取 commit hash"""
+    if _BUILD_COMMIT != "dev":
+        return _BUILD_COMMIT
+    import subprocess
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"],
+            stderr=subprocess.DEVNULL,
+        ).decode().strip() or "dev"
+    except Exception:
+        return "dev"
+
+
+VERSION = _detect_version()
+BUILD_TIME = _BUILD_TIME
 
 # 云盘最大容量（字节）默认 10TB
 MAX_STORAGE_CAPACITY = 10 * 1024 * 1024 * 1024 * 1024  # 10TB

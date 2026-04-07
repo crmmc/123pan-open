@@ -181,9 +181,9 @@ class Pan123:
             })
             logger.info("账号已保存")
         except Exception as e:
-            logger.error("保存账号失败:", e)
+            logger.error("保存账号失败: %s", e)
 
-    def get_dir_by_id(self, file_id, save=True, all=False, limit=100):
+    def get_dir_by_id(self, file_id, save=True, all=False, limit=100, search_data=""):
         """按文件夹ID获取文件列表（支持分页）
 
         Args:
@@ -199,7 +199,7 @@ class Pan123:
         total = -1
         times = 0
         while (length_now < total or total == -1) and (times < get_pages or all):
-            base_url = "https://www.123pan.com/api/file/list/new"
+            base_url = "https://www.123pan.com/b/api/file/list/new"
             params = {
                 "driveId": 0,
                 "limit": limit,
@@ -208,7 +208,7 @@ class Pan123:
                 "orderDirection": "desc",
                 "parentFileId": str(file_id),
                 "trashed": False,
-                "SearchData": "",
+                "SearchData": search_data,
                 "Page": str(page),
                 "OnlyLookAbnormalFile": 0,
             }
@@ -297,7 +297,11 @@ class Pan123:
             down_load_url, timeout=10, allow_redirects=False
         ).text
         url_pattern = re.compile(r"href='(https?://[^']+)'")
-        redirect_url = url_pattern.findall(next_to_get)[0]
+        matches = url_pattern.findall(next_to_get)
+        if not matches:
+            logger.error("未找到重定向链接，响应内容: %s", next_to_get[:200])
+            return -1
+        redirect_url = matches[0]
         if showlink:
             logger.info(f"获取下载链接成功: {redirect_url}")
 
@@ -377,6 +381,86 @@ class Pan123:
             return False
         logger.info(f"重命名成功: {new_name}")
         return True
+
+    def move_file(self, file_id_list, target_parent_id):
+        """移动文件或文件夹到目标目录
+
+        Args:
+            file_id_list: 文件ID列表，如 [123, 456]
+            target_parent_id: 目标父文件夹ID
+
+        Returns:
+            bool: 是否成功
+        """
+        data = {
+            "fileIdList": [{"FileId": fid} for fid in file_id_list],
+            "parentFileId": target_parent_id,
+        }
+        move_res = self._api_request(
+            self.session.post,
+            "https://www.123pan.com/b/api/file/mod_pid",
+            data=json.dumps(data),
+            headers=self.header_logined,
+            timeout=10,
+        )
+        move_json = move_res.json()
+        code = move_json.get("code", -1)
+        logger.debug(f"移动文件响应: {move_json}")
+        if code != 0:
+            message = move_json.get("message", "")
+            logger.error(f"移动文件失败: {message}")
+            return False
+        logger.info(f"移动文件成功: {len(file_id_list)} 个文件")
+        return True
+
+    def user_info(self):
+        """获取用户信息（已用空间、总容量、VIP 等）
+
+        Returns:
+            dict: 用户信息，包含 SpaceUsed, SpacePermanent 等
+            None: 失败时返回 None
+        """
+        res = self._api_request(
+            self.session.get,
+            "https://api.123pan.cn/b/api/user/info",
+            headers=self.header_logined,
+            timeout=10,
+        )
+        res_json = res.json()
+        code = res_json.get("code", -1)
+        if code != 0:
+            message = res_json.get("message", "")
+            logger.error(f"获取用户信息失败: {message}")
+            return None
+        return res_json.get("data")
+
+    def file_details(self, file_ids):
+        """获取文件/文件夹详情
+
+        Args:
+            file_ids: 文件ID列表，如 [123, 456]
+
+        Returns:
+            dict: 详情数据，包含 fileNum, dirNum, totalSize, paths 等
+            None: 失败时返回 None
+        """
+        data = {"file_ids": file_ids}
+        res = self._api_request(
+            self.session.post,
+            "https://www.123pan.com/b/api/restful/goapi/v1/file/details",
+            data=json.dumps(data),
+            headers=self.header_logined,
+            timeout=10,
+        )
+        res_json = res.json()
+        code = res_json.get("code", -1)
+        if code != 0:
+            message = res_json.get("message", "")
+            logger.error(f"获取文件详情失败: {message}")
+            return None
+        data = res_json.get("data")
+        logger.debug(f"file_details 响应 paths: {data.get('paths') if data else None}")
+        return data
 
     def share(self, file_id_list, share_pwd=""):
         """分享文件"""
@@ -675,7 +759,7 @@ class Pan123:
                 self.session.post,
                 url,
                 headers=headers,
-                data=list_up_request,
+                data=json.dumps(list_up_request),
                 timeout=30,
             )
             res_json = res.json()

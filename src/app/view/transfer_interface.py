@@ -1,8 +1,7 @@
 from pathlib import Path
-import threading
 import uuid
 
-from PyQt6.QtCore import QCoreApplication, Qt, QThread, QTimer, QUrl, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, QTimer, QUrl, pyqtSignal
 from PyQt6.QtGui import QDesktopServices
 from PyQt6.QtWidgets import (
     QComboBox,
@@ -598,7 +597,7 @@ class TransferInterface(QWidget):
             "file_name": file_name, "file_id": file_id,
             "file_type": file_type, "file_size": file_size,
             "save_path": save_path, "current_dir_id": current_dir_id,
-            "etag": etag, "s3key_flag": int(s3key_flag),
+            "etag": etag, "s3key_flag": int(bool(s3key_flag)),
             "status": "等待中", "metadata_version": DOWNLOAD_METADATA_VERSION,
         })
         self.__update_download_table()
@@ -633,7 +632,6 @@ class TransferInterface(QWidget):
             Database.instance().update_download_task(task.resume_id, progress=progress)
         elif isinstance(task, UploadTask) and task.db_task_id:
             Database.instance().update_upload_task(task.db_task_id, progress=progress)
-        QCoreApplication.processEvents()
         self.__refresh_table_for(task)
 
     def __update_task_status(self, task, status):
@@ -653,7 +651,6 @@ class TransferInterface(QWidget):
                 )
         elif isinstance(task, UploadTask) and task.db_task_id:
             Database.instance().update_upload_task(task.db_task_id, status=status)
-        QCoreApplication.processEvents()
         self.__refresh_table_for(task)
         if terminal:
             if isinstance(task, UploadTask):

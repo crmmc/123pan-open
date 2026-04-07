@@ -1,13 +1,13 @@
 from pathlib import Path
 
 from PyQt6.QtCore import Qt
-from PyQt6.QtCore import QEvent, QRunnable, QThreadPool, pyqtSignal, QObject, QTimer
+from PyQt6.QtCore import QEvent, QRunnable, QThreadPool, pyqtSignal, QObject
 from PyQt6.QtWidgets import (
     QAbstractItemView,
+    QDialog,
     QFrame,
     QHBoxLayout,
     QHeaderView,
-    QTreeWidget,
     QTreeWidgetItem,
     QVBoxLayout,
     QWidget,
@@ -16,7 +16,7 @@ from PyQt6.QtWidgets import (
     QFileDialog,
     QMenu,
 )
-from PyQt6.QtGui import QAction
+from PyQt6.QtGui import QAction, QShortcut, QKeySequence
 
 from qfluentwidgets import FluentIcon as FIF
 from qfluentwidgets import (
@@ -33,14 +33,18 @@ from qfluentwidgets import (
     ProgressBar,
     RoundMenu,
     MessageBox,
+    SearchLineEdit,
+    ToolButton,
 )
 
 from ..common.style_sheet import StyleSheet
 from ..common.api import format_file_size
-from ..common.const import MAX_STORAGE_CAPACITY
+
 from ..common.log import get_logger
 from .newfolder_window import NewFolderDialog
 from .rename_window import RenameDialog
+from .move_window import MoveDialog
+from .search_window import SearchDialog
 
 logger = get_logger(__name__)
 
@@ -75,27 +79,47 @@ class FileInterface(QWidget):
     def __createTopBar(self):
         self.topBarFrame = QFrame(self)
         self.topBarFrame.setObjectName("frame")
-        self.topBarLayout = QHBoxLayout(self.topBarFrame)
-        self.topBarLayout.setContentsMargins(12, 10, 12, 10)
-        self.topBarLayout.setSpacing(8)
+        self.topBarOuterLayout = QVBoxLayout(self.topBarFrame)
+        self.topBarOuterLayout.setContentsMargins(12, 10, 12, 10)
+        self.topBarOuterLayout.setSpacing(6)
 
-        self.breadcrumbBar = BreadcrumbBar(self.topBarFrame)
+        # 第一行：操作按钮 + 搜索
+        self.actionBarLayout = QHBoxLayout()
+        self.actionBarLayout.setSpacing(8)
 
-        # 右侧按钮
         self.newFolderButton = PushButton(
             FIF.FOLDER_ADD.icon(), "新建文件夹", self.topBarFrame
         )
         self.__createUploadButtonGroup()
         self.downloadButton = PushButton(FIF.DOWNLOAD.icon(), "下载", self.topBarFrame)
         self.deleteButton = PushButton(FIF.DELETE.icon(), "删除", self.topBarFrame)
+
+        self.searchBar = SearchLineEdit(self.topBarFrame)
+        self.searchBar.setPlaceholderText("搜索文件")
+        self.searchBar.setFixedWidth(200)
+
+        self.actionBarLayout.addWidget(self.newFolderButton)
+        self.actionBarLayout.addWidget(self.uploadButtonGroup)
+        self.actionBarLayout.addWidget(self.downloadButton)
+        self.actionBarLayout.addWidget(self.deleteButton)
+        self.actionBarLayout.addStretch(1)
+        self.actionBarLayout.addWidget(self.searchBar)
+
+        # 第二行：返回 + 面包屑 + 刷新
+        self.navBarLayout = QHBoxLayout()
+        self.navBarLayout.setSpacing(4)
+
+        self.backButton = ToolButton(FIF.LEFT_ARROW, self.topBarFrame)
+        self.backButton.setToolTip("返回上一级")
+        self.breadcrumbBar = BreadcrumbBar(self.topBarFrame)
         self.refreshButton = PushButton(FIF.UPDATE.icon(), "刷新", self.topBarFrame)
 
-        self.topBarLayout.addWidget(self.breadcrumbBar, 1)
-        self.topBarLayout.addWidget(self.newFolderButton, 0)
-        self.topBarLayout.addWidget(self.uploadButtonGroup, 0)
-        self.topBarLayout.addWidget(self.downloadButton, 0)
-        self.topBarLayout.addWidget(self.deleteButton, 0)
-        self.topBarLayout.addWidget(self.refreshButton, 0)
+        self.navBarLayout.addWidget(self.backButton, 0)
+        self.navBarLayout.addWidget(self.breadcrumbBar, 1)
+        self.navBarLayout.addWidget(self.refreshButton, 0)
+
+        self.topBarOuterLayout.addLayout(self.actionBarLayout)
+        self.topBarOuterLayout.addLayout(self.navBarLayout)
 
         self.mainLayout.addWidget(self.topBarFrame, 0)
 
@@ -179,6 +203,10 @@ class FileInterface(QWidget):
             header.sortIndicatorChanged.connect(self.__onHeaderSortIndicatorChanged)
         self.listLayout.addWidget(self.fileTable)
 
+        self.statusLabel = BodyLabel("", self.listFrame)
+        self.statusLabel.setStyleSheet("font-size: 12px; color: gray; padding: 4px 8px;")
+        self.listLayout.addWidget(self.statusLabel)
+
         self.contentLayout.addWidget(self.treeFrame, 1)
         self.contentLayout.addWidget(self.listFrame, 6)
 
@@ -187,6 +215,7 @@ class FileInterface(QWidget):
     def __initWidget(self):
         StyleSheet.VIEW_INTERFACE.apply(self)
         self.__connectSignalToSlot()
+        self.__setupShortcuts()
         self.setAcceptDrops(True)
         self.fileTable.viewport().setAcceptDrops(True)
         self.fileTable.viewport().installEventFilter(self)
@@ -219,12 +248,59 @@ class FileInterface(QWidget):
         self.folderTree.itemClicked.connect(self.__onTreeItemClicked)
         self.folderTree.itemExpanded.connect(self.__onTreeItemExpanded)
         self.fileTable.itemDoubleClicked.connect(self.__onTableItemDoubleClicked)
+        self.fileTable.itemSelectionChanged.connect(self.__updateStatusLabel)
         self.breadcrumbBar.currentItemChanged.connect(self.__onBreadcrumbItemChanged)
         self.newFolderButton.clicked.connect(self.__createNewFolder)
         self.uploadButton.clicked.connect(self.__uploadFile)
         self.downloadButton.clicked.connect(self.__downloadFile)
         self.deleteButton.clicked.connect(self.__deleteFile)
         self.refreshButton.clicked.connect(self.__refreshFileList)
+        self.backButton.clicked.connect(self.__goUpToParent)
+        self.searchBar.searchSignal.connect(self.__onSearch)
+        self.searchBar.returnPressed.connect(self.searchBar.search)
+
+    def __setupShortcuts(self):
+        QShortcut(QKeySequence(Qt.Key.Key_Delete), self).activated.connect(
+            self.__onDeleteShortcut
+        )
+        QShortcut(QKeySequence(Qt.Key.Key_F2), self).activated.connect(
+            self.__onRenameShortcut
+        )
+        QShortcut(QKeySequence(Qt.Key.Key_F5), self).activated.connect(
+            self.__refreshFileList
+        )
+        QShortcut(QKeySequence("Ctrl+F"), self).activated.connect(
+            self.searchBar.setFocus
+        )
+        QShortcut(QKeySequence(Qt.Key.Key_Backspace), self).activated.connect(
+            self.__onBackspaceShortcut
+        )
+
+    def __onDeleteShortcut(self):
+        if self.searchBar.hasFocus():
+            return
+        self.__deleteFile()
+
+    def __onRenameShortcut(self):
+        if self.searchBar.hasFocus():
+            return
+        self.__renameFile()
+
+    def __onBackspaceShortcut(self):
+        if self.searchBar.hasFocus():
+            return
+        self.__goUpToParent()
+
+    def __goUpToParent(self):
+        if len(self.path_stack) <= 1:
+            return
+        self.path_stack.pop()
+        self.current_dir_id = self.path_stack[-1][0]
+        self.__loadCurrentList()
+        self.__updateBreadcrumb()
+        tree_item = self.__findTreeItemById(self.current_dir_id)
+        if tree_item:
+            self.folderTree.setCurrentItem(tree_item)
 
     def __createUploadButtonGroup(self):
         self.uploadMenu = RoundMenu(parent=self)
@@ -292,6 +368,14 @@ class FileInterface(QWidget):
             local_paths.append(Path(local_file))
 
         return local_paths
+
+    def reload(self):
+        """公开方法：重新加载 pan 数据和文件列表"""
+        self.__loadPanAndData()
+
+    def refresh(self):
+        """公开方法：刷新当前文件列表"""
+        self.__refreshFileList()
 
     def __loadPanAndData(self):
         try:
@@ -366,7 +450,6 @@ class FileInterface(QWidget):
         self.path_stack = self.__buildPathStackFromTree(item)
         self.__loadCurrentList()
         self.__updateBreadcrumb()
-        self.__updateBackButtonState()
 
     def __buildPathStackFromTree(self, item):
         stack = []
@@ -379,20 +462,6 @@ class FileInterface(QWidget):
 
         stack.reverse()
         return stack if stack else [(0, "根目录")]
-
-    def __goParentDir(self):
-        if len(self.path_stack) <= 1:
-            return
-
-        self.path_stack.pop()
-        self.current_dir_id = self.path_stack[-1][0]
-        self.__loadCurrentList()
-        self.__updateBreadcrumb()
-        self.__updateBackButtonState()
-
-        current_item = self.__findTreeItemById(self.current_dir_id)
-        if current_item:
-            self.folderTree.setCurrentItem(current_item)
 
     def __onTableItemDoubleClicked(self, item):
         row = item.row()
@@ -411,7 +480,6 @@ class FileInterface(QWidget):
         self.path_stack.append((file_id, name))
         self.__loadCurrentList()
         self.__updateBreadcrumb()
-        self.__updateBackButtonState()
 
         tree_item = self.__findTreeItemById(file_id)
         if tree_item:
@@ -434,11 +502,13 @@ class FileInterface(QWidget):
         # 提交任务到线程池
         QThreadPool.globalInstance().start(task)
 
-    def __fetchDirList(self, dir_id):
+    def __fetchDirList(self, dir_id, search_data=""):
         if not self.pan:
             return []
         try:
-            code, items = self.pan.get_dir_by_id(dir_id, save=False, all=True, limit=100)
+            code, items = self.pan.get_dir_by_id(
+                dir_id, save=False, all=True, limit=100, search_data=search_data
+            )
             return items if code == 0 else []
         except Exception:
             return []
@@ -448,16 +518,17 @@ class FileInterface(QWidget):
         class LoadListSignals(QObject):
             finished = pyqtSignal(list, str)  # file_items, error
 
-        def __init__(self, fetch_method, dir_id):
+        def __init__(self, fetch_method, dir_id, search_data=""):
             super().__init__()
             self.fetch_method = fetch_method
             self.dir_id = dir_id
+            self.search_data = search_data
             # 将信号对象作为成员变量，防止被垃圾回收
             self.signals = self.LoadListSignals()
 
         def run(self):
             try:
-                file_items = self.fetch_method(self.dir_id)
+                file_items = self.fetch_method(self.dir_id, self.search_data)
                 self.signals.finished.emit(file_items, "")
             except Exception as e:
                 self.signals.finished.emit([], str(e))
@@ -562,7 +633,6 @@ class FileInterface(QWidget):
         self.path_stack = self.path_stack[: target_index + 1]
         self.current_dir_id = target_dir_id
         self.__loadCurrentList()
-        self.__updateBackButtonState()
 
         tree_item = self.__findTreeItemById(target_dir_id)
         if tree_item:
@@ -711,6 +781,7 @@ class FileInterface(QWidget):
             sorted_items = self.__sortFileList(file_items)
             # 更新文件列表（轻量级UI操作）
             self.__updateFileListUI(sorted_items)
+        self.__updateStatusLabel()
 
     def __sortFileList(self, file_items):
         """对文件列表进行排序，文件夹始终在前"""
@@ -725,23 +796,15 @@ class FileInterface(QWidget):
             else:  # 文件
                 files.append(item)
 
-        # 根据排序模式对文件夹和文件分别排序
-        if self.sort_mode == 0:  # 按名称排序（仅翻转，不按字母排序）
-            # 不排序，保持原始顺序，但可以翻转
-            pass
+        reverse = not self.sort_ascending
+        if self.sort_mode == 0:  # 按名称排序
+            folders.sort(key=lambda x: x.get("FileName", ""), reverse=reverse)
+            files.sort(key=lambda x: x.get("FileName", ""), reverse=reverse)
         elif self.sort_mode == 2:  # 按大小排序
-            # sort_ascending=True 表示升序（小到大），reverse=False
-            # sort_ascending=False 表示降序（大到小），reverse=True
-            reverse = not self.sort_ascending
             folders.sort(key=lambda x: int(x.get("Size", 0) or 0), reverse=reverse)
             files.sort(key=lambda x: int(x.get("Size", 0) or 0), reverse=reverse)
 
-        # 合并结果：文件夹在前，文件在后
         result = folders + files
-
-        # 如果是按名称排序且需要降序，则翻转整个列表
-        if self.sort_mode == 0 and not self.sort_ascending:
-            result.reverse()
 
         return result
 
@@ -800,40 +863,6 @@ class FileInterface(QWidget):
 
                 # 添加占位符
                 self.__addPlaceholder(child)
-
-    def __getExpandedItems(self):
-        """获取树的展开状态"""
-        expanded_items = []
-
-        def collect_expanded_items(item):
-            if item.isExpanded():
-                item_id = item.data(0, Qt.ItemDataRole.UserRole)
-                if item_id:
-                    expanded_items.append(item_id)
-
-            for i in range(item.childCount()):
-                collect_expanded_items(item.child(i))
-
-        root = self.folderTree.invisibleRootItem()
-        for i in range(root.childCount()):
-            collect_expanded_items(root.child(i))
-
-        return expanded_items
-
-    def __restoreExpandedItems(self, expanded_items):
-        """恢复树的展开状态"""
-
-        def expand_items(item):
-            item_id = item.data(0, Qt.ItemDataRole.UserRole)
-            if item_id and item_id in expanded_items:
-                item.setExpanded(True)
-
-            for i in range(item.childCount()):
-                expand_items(item.child(i))
-
-        root = self.folderTree.invisibleRootItem()
-        for i in range(root.childCount()):
-            expand_items(root.child(i))
 
     def __uploadFile(self):
         """上传文件"""
@@ -936,7 +965,7 @@ class FileInterface(QWidget):
 
         # 多选且需要询问位置时，弹一次目录选择
         download_dir = default_download_path
-        if not ask_download_location:
+        if ask_download_location:
             if len(rows) > 1:
                 chosen = QFileDialog.getExistingDirectory(
                     self, "选择下载目录", default_download_path,
@@ -998,6 +1027,110 @@ class FileInterface(QWidget):
         self.__loadCurrentList()
         # 同时更新云盘存储信息
         self.load_and_update_storage_info()
+
+    def __onSearch(self, text):
+        if not self.pan:
+            return
+        dlg = SearchDialog(self.pan, self)
+        dlg.searchBar.setText(text)
+        dlg.searchBar.search()
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            result = dlg.get_result()
+            if result:
+                self.__jumpToFile(result)
+
+    def __jumpToFile(self, result):
+        """搜索结果跳转：进入文件所在目录并选中"""
+        file_id = int(result.get("FileId", 0))
+        file_type = int(result.get("Type", 0))
+        parent_id = int(result.get("ParentFileId", 0))
+
+        if file_type == 1:
+            target_dir_id = file_id
+            select_file_id = None
+        else:
+            target_dir_id = parent_id
+            select_file_id = file_id
+
+        class JumpSignals(QObject):
+            finished = pyqtSignal(object, int, object, str)
+
+        class JumpTask(QRunnable):
+            def __init__(self, pan, file_id, target_dir_id, select_file_id, signals):
+                super().__init__()
+                self.pan = pan
+                self.file_id = file_id
+                self.target_dir_id = target_dir_id
+                self.select_file_id = select_file_id
+                self.signals = signals
+
+            def run(self):
+                try:
+                    details = self.pan.file_details([self.file_id])
+                    detail_paths = details.get("paths", []) if details else []
+                    self.signals.finished.emit(
+                        detail_paths, self.target_dir_id, self.select_file_id, ""
+                    )
+                except Exception as e:
+                    self.signals.finished.emit([], self.target_dir_id, None, str(e))
+
+        self._jump_signals = JumpSignals()
+        self._jump_signals.finished.connect(self.__onJumpFinished)
+        task = JumpTask(self.pan, file_id, target_dir_id, select_file_id, self._jump_signals)
+        QThreadPool.globalInstance().start(task)
+
+    def __onJumpFinished(self, detail_paths, target_dir_id, select_file_id, error):
+        if error:
+            InfoBar.error(title="跳转失败", content=error, parent=self)
+            return
+
+        # 从 detail_paths 构建 path_stack（包含 fileId）
+        self.path_stack = [(0, "根目录")]
+        for p in detail_paths:
+            fid = int(p.get("fileId", 0))
+            fname = p.get("fileName", "")
+            if fid != 0:
+                self.path_stack.append((fid, fname))
+        if self.path_stack[-1][0] != target_dir_id:
+            for p in detail_paths:
+                if int(p.get("fileId", 0)) == target_dir_id:
+                    self.path_stack.append((target_dir_id, p.get("fileName", "")))
+                    break
+
+        self.current_dir_id = target_dir_id
+        self.__updateBreadcrumb()
+
+        # 加载目标目录内容，完成后选中文件
+        self.fileTable.setRowCount(0)
+        task = self.LoadListTask(self.__fetchDirList, target_dir_id)
+
+        if select_file_id is not None:
+            def on_loaded(file_items, err):
+                self.__onLoadListFinished(file_items, err)
+                if not err:
+                    for row in range(self.fileTable.rowCount()):
+                        name_item = self.fileTable.item(row, 0)
+                        if name_item and int(name_item.data(Qt.ItemDataRole.UserRole)) == select_file_id:
+                            self.fileTable.selectRow(row)
+                            self.fileTable.scrollToItem(name_item)
+                            break
+            task.signals.finished.connect(on_loaded)
+        else:
+            task.signals.finished.connect(self.__onLoadListFinished)
+
+        QThreadPool.globalInstance().start(task)
+
+        tree_item = self.__findTreeItemById(target_dir_id)
+        if tree_item:
+            self.folderTree.setCurrentItem(tree_item)
+
+    def __updateStatusLabel(self):
+        count = len(self.__getSelectedRows())
+        total = self.fileTable.rowCount()
+        if count:
+            self.statusLabel.setText(f"已选中 {count} 个，共 {total} 个")
+        else:
+            self.statusLabel.setText(f"共 {total} 个")
 
     def __deleteFile(self, file_id=None, file_name=None):
         """删除文件（支持多选 + 确认弹窗）"""
@@ -1265,6 +1398,142 @@ class FileInterface(QWidget):
                 # 显示错误信息
                 InfoBar.error(title="重命名失败", content="重命名失败", parent=self)
 
+    def __moveFile(self):
+        """移动文件到目标文件夹"""
+        rows = self.__getSelectedRows()
+        if not rows:
+            InfoBar.warning(title="移动错误", content="请选择要移动的文件", parent=self)
+            return
+
+        # 收集待移动文件信息
+        move_list = []
+        for row in rows:
+            name_item = self.fileTable.item(row, 0)
+            move_list.append((
+                name_item.data(Qt.ItemDataRole.UserRole),
+                name_item.text(),
+            ))
+
+        # 弹出目标文件夹选择弹窗
+        dialog = MoveDialog(self.pan, self.current_dir_id, self)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+
+        target_id, target_name = dialog.get_target()
+        if target_id is None:
+            return
+
+        # 不允许移动到当前目录
+        if target_id == self.current_dir_id:
+            InfoBar.warning(title="移动错误", content="目标文件夹与当前文件夹相同", parent=self)
+            return
+
+        # 后台执行移动
+        file_id_list = [fid for fid, _ in move_list]
+
+        class MoveFilesSignals(QObject):
+            finished = pyqtSignal(bool, int, str, str)
+
+        class MoveFilesTask(QRunnable):
+            def __init__(self, pan, file_id_list, target_id, target_name, signals):
+                super().__init__()
+                self.pan = pan
+                self.file_id_list = file_id_list
+                self.target_id = target_id
+                self.target_name = target_name
+                self.signals = signals
+
+            def run(self):
+                try:
+                    success = self.pan.move_file(self.file_id_list, self.target_id)
+                    self.signals.finished.emit(
+                        success, len(self.file_id_list), self.target_name, ""
+                    )
+                except Exception as e:
+                    self.signals.finished.emit(False, 0, self.target_name, str(e))
+
+        signals = MoveFilesSignals()
+        signals.finished.connect(self.__onMoveFilesFinished)
+        task = MoveFilesTask(self.pan, file_id_list, target_id, target_name, signals)
+        QThreadPool.globalInstance().start(task)
+
+    def __onMoveFilesFinished(self, success, count, target_name, error):
+        """移动文件完成回调"""
+        if error:
+            InfoBar.error(
+                title="移动失败", content=f"移动文件时发生错误: {error}", parent=self
+            )
+            return
+        if success:
+            InfoBar.success(
+                title="移动成功",
+                content=f"已将 {count} 个文件移动到「{target_name}」",
+                parent=self,
+            )
+            self.__refreshFileList()
+        else:
+            InfoBar.error(title="移动失败", content="移动文件失败", parent=self)
+
+    def __showFileDetails(self):
+        """显示文件/文件夹详情"""
+        rows = self.__getSelectedRows()
+        if not rows:
+            return
+
+        name_item = self.fileTable.item(rows[0], 0)
+        file_id = name_item.data(Qt.ItemDataRole.UserRole)
+        file_name = name_item.text()
+
+        class FileDetailsSignals(QObject):
+            finished = pyqtSignal(str, object, str)
+
+        class FileDetailsTask(QRunnable):
+            def __init__(self, pan, file_id, file_name, signals):
+                super().__init__()
+                self.pan = pan
+                self.file_id = file_id
+                self.file_name = file_name
+                self.signals = signals
+
+            def run(self):
+                try:
+                    data = self.pan.file_details([self.file_id])
+                    self.signals.finished.emit(self.file_name, data, "")
+                except Exception as e:
+                    self.signals.finished.emit(self.file_name, None, str(e))
+
+        signals = FileDetailsSignals()
+        signals.finished.connect(self.__onFileDetailsFinished)
+        task = FileDetailsTask(self.pan, file_id, file_name, signals)
+        QThreadPool.globalInstance().start(task)
+
+    def __onFileDetailsFinished(self, file_name, data, error):
+        """文件详情回调"""
+        if error or data is None:
+            InfoBar.error(
+                title="获取详情失败",
+                content=error or "未知错误",
+                parent=self,
+            )
+            return
+
+        file_num = data.get("fileNum", 0)
+        dir_num = data.get("dirNum", 0)
+        total_size = int(data.get("totalSize", 0))
+        paths = data.get("paths", [])
+
+        path_str = " / ".join(p.get("fileName", "") for p in paths)
+        lines = [f"路径：{path_str}"]
+        if dir_num > 0:
+            lines.append(f"文件夹数：{dir_num}")
+        if file_num > 0:
+            lines.append(f"文件数：{file_num}")
+        lines.append(f"总大小：{format_file_size(total_size)}")
+
+        msg = MessageBox(f"「{file_name}」详情", "\n".join(lines), self)
+        msg.cancelButton.hide()
+        msg.exec()
+
     def __onFileTableContextMenu(self, position):
         """文件表格右键菜单"""
         # 获取鼠标点击位置的行
@@ -1292,109 +1561,68 @@ class FileInterface(QWidget):
             rename_action.triggered.connect(self.__renameFile)
             menu.addAction(rename_action)
 
+        # 移动到
+        move_action = QAction(FIF.MOVE.icon(), "移动到", self)
+        move_action.triggered.connect(self.__moveFile)
+        menu.addAction(move_action)
+
         # 删除
         delete_action = QAction(FIF.DELETE.icon(), "删除", self)
         delete_action.triggered.connect(self.__deleteFile)
         menu.addAction(delete_action)
 
+        menu.addSeparator()
+
+        # 详情（仅单选时显示）
+        if len(selected_rows) == 1:
+            detail_action = QAction(FIF.INFO.icon(), "详情", self)
+            detail_action.triggered.connect(self.__showFileDetails)
+            menu.addAction(detail_action)
+
         menu.exec(self.fileTable.mapToGlobal(position))
 
-    def update_storage_info(self, used_text):
-        """更新云盘存储信息"""
-        max_capacity = MAX_STORAGE_CAPACITY
-        total_text = format_file_size(max_capacity)
-
-        # 解析 used_text 来获取字节数，用于计算百分比
-        # 格式示例: "1.5 GB", "512 MB", "2 KB", "1024 B"
-        try:
-            parts = used_text.split()
-            if len(parts) == 2:
-                value = float(parts[0])
-                unit = parts[1].upper()
-
-                # 转换为字节
-                if unit == "GB":
-                    used_bytes = int(value * 1024 * 1024 * 1024)
-                elif unit == "MB":
-                    used_bytes = int(value * 1024 * 1024)
-                elif unit == "KB":
-                    used_bytes = int(value * 1024)
-                else:  # B
-                    used_bytes = int(value)
-
-                # 计算使用百分比
-                usage_percent = (used_bytes / max_capacity * 100) if max_capacity > 0 else 0
-            else:
-                usage_percent = 0
-        except Exception as e:
-            logger.error(f"解析存储信息时发生错误: {e}")
-            usage_percent = 0
-
-        # 更新进度条
-        self.storageProgressBar.setValue(int(usage_percent))
-
-        # 更新文本显示
-        self.storageValueLabel.setText(f"{used_text} / {total_text}")
-
-    def calculate_total_storage(self, dir_id=0):
-        """
-        统计指定目录下的总存储使用量
+    def update_storage_info(self, info):
+        """更新云盘存储信息
 
         Args:
-            dir_id: 目录ID，默认为0（根目录）
-
-        Returns:
-            格式化后的总存储使用量字符串（如 "1.5 GB"）
+            info: (used_bytes, total_bytes) 元组
         """
-        total_size_mb = 0.0
+        used_bytes, total_bytes = info
+        used_text = format_file_size(used_bytes)
+        total_text = format_file_size(total_bytes)
 
-        try:
-            # 获取当前目录的文件列表，使用 all=True 确保获取所有文件
-            code, items = self.pan.get_dir_by_id(dir_id, save=False, all=True, limit=1000)
+        usage_percent = (used_bytes / total_bytes * 100) if total_bytes > 0 else 0
 
-            if code != 0 or not items:
-                return "0 B"
+        self.storageProgressBar.setValue(int(usage_percent))
+        self.storageValueLabel.setText(f"{used_text} / {total_text}")
 
-            # 遍历文件列表
-            for item in items:
-                file_size = int(item.get("Size", 0) or 0)
-                # 先转换为MB，再累计
-                file_size_mb = file_size / (1024 * 1024)
-                total_size_mb += file_size_mb
+    class StorageTask(QRunnable):
+        class StorageSignals(QObject):
+            finished = pyqtSignal(object)
 
-        except Exception as e:
-            # 如果某个目录访问失败，返回0
-            logger.error(f"统计目录 {dir_id} 时发生错误: {e}")
-            return "0 B"
+        def __init__(self, pan):
+            super().__init__()
+            self.pan = pan
+            self.signals = self.StorageSignals()
 
-        # 将MB转换回字节，然后格式化
-        total_size_bytes = int(total_size_mb * 1024 * 1024)
-        return format_file_size(total_size_bytes)
+        def run(self):
+            try:
+                data = self.pan.user_info()
+                if data:
+                    used = int(data.get("SpaceUsed", 0))
+                    total = int(data.get("SpacePermanent", 0))
+                    self.signals.finished.emit((used, total))
+                else:
+                    self.signals.finished.emit((0, 0))
+            except Exception as e:
+                logger.error(f"获取存储信息失败: {e}")
+                self.signals.finished.emit((0, 0))
 
     def load_and_update_storage_info(self):
-        """统计并更新云盘存储信息"""
+        """通过 user_info API 获取并更新云盘存储信息"""
         if not self.pan:
             return
 
-        # 创建后台任务来统计存储信息
-        class StorageTask(QRunnable):
-            class StorageSignals(QObject):
-                finished = pyqtSignal(str)  # formatted storage size string
-
-            def __init__(self, file_interface):
-                super().__init__()
-                self.file_interface = file_interface
-                self.signals = self.StorageSignals()
-
-            def run(self):
-                try:
-                    total_size = self.file_interface.calculate_total_storage(0)
-                    self.signals.finished.emit(total_size)
-                except Exception as e:
-                    logger.error(f"统计存储信息时发生错误: {e}")
-                    self.signals.finished.emit("0 B")
-
-        # 创建并启动任务
-        task = StorageTask(self)
+        task = self.StorageTask(self.pan)
         task.signals.finished.connect(self.update_storage_info)
         QThreadPool.globalInstance().start(task)

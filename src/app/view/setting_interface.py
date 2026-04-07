@@ -18,7 +18,7 @@ from qfluentwidgets import FluentIcon as FIF
 
 from ..common.config import isWin11
 from ..common.database import Database
-from ..common.const import YEAR, ABOUT_URL, VERSION
+from ..common.const import YEAR, ABOUT_URL, VERSION, BUILD_TIME
 from ..common.style_sheet import StyleSheet
 
 
@@ -145,11 +145,14 @@ class SettingInterface(ScrollArea):
         )
 
         self.aboutGroup = SettingCardGroup(self.tr("关于"), self.scrollWidget)
+        about_text = f"123pan {VERSION} © Copyright {YEAR}"
+        if BUILD_TIME:
+            about_text += f"  |  构建于 {BUILD_TIME}"
         self.aboutCard = PrimaryPushSettingCard(
             self.tr("项目页面"),
             FIF.INFO,
             self.tr("关于"),
-            "123pan" + f"{VERSION}" + " © Copyright" + f" {YEAR}",
+            about_text,
             self.aboutGroup,
         )
 
