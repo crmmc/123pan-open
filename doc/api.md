@@ -70,10 +70,7 @@ username = config.get("userName", "")
 - `show()`: 显示文件列表信息。
 - `link_by_number(file_number, showlink=True)`: 按编号获取下载链接。
 - `link_by_fileDetail(file_detail, showlink=True)`: 按文件详情获取下载链接。
-- `download(file_number, download_path="download")`: 下载文件。
-- `download_from_url(url, file_name, download_path="download")`: 从 URL 下载文件。
 - `get_all_things(id)`: 获取文件夹内所有内容。
-- `download_dir(file_detail, download_path_root="download")`: 下载文件夹。
 - `recycle()`: 获取回收站列表。
 - `delete_file(file, by_num=True, operation=True)`: 删除或恢复文件。
 - `share(file_id_list, share_pwd="")`: 分享文件。
@@ -83,7 +80,6 @@ username = config.get("userName", "")
 - `read_ini(user_name, pass_word, input_pwd, authorization)`: 从配置文件读取账号信息。
 - `mkdir(dirname, remakedir=False)`: 创建文件夹。
 - `_compute_file_md5(file_path)`: 计算文件 MD5 值。
-- `stream_download_by_number(file_number, download_dir, task_id=None, signals=None, task=None)`: 流式下载文件，支持进度和取消。
 - `upload_file_stream(file_path, dup_choice=1, task_id=None, signals=None, task=None)`: 流式上传文件，支持进度和取消。
 
 #### TransferTask 类
@@ -103,7 +99,8 @@ username = config.get("userName", "")
 from .api import Pan123
 pan = Pan123(user_name="your_username", pass_word="your_password")
 pan.get_dir()
-pan.download(0)  # 下载第一个文件
+file_detail = pan.list[0]
+url = pan.link_by_fileDetail(file_detail)
 ```
 
 ---
@@ -238,37 +235,6 @@ url = pan.link_by_fileDetail(file_detail, showlink=True)
   url = pan.link_by_fileDetail(file_detail)
   ```
 
-#### download(file_number, download_path="download")
-```python
-pan.download(0, download_path="download")
-```
-- **参数**:
-  - `file_number`: int, 文件索引。
-  - `download_path`: str, 下载路径。默认 "download"。
-- **返回值**: 无。
-- **说明**: 下载指定文件。如果是文件夹，会下载为 ZIP。
-- **异常**: 如果索引无效或下载失败，记录错误。
-- **示例**:
-  ```python
-  pan.download(0, "/home/user/downloads")
-  ```
-
-#### download_from_url(url, file_name, download_path="download")
-```python
-pan.download_from_url("https://example.com/file.zip", "file.zip", "download")
-```
-- **参数**:
-  - `url`: str, 下载 URL。
-  - `file_name`: str, 文件名。
-  - `download_path`: str, 下载路径。默认 "download"。
-- **返回值**: 无。
-- **说明**: 从指定 URL 下载文件到本地。
-- **异常**: 如果路径不存在，会创建；下载失败记录错误。
-- **示例**:
-  ```python
-  pan.download_from_url(url, "example.zip")
-  ```
-
 #### get_all_things(id)
 ```python
 pan.get_all_things(12345)
@@ -281,22 +247,6 @@ pan.get_all_things(12345)
 - **示例**:
   ```python
   pan.get_all_things(0)  # 获取根目录所有内容
-  ```
-
-#### download_dir(file_detail, download_path_root="download")
-```python
-pan.download_dir(file_detail, "download")
-```
-- **参数**:
-  - `file_detail`: dict, 文件夹详情。
-  - `download_path_root`: str, 下载根路径。默认 "download"。
-- **返回值**: 无。
-- **说明**: 下载整个文件夹及其内容。
-- **异常**: 如果不是文件夹，记录警告。
-- **示例**:
-  ```python
-  folder = pan.list[0]
-  pan.download_dir(folder)
   ```
 
 #### recycle()
@@ -434,24 +384,6 @@ md5 = pan._compute_file_md5("/path/to/file.txt")
 - **示例**:
   ```python
   hash = pan._compute_file_md5("file.txt")
-  ```
-
-#### stream_download_by_number(file_number, download_dir, task_id=None, signals=None, task=None)
-```python
-path = pan.stream_download_by_number(0, "/download", task_id=1, signals=signals, task=task)
-```
-- **参数**:
-  - `file_number`: int, 文件索引。
-  - `download_dir`: str, 下载目录。
-  - `task_id`: int, 任务 ID（可选）。
-  - `signals`: object, 信号对象（可选）。
-  - `task`: object, 任务对象（可选）。
-- **返回值**: str, 下载文件路径或 "已取消"。
-- **说明**: 流式下载文件，支持进度、暂停和取消。
-- **异常**: 如果链接获取失败或下载出错，抛出异常。
-- **示例**:
-  ```python
-  path = pan.stream_download_by_number(0, "downloads")
   ```
 
 #### upload_file_stream(file_path, dup_choice=1, task_id=None, signals=None, task=None)
