@@ -37,10 +37,6 @@ jobs:
             runner: ubuntu-24.04-arm
             artifact: 123pan-linux-arm64
             binary: 123pan
-          - name: macos-x64
-            runner: macos-13
-            artifact: 123pan-macos-x64
-            binary: 123pan
           - name: macos-arm64
             runner: macos-latest
             artifact: 123pan-macos-arm64
@@ -128,7 +124,6 @@ jobs:
             | Windows | ARM64 | `123pan-windows-arm64.exe` |
             | Linux | x64 | `123pan-linux-x64` |
             | Linux | ARM64 | `123pan-linux-arm64` |
-            | macOS | x64 (Intel) | `123pan-macos-x64` |
             | macOS | ARM64 (Apple Silicon) | `123pan-macos-arm64` |
           files: ./artifacts/**/*
           prerelease: ${{ github.event.inputs.prerelease || false }}
