@@ -1,182 +1,135 @@
 <div align="center">
 
-# 🚀 [123pan](https://www.123panng.top)
+# 123pan
 
-  <p>突破限制 · 高效下载 · 简单易用</p>
-  
-  <div>
-    <a href="https://github.com/123pannextgen/123pan/stargazers"><img src="https://img.shields.io/github/stars/123pannextgen/123pan" alt="Stars"></a>
-    <a href="https://github.com/123pannextgen/123pan/issues"><img src="https://img.shields.io/github/issues/123pannextgen/123pan"></a>
-    <a href="https://github.com/123pannextgen/123pan/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
-    <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.12%2B-blue" alt="Python Version"></a>
-    <a href="https://github.com/123pannextgen/123pan/releases"><img src="https://img.shields.io/github/v/tag/123pannextgen/123pan?label=release" alt="latest_release"></a>
-    <a href="https://github.com/123pannextgen/123pan/releases"><img src="https://img.shields.io/github/downloads/123pannextgen/123pan/total" alt="Downloads"></a>
-  </div>
-  <br>
-  <img src="./doc/image.png" width="600"><img>
+**高性能 123 云盘第三方客户端 | 多线程传输 · 断点续传 · 全平台支持**
+
+<div>
+  <a href="https://github.com/crmmc/123pan/stargazers"><img src="https://img.shields.io/github/stars/crmmc/123pan" alt="Stars"></a>
+  <a href="https://github.com/crmmc/123pan/blob/main/LICENSE"><img src="https://img.shields.io/badge/license-Apache%202.0-green" alt="License"></a>
+  <a href="https://github.com/crmmc/123pan/releases"><img src="https://img.shields.io/github/v/release/crmmc/123pan" alt="Release"></a>
+  <a href="https://github.com/crmmc/123pan/releases"><img src="https://img.shields.io/github/downloads/crmmc/123pan/total" alt="Downloads"></a>
+</div>
+<div>
+  <img src="https://img.shields.io/badge/python-3.12%2B-3776AB?logo=python&logoColor=white" alt="Python">
+  <img src="https://img.shields.io/badge/PyQt6-Fluent%20Design-41CD52?logo=qt&logoColor=white" alt="PyQt6">
+  <img src="https://img.shields.io/badge/platform-Windows%20%7C%20Linux%20%7C%20macOS-lightgrey" alt="Platform">
+  <a href="https://github.com/crmmc/123pan/actions/workflows/build.yaml"><img src="https://img.shields.io/github/actions/workflow/status/crmmc/123pan/build.yaml?label=build&logo=github" alt="Build"></a>
+  <a href="https://github.com/crmmc/123pan/actions/workflows/test.yaml"><img src="https://img.shields.io/github/actions/workflow/status/crmmc/123pan/test.yaml?label=tests&logo=github" alt="Tests"></a>
+</div>
+
+<br>
+
+<img src="./doc/screenshots/main.png" width="720">
+
+<sub>文件管理 · 双栏布局 · 面包屑导航 · 云盘空间卡片</sub>
 
 </div>
 
-## 介绍
+---
 
-123pan是一款基于Python开发的高效下载辅助工具，通过模拟安卓客户端协议，帮助用户绕过123云盘的自用下载流量限制，实现无阻碍下载体验。
+> 基于 [123panNextGen/123pan](https://github.com/123panNextGen/123pan) 重构，采用 PyQt6 + Fluent Design 全新界面，新增多线程传输、断点续传、完整文件管理等功能。采用安卓客户端的 api 端点，实现更稳定的多线程上传功能。解决官方 pc 客户端的上传功能不能跑满多宽带负载均衡的问题。
 
-## 项目源码结构
+## 特性亮点
 
-```
-123pan
-├── config
-├── doc
-│   ├── api.md
-│   ├── image.png  (lfs)
-│   └── todo.md
-├── script
-│   ├── build.sh
-│   └── lint.sh
-├── src
-│   ├── app
-│   │   ├── common
-│   │   │   ├── api.py
-│   │   │   ├── config.py
-│   │   │   ├── const.py
-│   │   │   ├── log.py
-│   │   │   ├── resource.py
-│   │   │   └── style_sheet.py
-│   │   ├── resource
-│   │   │   ├── qss
-│   │   │   │   ├── dark
-│   │   │   │   │   ├── gallery_interface.qss
-│   │   │   │   │   ├── home_interface.qss
-│   │   │   │   │   ├── icon_interface.qss
-│   │   │   │   │   ├── link_card.qss
-│   │   │   │   │   ├── navigation_view_interface.qss
-│   │   │   │   │   ├── sample_card.qss
-│   │   │   │   │   ├── setting_interface.qss
-│   │   │   │   │   └── view_interface.qss
-│   │   │   │   └── light
-│   │   │   │       ├── gallery_interface.qss
-│   │   │   │       ├── home_interface.qss
-│   │   │   │       ├── icon_interface.qss
-│   │   │   │       ├── link_card.qss
-│   │   │   │       ├── navigation_view_interface.qss
-│   │   │   │       ├── sample_card.qss
-│   │   │   │       ├── setting_interface.qss
-│   │   │   │       └── view_interface.qss
-│   │   │   └── resource.qrc
-│   │   └── view
-│   │       ├── cloud_interface.py
-│   │       ├── file_interface.py
-│   │       ├── login_window.py
-│   │       ├── main_window.py
-│   │       ├── newfolder_window.py
-│   │       ├── rename_window.py
-│   │       ├── setting_interface.py
-│   │       └── transfer_interface.py
-│   ├── 123pan.pro
-│   └── 123pan.py
-├── LICENSE
-├── README.md
-├── pyproject.toml
-└── uv.lock
-```
+| 特性 | 说明 |
+|:---|:---|
+| 🚀 多线程传输 | 下载/上传支持 1–16 线程并发，充分利用带宽 |
+| 🔁 断点续传 | 下载和上传均支持断点续传，大文件传输不怕中断 |
+| 🎨 Fluent Design | 基于 PyQt6-Fluent-Widgets，现代化流畅设计风格 |
+| 📁 完整文件管理 | 文件夹树 + 面包屑导航 + 拖拽上传 + 右键菜单 + 批量操作 |
+| 📋 任务管理 | 暂停/继续/取消/重试，实时速度与进度，状态筛选 |
+| 💾 持久化存储 | SQLite 替代 JSON，任务状态跨会话保留 |
+| 🌍 全平台 | Windows / Linux / macOS（x64 + ARM64），CI 自动构建 |
+| 🔧 工程化 | mypy 类型检查 + pylint + pytest 单元测试 |
 
-## 使用
+## 界面展示
 
-### 使用打包后的文件运行
+### 传输管理
 
-如果你的电脑是windows系统或者linux发行版，可以直接下载打包后的文件并运行。  
-下载地址：
+<img src="./doc/screenshots/download.png" width="800">
 
-- Github: https://github.com/123panNextGen/123pan/releases/
-- Website(CloudFlare CDN, 更新可能不及时): https://download.123panng.top/
+> 实时显示速度 · 进度 · 剩余时间 · 连接数，支持暂停/继续/重试
 
-其他系统以及开发请参考下方的源码运行。
+### 设置
 
-### 使用源码运行
+<img src="./doc/screenshots/setting.png" width="800">
 
-首先准备好 [Python3](https://www.python.org/downloads/) 与 [uv](https://github.com/astral-sh/uv) 环境，并克隆存储库。
+> 下载/上传线程数 · 并发任务数 · 重试次数，完整传输参数可配
 
-```shell
-git clone https://github.com/123panNextGen/123pan.git
-cd 123pan/
-```
+### 账户与登录
 
-准备Python虚拟环境。
+<table>
+  <tr>
+    <td width="62%">
+      <img src="./doc/screenshots/account_info.png" width="100%">
+      <p align="center"><sub>账户信息 · 一键退出登录</sub></p>
+    </td>
+    <td width="38%">
+      <img src="./doc/screenshots/login.png" width="100%">
+      <p align="center"><sub>登录 · 自动登录选项</sub></p>
+    </td>
+  </tr>
+</table>
 
-```shell
+## 安装
+
+### 下载预构建版本
+
+前往 [Releases](https://github.com/crmmc/123pan/releases) 下载对应平台的可执行文件，下载后直接运行即可：
+
+| 平台 | 架构 | 文件名 |
+|:---|:---|:---|
+| Windows | x64 | `123pan-windows-x64.exe` |
+| Windows | ARM64 | `123pan-windows-arm64.exe` |
+| Linux | x64 | `123pan-linux-x64` |
+| Linux | ARM64 | `123pan-linux-arm64` |
+| macOS | Intel | `123pan-macos-x64` |
+| macOS | Apple Silicon | `123pan-macos-arm64` |
+
+### 从源码运行
+
+需要 [Python 3.12+](https://www.python.org/downloads/) 和 [uv](https://github.com/astral-sh/uv)。
+
+```bash
+git clone https://github.com/crmmc/123pan.git
+cd 123pan
 uv sync
-uv sync --extra build # 构建环境
-```
-
-然后运行`src`下的`123pan.py`即可。
-
-```shell
 uv run src/123pan.py
 ```
 
-## 技术说明
+## 构建
 
-默认会在系统`C:\Users%USERNAME%\AppData\Roaming\123pannextgen\123pan`或`~/.config/123pannextgen/123pan`创建配置文件和日志。
-
-```json
-{
-  "userName": "账号",
-  "passWord": "密码",
-  "authorization": "令牌",
-  "deviceType": "驱动类型",
-  "osVersion": "安卓版本",
-  "loginuuid": "登陆UUID" ,
-  "settings": {
-    "defaultDownloadPath": "默认下载路径",
-    "askDownloadLocation": true
-  }
-}
+```bash
+uv sync --extra build
+bash script/build.sh
 ```
 
-## 问题反馈
+生成的可执行文件位于项目根目录。支持 Windows、Linux、macOS 三平台。
 
-你可以通过多种途径反馈问题。
+## 技术栈
 
-- Github: https://github.com/123panNextGen/123pan/issues
-- QQ群: 996241397
+| 组件 | 技术 |
+|:---|:---|
+| GUI 框架 | PyQt6 + PyQt6-Fluent-Widgets |
+| 数据存储 | SQLite（配置 + 任务持久化） |
+| 打包工具 | Nuitka（编译为单文件可执行） |
+| 包管理 | uv |
+| CI/CD | GitHub Actions（6 平台自动构建 + Release） |
+| 质量保证 | mypy + pylint + pytest |
 
-我们将在第一时间解决。
+## 许可证
 
-## 代码贡献
+[Apache 2.0](./LICENSE)
 
-我们很欢迎您来为项目添砖加瓦，但是请遵守以下几点：
+**本工具仅用于学习研究，请勿用于商业用途。使用者需遵守 123 云盘用户协议，滥用可能导致账号限制。**
 
-- 不要提交未测试的代码
-- 不要提交无意义的内容
-- 不要提交涉及隐私的内容
-- 不要向main分支提交pr
+## 致谢
 
-我们还提供了开发交流群，可以在用户交流群中联系管理员获得。
-
-## 使用协议
-
-本程序使用[Apache 2.0](./LICENSE)协议。  
-**本工具仅用于学习研究，请勿用于商业用途，使用者需遵守123云盘用户协议，滥用可能导致账号限制。**
+本项目 fork 自 [123panNextGen/123pan](https://github.com/123panNextGen/123pan)，感谢原作者的基础工作。
 
 ---
 
-[![Star History Chart](https://api.star-history.com/svg?repos=123panNextGen/123pan&type=date&legend=top-left)](https://www.star-history.com/#123panNextGen/123pan&type=date&legend=top-left)
-
-本程序由[123panNextGen](https://github.com/123panNextGen)开发团队用♥️制作～  
-我们由衷感谢为本程序贡献代码的人们。 [贡献人员名单](https://github.com/123panNextGen/123pan/graphs/contributors)
-
-<!--
- ⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣀⡀⠀⠀⣀⡀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢸⣿⣿⣿⠀⣼⣿⣿⣦⡀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⠀⠀⠀⠀⢸⣿⣿⡟⢰⣿⣿⣿⠟⠁⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⢰⣿⠿⢿⣦⣀⠀⠘⠛⠛⠃⠸⠿⠟⣫⣴⣶⣾⡆⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠸⣿⡀⠀⠉⢿⣦⡀⠀⠀⠀⠀⠀⠀⠛⠿⠿⣿⠃⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠙⢿⣦⠀⠀⠹⣿⣶⡾⠛⠛⢷⣦⣄⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⣧⠀⠀⠈⠉⣀⡀⠀⠀⠙⢿⡇⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⢀⣠⣴⡿⠟⠋⠀⠀⢠⣾⠟⠃⠀⠀⠀⢸⣿⡆⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⢀⣠⣶⡿⠛⠉⠀⠀⠀⠀⠀⣾⡇⠀⠀⠀⠀⠀⢸⣿⠇⠀⠀⠀⠀⠀
-⠀⢀⣠⣾⠿⠛⠁⠀⠀⠀⠀⠀⠀⠀⢀⣼⣧⣀⠀⠀⠀⢀⣼⠇⠀⠀⠀⠀⠀⠀
-⠀⠈⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⡿⠋⠙⠛⠛⠛⠛⠛⠁⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣾⡿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⢾⠿⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
--->
+<div align="center">
+由 <a href="https://github.com/crmmc">crmmc</a> 维护
+</div>
