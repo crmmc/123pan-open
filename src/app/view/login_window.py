@@ -5,7 +5,6 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QDialog,
-    QFormLayout,
     QHBoxLayout,
     QStackedWidget,
     QVBoxLayout,
@@ -94,29 +93,36 @@ class LoginDialog(QDialog):
         password_page = QWidget()
         password_layout = QVBoxLayout(password_page)
         password_layout.setContentsMargins(0, 0, 0, 0)
-        password_layout.setSpacing(20)
+        password_layout.setSpacing(0)
 
-        form = QFormLayout()
-        form.setSpacing(15)
+        password_layout.addStretch(1)
 
+        # 用户名输入框
         self.le_user = LineEdit()
         self.le_user.setPlaceholderText("请输入用户名")
-        form.addRow("用户名", self.le_user)
+        password_layout.addWidget(self.le_user)
 
+        password_layout.addSpacing(15)
+
+        # 密码输入框
         self.le_pass = LineEdit()
         self.le_pass.setPlaceholderText("请输入密码")
         self.le_pass.setEchoMode(LineEdit.EchoMode.Password)
-        form.addRow("密码", self.le_pass)
+        password_layout.addWidget(self.le_pass)
 
+        password_layout.addSpacing(12)
+
+        # 记住密码 / 保持登录
         self.cb_remember_password = QCheckBox("记住密码")
         self.cb_stay_logged_in = QCheckBox("保持登录")
         checkbox_layout = QHBoxLayout()
         checkbox_layout.addWidget(self.cb_remember_password)
         checkbox_layout.addWidget(self.cb_stay_logged_in)
-        form.addRow("", checkbox_layout)
+        password_layout.addLayout(checkbox_layout)
 
-        password_layout.addLayout(form)
+        password_layout.addSpacing(20)
 
+        # 登录 / 取消按钮
         h = QHBoxLayout()
         h.addStretch()
         self.btn_ok = PrimaryPushButton("登录")
@@ -126,6 +132,8 @@ class LoginDialog(QDialog):
         h.addWidget(self.btn_ok)
         h.addWidget(self.btn_cancel)
         password_layout.addLayout(h)
+
+        password_layout.addStretch(1)
 
         self.stacked_widget.addWidget(password_page)
 
