@@ -116,6 +116,7 @@ class LoginDialog(QDialog):
         self.cb_stay_logged_in = QCheckBox("保持登录")
         checkbox_layout = QHBoxLayout()
         checkbox_layout.addWidget(self.cb_remember_password)
+        checkbox_layout.addStretch()
         checkbox_layout.addWidget(self.cb_stay_logged_in)
         password_layout.addLayout(checkbox_layout)
 
