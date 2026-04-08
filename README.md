@@ -62,13 +62,17 @@
 
 <table>
   <tr>
-    <td width="62%">
+    <td width="50%">
       <img src="./doc/screenshots/account_info.png" width="100%">
       <p align="center"><sub>账户信息 · 一键退出登录</sub></p>
     </td>
-    <td width="38%">
+    <td width="25%">
       <img src="./doc/screenshots/login.png" width="100%">
-      <p align="center"><sub>登录 · 扫码登录 · 自动登录选项</sub></p>
+      <p align="center"><sub>密码登录 · 自动登录选项</sub></p>
+    </td>
+    <td width="25%">
+      <img src="./doc/screenshots/qr_login.png" width="100%">
+      <p align="center"><sub>扫码登录 · APP 扫码免密</sub></p>
     </td>
   </tr>
 </table>
