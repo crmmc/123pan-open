@@ -7,7 +7,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QFormLayout,
     QHBoxLayout,
+    QStackedWidget,
     QVBoxLayout,
+    QWidget,
 )
 
 import requests
@@ -16,12 +18,13 @@ from qfluentwidgets import (
     PrimaryPushButton,
     PushButton,
     MessageBox,
-    TitleLabel,
+    SegmentedWidget,
 )
 
 from ..common.api import Pan123
 from ..common.database import Database
 from ..common.log import get_logger
+from .qr_login_page import QRLoginPage
 
 logger = get_logger(__name__)
 
@@ -71,27 +74,35 @@ class LoginDialog(QDialog):
         self.setWindowTitle("登录123云盘")
         self.resize(460, 320)
         self.setFixedSize(460, 320)
-        # self.setWindowFlags(
-        #     self.windowFlags() & ~Qt.WindowType.WindowContextHelpButtonHint
-        # )
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 30, 40, 30)
         layout.setSpacing(20)
 
-        # 标题
-        title = TitleLabel("欢迎使用123云盘")
-        layout.addWidget(title, alignment=Qt.AlignmentFlag.AlignCenter)
+        # Tab 切换
+        self.segmented_widget = SegmentedWidget()
+        self.segmented_widget.addItem(routeKey="password", text="密码登录")
+        self.segmented_widget.addItem(routeKey="qrcode", text="扫码登录")
+        self.segmented_widget.setCurrentItem("password")
+        layout.addWidget(self.segmented_widget, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # 页面容器
+        self.stacked_widget = QStackedWidget()
+        layout.addWidget(self.stacked_widget)
+
+        # -- 密码登录页面 (page 0) --
+        password_page = QWidget()
+        password_layout = QVBoxLayout(password_page)
+        password_layout.setContentsMargins(0, 0, 0, 0)
+        password_layout.setSpacing(20)
 
         form = QFormLayout()
         form.setSpacing(15)
 
-        # 用户名输入框
         self.le_user = LineEdit()
         self.le_user.setPlaceholderText("请输入用户名")
         form.addRow("用户名", self.le_user)
 
-        # 密码输入框
         self.le_pass = LineEdit()
         self.le_pass.setPlaceholderText("请输入密码")
         self.le_pass.setEchoMode(LineEdit.EchoMode.Password)
@@ -104,23 +115,27 @@ class LoginDialog(QDialog):
         checkbox_layout.addWidget(self.cb_stay_logged_in)
         form.addRow("", checkbox_layout)
 
-        layout.addLayout(form)
+        password_layout.addLayout(form)
 
         h = QHBoxLayout()
         h.addStretch()
-
-        # 登录按钮
         self.btn_ok = PrimaryPushButton("登录")
         self.btn_ok.setMinimumWidth(100)
-
-        # 取消按钮
         self.btn_cancel = PushButton("取消")
         self.btn_cancel.setMinimumWidth(100)
-
         h.addWidget(self.btn_ok)
         h.addWidget(self.btn_cancel)
-        layout.addLayout(h)
+        password_layout.addLayout(h)
 
+        self.stacked_widget.addWidget(password_page)
+
+        # -- 扫码登录页面 (page 1) --
+        self.qr_page = QRLoginPage(self.cb_stay_logged_in, parent=self)
+        self.qr_page.loginSuccess.connect(self._on_qr_login_success)
+        self.stacked_widget.addWidget(self.qr_page)
+
+        # 信号连接
+        self.segmented_widget.currentItemChanged.connect(self._on_tab_changed)
         self.btn_ok.clicked.connect(self.on_ok)
         self.btn_cancel.clicked.connect(self.close)
 
@@ -138,6 +153,31 @@ class LoginDialog(QDialog):
     def _on_remember_password_changed(self, state):
         if not state:
             Database.instance().set_config("passWord", "")
+
+    def _on_tab_changed(self, route_key):
+        if route_key == "password":
+            self.stacked_widget.setCurrentIndex(0)
+            self.qr_page.stop_polling()
+        else:
+            self.stacked_widget.setCurrentIndex(1)
+            self.qr_page.start_qr_flow()
+
+    def _on_qr_login_success(self, pan_object):
+        """QR 登录成功回调。"""
+        self.pan = pan_object
+        try:
+            db = Database.instance()
+            if self.cb_stay_logged_in.isChecked():
+                db.set_config("authorization", pan_object.authorization)
+            else:
+                db.set_config("authorization", "")
+            db.set_config("stayLoggedIn", self.cb_stay_logged_in.isChecked())
+            db.set_config("deviceType", pan_object.devicetype)
+            db.set_config("osVersion", pan_object.osversion)
+            db.set_config("loginuuid", pan_object.loginuuid)
+        except Exception as e:
+            logger.warning(f"保存配置失败: {e}")
+        self.accept()
 
     def on_ok(self):
         """登录处理"""
