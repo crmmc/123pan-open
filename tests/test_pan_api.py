@@ -639,3 +639,75 @@ class TestRecycle:
         with patch.object(pan.session, "get", return_value=resp):
             pan.recycle()
             assert len(pan.recycle_list) == 2
+
+
+class TestQrGenerate:
+    """qr_generate() 单元测试"""
+
+    def test_qr_generate_success(self, pan):
+        """Test 1: 成功时返回 dict 包含 uniID 和 url"""
+        resp = _mock_response(200, {
+            "code": 0,
+            "data": {"uniID": "uni-abc-123", "url": "https://login.123pan.com/qr/xxx"},
+        })
+
+        with patch.object(pan.session, "get", return_value=resp):
+            result = pan.qr_generate()
+            assert "uniID" in result
+            assert "url" in result
+            assert result["uniID"] == "uni-abc-123"
+            assert result["url"] == "https://login.123pan.com/qr/xxx"
+
+    def test_qr_generate_network_error(self, pan):
+        """Test 2: 网络异常时抛出 requests.RequestException"""
+        with patch.object(
+            pan.session, "get",
+            side_effect=requests.exceptions.ConnectionError("连接失败"),
+        ):
+            with pytest.raises(requests.exceptions.RequestException):
+                pan.qr_generate()
+
+    def test_qr_generate_api_error(self, pan):
+        """Test 3: API 返回 code!=0 时抛出 RuntimeError"""
+        resp = _mock_response(200, {"code": -1, "message": "服务异常"})
+
+        with patch.object(pan.session, "get", return_value=resp):
+            with pytest.raises(RuntimeError, match="获取二维码失败"):
+                pan.qr_generate()
+
+
+class TestQrPoll:
+    """qr_poll() 单元测试"""
+
+    def test_qr_poll_waiting(self, pan):
+        """Test 4: loginStatus=0 时返回 {"loginStatus": 0}"""
+        resp = _mock_response(200, {
+            "code": 0,
+            "data": {"loginStatus": 0, "scanPlatform": 0},
+        })
+
+        with patch.object(pan.session, "get", return_value=resp):
+            result = pan.qr_poll("uni-abc-123")
+            assert result["loginStatus"] == 0
+            assert "token" not in result
+
+    def test_qr_poll_confirmed_with_token(self, pan):
+        """Test 5: loginStatus=2 时返回包含 token 的 dict"""
+        resp = _mock_response(200, {
+            "code": 0,
+            "data": {"loginStatus": 2, "token": "eyJhbGciOiJIUzI1NiJ9.test"},
+        })
+
+        with patch.object(pan.session, "get", return_value=resp):
+            result = pan.qr_poll("uni-abc-123")
+            assert result["loginStatus"] == 2
+            assert result["token"] == "eyJhbGciOiJIUzI1NiJ9.test"
+
+    def test_qr_poll_network_error(self, pan):
+        """Test 6: 网络异常时抛出 requests.RequestException"""
+        with patch.object(
+            pan.session, "get",
+            side_effect=requests.exceptions.ConnectionError("连接失败"),
+        ):
+            with pytest.raises(requests.exceptions.RequestException):
+                pan.qr_poll("uni-abc-123")
