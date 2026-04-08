@@ -71,10 +71,9 @@ class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("登录123云盘")
-        self.setFixedWidth(460)
-        self._password_height = 320
-        self._qr_height = 400
-        self.setFixedHeight(self._password_height)
+        self._password_size = (345, 320)
+        self._qr_size = (391, 400)
+        self.setFixedSize(*self._password_size)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 30, 40, 30)
@@ -124,12 +123,12 @@ class LoginDialog(QDialog):
 
         # 登录 / 取消按钮
         h = QHBoxLayout()
-        h.addStretch()
         self.btn_ok = PrimaryPushButton("登录")
         self.btn_ok.setMinimumWidth(100)
         self.btn_cancel = PushButton("取消")
         self.btn_cancel.setMinimumWidth(100)
         h.addWidget(self.btn_ok)
+        h.addStretch()
         h.addWidget(self.btn_cancel)
         password_layout.addLayout(h)
 
@@ -172,10 +171,10 @@ class LoginDialog(QDialog):
         if route_key == "password":
             self.stacked_widget.setCurrentIndex(0)
             self.qr_page.stop_polling()
-            self.setFixedHeight(self._password_height)
+            self.setFixedSize(*self._password_size)
         else:
             self.stacked_widget.setCurrentIndex(1)
-            self.setFixedHeight(self._qr_height)
+            self.setFixedSize(*self._qr_size)
             self.qr_page.start_qr_flow()
 
     def _on_qr_login_success(self, pan_object):
