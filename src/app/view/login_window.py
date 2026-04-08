@@ -72,8 +72,8 @@ class LoginDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("登录123云盘")
-        self.resize(460, 320)
-        self.setFixedSize(460, 320)
+        self.resize(460, 400)
+        self.setFixedSize(460, 400)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(40, 30, 40, 30)

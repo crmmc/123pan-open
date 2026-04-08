@@ -31,7 +31,7 @@ class QRLoginPage(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        layout.addStretch(16)
+        layout.addStretch(1)
 
         # 二维码图片
         self.qr_label = QLabel()
