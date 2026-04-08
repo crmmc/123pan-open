@@ -12,7 +12,19 @@ logger = get_logger(__name__)
 _db_instance = None
 _db_lock = threading.Lock()
 
-UPLOAD_PART_SIZE = 5 * 1024 * 1024  # 5MB — 与 api.py UPLOAD_PART_SIZE 保持一致
+UPLOAD_PART_SIZE = 5 * 1024 * 1024  # 5MB — 旧常量，仅用于 DB schema default 和断点续传兼容
+
+
+def get_upload_part_size() -> int:
+    """运行时上传分片大小（字节），从用户配置读取。"""
+    mb = _safe_int(Database.instance().get_config("uploadPartSizeMB", 5), 5, 5, 16)
+    return mb * 1024 * 1024
+
+
+def get_download_part_size() -> int:
+    """运行时下载分片大小（字节），从用户配置读取。"""
+    mb = _safe_int(Database.instance().get_config("downloadPartSizeMB", 5), 5, 4, 32)
+    return mb * 1024 * 1024
 
 CURRENT_SCHEMA_VERSION = 2
 
@@ -169,12 +181,14 @@ class Database:
             "askDownloadLocation": True,
             "rememberPassword": False,
             "stayLoggedIn": True,
-            "maxDownloadThreads": 3,
+            "maxDownloadThreads": 1,
             "maxUploadThreads": 16,
-            "maxConcurrentDownloads": 3,
+            "maxConcurrentDownloads": 5,
             "maxConcurrentUploads": 3,
             "retryMaxAttempts": 3,
             "retryBackoffFactor": 0.5,
+            "uploadPartSizeMB": 5,
+            "downloadPartSizeMB": 5,
         }
         with self._lock:
             for key, value in defaults.items():

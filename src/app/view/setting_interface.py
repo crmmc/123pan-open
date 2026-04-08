@@ -135,6 +135,40 @@ class SettingInterface(ScrollArea):
         self.retryAttemptsCard.hBoxLayout.addWidget(self.retryAttemptsSpinBox)
         self.retryAttemptsCard.hBoxLayout.addSpacing(16)
 
+        # 下载分片大小
+        self.downloadPartSizeCard = SettingCard(
+            FIF.DOWNLOAD,
+            self.tr("下载分片大小"),
+            self.tr("单个分片大小（4-32 MB，整数）"),
+            self.musicInThisPCGroup,
+        )
+        self.downloadPartSizeSpinBox = SpinBox(self.downloadPartSizeCard)
+        self.downloadPartSizeSpinBox.setRange(4, 32)
+        self.downloadPartSizeSpinBox.setSuffix(" MB")
+        self.downloadPartSizeSpinBox.setValue(
+            int(Database.instance().get_config("downloadPartSizeMB", 5))
+        )
+        self.downloadPartSizeSpinBox.setFixedWidth(120)
+        self.downloadPartSizeCard.hBoxLayout.addWidget(self.downloadPartSizeSpinBox)
+        self.downloadPartSizeCard.hBoxLayout.addSpacing(16)
+
+        # 上传分片大小
+        self.uploadPartSizeCard = SettingCard(
+            FIF.UP,
+            self.tr("上传分片大小"),
+            self.tr("单个分片大小（5-16 MB，整数）"),
+            self.musicInThisPCGroup,
+        )
+        self.uploadPartSizeSpinBox = SpinBox(self.uploadPartSizeCard)
+        self.uploadPartSizeSpinBox.setRange(5, 16)
+        self.uploadPartSizeSpinBox.setSuffix(" MB")
+        self.uploadPartSizeSpinBox.setValue(
+            int(Database.instance().get_config("uploadPartSizeMB", 5))
+        )
+        self.uploadPartSizeSpinBox.setFixedWidth(120)
+        self.uploadPartSizeCard.hBoxLayout.addWidget(self.uploadPartSizeSpinBox)
+        self.uploadPartSizeCard.hBoxLayout.addSpacing(16)
+
         self.personalGroup = SettingCardGroup(self.tr("个性化"), self.scrollWidget)
         self.micaCard = SwitchSettingCard(
             FIF.TRANSPARENT,
@@ -187,6 +221,8 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.concurrentDownloadsCard)
         self.musicInThisPCGroup.addSettingCard(self.concurrentUploadsCard)
         self.musicInThisPCGroup.addSettingCard(self.retryAttemptsCard)
+        self.musicInThisPCGroup.addSettingCard(self.downloadPartSizeCard)
+        self.musicInThisPCGroup.addSettingCard(self.uploadPartSizeCard)
 
         self.personalGroup.addSettingCard(self.micaCard)
 
@@ -226,6 +262,12 @@ class SettingInterface(ScrollArea):
     def __onRetryAttemptsChanged(self, value):
         Database.instance().set_config("retryMaxAttempts", value)
 
+    def __onDownloadPartSizeChanged(self, value):
+        Database.instance().set_config("downloadPartSizeMB", value)
+
+    def __onUploadPartSizeChanged(self, value):
+        Database.instance().set_config("uploadPartSizeMB", value)
+
     def __connectSignalToSlot(self):
         """connect signal to slot"""
         # cfg.appRestartSig.connect(self.__showRestartTooltip)
@@ -249,6 +291,12 @@ class SettingInterface(ScrollArea):
         )
         self.retryAttemptsSpinBox.valueChanged.connect(
             self.__onRetryAttemptsChanged
+        )
+        self.downloadPartSizeSpinBox.valueChanged.connect(
+            self.__onDownloadPartSizeChanged
+        )
+        self.uploadPartSizeSpinBox.valueChanged.connect(
+            self.__onUploadPartSizeChanged
         )
 
         # personalization

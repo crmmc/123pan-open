@@ -22,7 +22,7 @@ from qfluentwidgets import (
 from qfluentwidgets import FluentIcon as FIF
 
 from ..common.api import format_file_size
-from ..common.database import Database, UPLOAD_PART_SIZE
+from ..common.database import Database, UPLOAD_PART_SIZE, get_upload_part_size
 from ..common.download_metadata import (
     DOWNLOAD_METADATA_VERSION,
     LEGACY_RESUME_TASK_ERROR,
@@ -113,7 +113,7 @@ class UploadTask(TransferTask):
         self.upload_id_s3 = ""
         self.up_file_id = 0
         self.total_parts = 0
-        self.block_size = UPLOAD_PART_SIZE
+        self.block_size = get_upload_part_size()
         self.etag = ""
 
 

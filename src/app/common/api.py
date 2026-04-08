@@ -15,7 +15,7 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from .database import Database, UPLOAD_PART_SIZE, _safe_int
+from .database import Database, UPLOAD_PART_SIZE, _safe_int, get_upload_part_size
 from .const import all_device_type, all_os_versions
 from .log import get_logger
 
@@ -883,7 +883,7 @@ class Pan123:
             upload_key = data.get("Key", "")
             upload_id = data.get("UploadId", "")
             up_file_id = data.get("FileId", 0)
-            block_size = UPLOAD_PART_SIZE
+            block_size = get_upload_part_size()
             total_parts = math.ceil(fsize / block_size) if fsize > 0 else 1
             done_parts = set()
 

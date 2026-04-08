@@ -17,3 +17,5 @@
 | maxConcurrentDownloads | 同时下载任务数 | SpinBox | 1-5 |
 | maxConcurrentUploads | 同时上传任务数 | SpinBox | 1-5 |
 | retryMaxAttempts | 最大重试次数 | SpinBox | 1-10 |
+| uploadPartSizeMB | 上传分片大小 | SpinBox | 5-16 MB |
+| downloadPartSizeMB | 下载分片大小 | SpinBox | 4-32 MB |

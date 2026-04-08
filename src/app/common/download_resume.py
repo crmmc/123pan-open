@@ -10,12 +10,12 @@ from pathlib import Path
 import requests
 
 from .config import CONFIG_DIR
-from .database import Database
+from .database import Database, get_download_part_size
 from .log import get_logger
 
 logger = get_logger(__name__)
 
-PART_SIZE = 5 * 1024 * 1024
+PART_SIZE = 5 * 1024 * 1024  # 默认值，运行时由 get_download_part_size() 覆盖
 MIN_PARALLEL_SIZE = 2 * 1024 * 1024
 MAX_RATE_LIMITS = 50
 IO_CHUNK_SIZE = 1024 * 1024
@@ -24,7 +24,7 @@ MAX_PART_QUEUE_ATTEMPTS = 3
 PROGRESS_UPDATE_INTERVAL = 0.1
 RATE_LIMIT_BACKOFF_SECONDS = 2
 WORKER_SPAWN_INTERVAL = 0.3
-DEFAULT_MAX_DOWNLOAD_THREADS = 3
+DEFAULT_MAX_DOWNLOAD_THREADS = 1
 
 
 def build_resume_id(account_name, file_id, save_path):
@@ -141,14 +141,15 @@ def _cleanup_parts(resume_id, part_indexes):
 
 # ---- part plan ----
 
-def _build_parts(total):
+def _build_parts(total, part_size=None):
     if total <= 0:
         return []
-    part_count = math.ceil(total / PART_SIZE)
+    ps = part_size or get_download_part_size()
+    part_count = math.ceil(total / ps)
     parts = []
     for index in range(part_count):
-        start = index * PART_SIZE
-        end = min(start + PART_SIZE - 1, total - 1)
+        start = index * ps
+        end = min(start + ps - 1, total - 1)
         parts.append({
             "index": index, "start": start, "end": end,
             "expected_size": end - start + 1,
