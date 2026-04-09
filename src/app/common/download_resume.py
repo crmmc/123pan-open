@@ -275,7 +275,7 @@ def _download_part(
             return stop_result
         try:
             md5 = hashlib.md5()
-            with requests.get(redirect_url, headers=headers, stream=True, timeout=60) as resp:
+            with requests.get(redirect_url, headers=headers, stream=True, timeout=(5, 600)) as resp:
                 if resp.status_code in RATE_LIMIT_CODES:
                     return "rate_limited"
                 resp.raise_for_status()
@@ -356,9 +356,6 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
     downloaded = [reused_bytes]
     progress_lock = threading.Lock()
     last_progress_time = [0.0]
-    probe_phase = [True]
-    probe_failed = [False]
-    probe_success_count = [0]
     worker_feedback = threading.Event()
 
     if speed_tracker and reused_bytes:
@@ -374,7 +371,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                 if stop_result:
                     return
                 with progress_lock:
-                    if active_workers[0] > allowed_workers[0]:
+                    if active_workers[0] > allowed_workers[0] and active_workers[0] > 1:
                         return
                 try:
                     part = part_queue.get_nowait()
@@ -388,7 +385,8 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                 if result == "ok":
                     _save_download_status(resume_id, total, downloaded[0], "下载中")
                     with progress_lock:
-                        probe_success_count[0] += 1
+                        if allowed_workers[0] < max_workers:
+                            allowed_workers[0] += 1
                     worker_feedback.set()
                     continue
                 if result in ("cancelled", "paused"):
@@ -402,9 +400,6 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                         new_limit = max(1, active_workers[0] - 1)
                         if new_limit < allowed_workers[0]:
                             allowed_workers[0] = new_limit
-                        if probe_phase[0]:
-                            probe_failed[0] = True
-                            probe_phase[0] = False
                         _notify_conn_info(signals, active_workers[0], allowed_workers[0])
                     part_queue.put(part)
                     worker_feedback.set()
@@ -413,19 +408,10 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                 if result == "retryable":
                     part_queue.put(part)
                     with progress_lock:
-                        new_limit = max(1, active_workers[0] - 1)
-                        if new_limit < allowed_workers[0]:
-                            allowed_workers[0] = new_limit
-                        if probe_phase[0]:
-                            probe_failed[0] = True
-                            probe_phase[0] = False
+                        allowed_workers[0] = max(1, allowed_workers[0] - 1)
                         _notify_conn_info(signals, active_workers[0], allowed_workers[0])
                     worker_feedback.set()
-                    continue
-                with progress_lock:
-                    if probe_phase[0]:
-                        probe_failed[0] = True
-                        probe_phase[0] = False
+                    return  # worker 退出，调度器补充新 worker
                 worker_feedback.set()
                 failed[0] = True
                 return
@@ -446,9 +432,6 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         active_workers=active_workers,
         allowed_workers=allowed_workers,
         failed=failed,
-        probe_failed=probe_failed,
-        probe_success_count=probe_success_count,
-        probe_phase=probe_phase,
         worker_feedback=worker_feedback,
         is_stopped_fn=lambda: bool(_get_stop_result(task)),
         notify_conn_fn=lambda a, al: _notify_conn_info(signals, a, al),
