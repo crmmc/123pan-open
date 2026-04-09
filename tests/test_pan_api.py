@@ -806,7 +806,7 @@ class TestUploadFileStream:
         target_file.write_text("a", encoding="utf-8")
         original_stat = Path.stat
 
-        def fake_stat(path_obj):
+        def fake_stat(path_obj, **kwargs):
             if path_obj == target_file:
                 raise OSError("stat failed")
             return original_stat(path_obj)

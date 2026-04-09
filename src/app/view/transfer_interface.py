@@ -1002,8 +1002,10 @@ class TransferInterface(QWidget):
         return item
 
     def __bind_button(self, button, handler):
-        if button.receivers(button.clicked) > 0:
+        try:
             button.clicked.disconnect()
+        except RuntimeError:
+            pass
         button.clicked.connect(handler)
 
     def __get_or_create_actions(self, table, row, col):
