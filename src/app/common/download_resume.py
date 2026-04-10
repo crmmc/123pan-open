@@ -433,8 +433,8 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                         _notify_conn_info(signals, active_workers[0], allowed_workers[0])
                     worker_feedback.set()
                     return  # worker 退出，调度器补充
-                worker_feedback.set()
                 failed[0] = True
+                worker_feedback.set()
                 return
         finally:
             with progress_lock:
