@@ -134,29 +134,28 @@ def test_prepare_upload_task_skips_failed_file_but_keeps_other_uploads(tmp_path)
     ok_file = tmp_path / "ok.txt"
     ok_file.write_text("ok", encoding="utf-8")
     missing_file = tmp_path / "missing.txt"
+    pan = MagicMock()
+    pan._get_dir_items_by_id.return_value = []
     task = FileInterface.PrepareUploadTask(
-        pan=MagicMock(),
+        pan=pan,
         target_dir_id=9,
         local_paths=[str(ok_file), str(missing_file)],
     )
     results = []
-    task.signals.finished.connect(lambda uploads, created, folders, error: results.append(
-        (uploads, created, folders, error)
+    task.signals.finished.connect(lambda entries, ef, efld, error: results.append(
+        (entries, ef, efld, error)
     ))
 
     task.run()
 
-    uploads, created_dir_count, folder_items, error = results[0]
-    assert uploads == [
-        {
-            "file_name": "ok.txt",
-            "file_size": 2,
-            "local_path": str(ok_file),
-            "target_dir_id": 9,
-        }
-    ]
-    assert created_dir_count == 0
-    assert folder_items == []
+    entries, existing_files, existing_folders, error = results[0]
+    assert len(entries) == 1
+    assert entries[0]["path"] == ok_file
+    assert entries[0]["is_dir"] is False
+    assert entries[0]["conflict"] is False
+    assert entries[0]["file_size"] == 2
+    assert existing_files == set()
+    assert existing_folders == set()
     assert "missing.txt" in error
 
 
@@ -164,20 +163,26 @@ def test_prepare_upload_task_stops_when_folder_creation_fails(tmp_path):
     folder = tmp_path / "folder"
     folder.mkdir()
     pan = MagicMock()
-    pan.prepare_folder_upload.side_effect = RuntimeError("429")
+    pan._get_dir_items_by_id.return_value = []
     task = FileInterface.PrepareUploadTask(
         pan=pan,
         target_dir_id=9,
         local_paths=[str(folder)],
     )
     results = []
-    task.signals.finished.connect(lambda uploads, created, folders, error: results.append(
-        (uploads, created, folders, error)
+    task.signals.finished.connect(lambda entries, ef, efld, error: results.append(
+        (entries, ef, efld, error)
     ))
 
     task.run()
 
-    assert results[0] == ([], 0, [], "429")
+    entries, existing_files, existing_folders, error = results[0]
+    assert len(entries) == 1
+    assert entries[0]["is_dir"] is True
+    assert entries[0]["conflict"] is False
+    assert existing_files == set()
+    assert existing_folders == set()
+    assert error == ""
 
 
 def test_prepare_upload_finished_drops_stale_cross_account_result():
@@ -191,14 +196,14 @@ def test_prepare_upload_finished_drops_stale_cross_account_result():
 
     FileInterface._FileInterface__onPrepareUploadFinished(
         fi,
-        uploads=[{
-            "file_name": "a.txt",
+        entries=[{
+            "path": Path("/tmp/a.txt"),
+            "is_dir": False,
+            "conflict": False,
             "file_size": 1,
-            "local_path": "/tmp/a.txt",
-            "target_dir_id": 7,
         }],
-        created_dir_count=0,
-        folder_items=[],
+        existing_file_names=set(),
+        existing_folder_names=set(),
         error="",
         context={
             "pan": object(),
