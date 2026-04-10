@@ -787,8 +787,14 @@ class Pan123:
             raise RuntimeError(f"创建目录失败: {dirname}")
         return created_id
 
-    def prepare_folder_upload(self, local_dir, target_parent_id):
-        """创建远端目录结构，并返回文件上传计划。"""
+    def prepare_folder_upload(self, local_dir, target_parent_id, merge=False):
+        """创建远端目录结构，并返回文件上传计划。
+
+        merge=True: 顶层目录不重命名，使用已有目录 ID；
+                    遍历子目录时复用已存在的同名子目录；
+                    跳过远端已存在的同名文件。
+        merge=False: 保持原有行为（冲突则重命名）。
+        """
         local_dir_path = Path(local_dir)
         if not local_dir_path.exists():
             raise FileNotFoundError(f"文件夹不存在: {local_dir_path}")
@@ -796,16 +802,23 @@ class Pan123:
             raise NotADirectoryError(f"不是文件夹: {local_dir_path}")
 
         top_level_dirs = self._get_child_directory_map(target_parent_id)
-        root_name = self._choose_available_directory_name(
-            set(top_level_dirs), local_dir_path.name
-        )
-        root_dir_id = self._create_directory_with_backoff(target_parent_id, root_name)
-        if not root_dir_id:
-            raise RuntimeError(f"创建顶层目录失败: {root_name}")
+
+        if merge and local_dir_path.name in top_level_dirs:
+            # 合并模式：复用已有顶层目录
+            root_name = local_dir_path.name
+            root_dir_id = top_level_dirs[root_name]
+            created_dir_count = 0
+        else:
+            root_name = self._choose_available_directory_name(
+                set(top_level_dirs), local_dir_path.name
+            )
+            root_dir_id = self._create_directory_with_backoff(target_parent_id, root_name)
+            if not root_dir_id:
+                raise RuntimeError(f"创建顶层目录失败: {root_name}")
+            created_dir_count = 1
 
         dir_id_map = {Path("."): root_dir_id}
         file_targets = []
-        created_dir_count = 1
 
         try:
             for current_root, dir_names, file_names in os.walk(local_dir_path):
@@ -815,8 +828,20 @@ class Pan123:
                 relative_root = current_path.relative_to(local_dir_path)
                 remote_parent_id = dir_id_map[relative_root or Path(".")]
 
+                # merge 模式下获取远端子目录映射和文件名集合
+                existing_child_dirs: dict[str, int] = {}
+                existing_file_names: set[str] = set()
+                if merge:
+                    existing_child_dirs = self._get_child_directory_map(remote_parent_id)
+                    for item in self._get_dir_items_by_id(remote_parent_id):
+                        if int(item.get("Type", 0) or 0) == 0:
+                            existing_file_names.add(item.get("FileName", ""))
+
                 for dir_name in dir_names:
                     child_relative = relative_root / dir_name
+                    if merge and dir_name in existing_child_dirs:
+                        dir_id_map[child_relative] = existing_child_dirs[dir_name]
+                        continue
                     child_dir_id = self._create_directory_with_backoff(
                         remote_parent_id,
                         dir_name,
@@ -827,6 +852,8 @@ class Pan123:
                     created_dir_count += 1
 
                 for file_name in file_names:
+                    if merge and file_name in existing_file_names:
+                        continue
                     file_targets.append({
                         "file_name": file_name,
                         "local_path": str(current_path / file_name),
@@ -834,13 +861,15 @@ class Pan123:
                         "file_size": (current_path / file_name).stat().st_size,
                     })
         except Exception:
-            try:
-                self.delete_file(
-                    {"FileId": root_dir_id, "Type": 1, "FileName": root_name},
-                    by_num=False,
-                )
-            except Exception as cleanup_exc:
-                logger.warning("回滚上传目录失败: %s", cleanup_exc)
+            if not merge:
+                # 非合并模式：失败时回滚顶层目录
+                try:
+                    self.delete_file(
+                        {"FileId": root_dir_id, "Type": 1, "FileName": root_name},
+                        by_num=False,
+                    )
+                except Exception as cleanup_exc:
+                    logger.warning("回滚上传目录失败: %s", cleanup_exc)
             raise
 
         return {

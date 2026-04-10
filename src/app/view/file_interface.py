@@ -46,6 +46,7 @@ from .newfolder_window import NewFolderDialog
 from .rename_window import RenameDialog
 from .move_window import MoveDialog
 from .search_window import SearchDialog
+from .upload_conflict_dialog import ConflictAction, UploadConflictDialog
 
 logger = get_logger(__name__)
 
@@ -70,6 +71,18 @@ def _sanitize_filename(name: str) -> str:
         ext = Path(name).suffix
         name = name[:200 - len(ext)] + ext
     return name
+
+
+def _generate_keep_both_name(file_name: str, existing_names: set[str]) -> str:
+    """生成 "保留两者" 的文件名，形如 name(1).ext。"""
+    stem = Path(file_name).stem
+    suffix = Path(file_name).suffix
+    index = 1
+    while True:
+        candidate = f"{stem}({index}){suffix}"
+        if candidate not in existing_names:
+            return candidate
+        index += 1
 
 
 class FileInterface(QWidget):
@@ -579,8 +592,17 @@ class FileInterface(QWidget):
                 self.signals.finished.emit([], str(e))
 
     class PrepareUploadTask(QRunnable):
+        """后台线程：准备上传列表并检测冲突。
+
+        finished signal 参数:
+          - entries: list[dict]  每项包含 path/is_dir/conflict 等信息
+          - existing_file_names: set[str]  远端已有文件名
+          - existing_folder_names: set[str]  远端已有文件夹名
+          - error: str
+        """
+
         class PrepareUploadSignals(QObject):
-            finished = Signal(list, int, list, str)
+            finished = Signal(list, set, set, str)
 
         def __init__(self, pan, target_dir_id, local_paths):
             super().__init__()
@@ -591,48 +613,53 @@ class FileInterface(QWidget):
 
         def run(self):
             try:
-                uploads = []
-                created_dir_count = 0
-                folder_items = []
+                # 获取目标目录的已有文件/文件夹名
+                existing_items = self.pan._get_dir_items_by_id(self.target_dir_id)
+                existing_file_names = {
+                    item["FileName"] for item in existing_items
+                    if int(item.get("Type", 0) or 0) == 0
+                }
+                existing_folder_names = {
+                    item["FileName"] for item in existing_items
+                    if int(item.get("Type", 0) or 0) == 1
+                }
+
+                entries = []
                 skipped_files = []
                 for local_path in self.local_paths:
                     path = Path(local_path)
+                    logger.debug(
+                        "PrepareUpload: path=%s, exists=%s, is_dir=%s",
+                        path, path.exists(), path.is_dir(),
+                    )
                     if path.is_dir():
-                        plan = self.pan.prepare_folder_upload(
-                            path, self.target_dir_id
-                        )
-                        uploads.extend(plan["file_targets"])
-                        created_dir_count += int(plan["created_dir_count"])
-                        folder_items.append(
-                            {
-                                "FileId": plan["root_dir_id"],
-                                "FileName": plan["root_dir_name"],
-                            }
-                        )
+                        entries.append({
+                            "path": path,
+                            "is_dir": True,
+                            "conflict": path.name in existing_folder_names,
+                        })
                         continue
 
                     try:
                         if not path.exists():
                             raise FileNotFoundError(f"路径不存在: {path}")
-                        uploads.append(
-                            {
-                                "file_name": path.name,
-                                "file_size": path.stat().st_size,
-                                "local_path": str(path),
-                                "target_dir_id": self.target_dir_id,
-                            }
-                        )
+                        entries.append({
+                            "path": path,
+                            "is_dir": False,
+                            "conflict": path.name in existing_file_names,
+                            "file_size": path.stat().st_size,
+                        })
                     except Exception as exc:
                         skipped_files.append(f"{path.name}: {exc}")
 
                 self.signals.finished.emit(
-                    uploads,
-                    created_dir_count,
-                    folder_items,
+                    entries,
+                    existing_file_names,
+                    existing_folder_names,
                     "；".join(skipped_files),
                 )
             except Exception as e:
-                self.signals.finished.emit([], 0, [], str(e))
+                self.signals.finished.emit([], set(), set(), str(e))
 
     def __findTreeItemById(self, dir_id):
         iterator = QTreeWidgetItemIterator(self.folderTree)
@@ -1002,10 +1029,8 @@ class FileInterface(QWidget):
         signals = task.signals
         self._pending_signals.append(signals)
         signals.finished.connect(
-            lambda uploads, created_dir_count, folder_items, error, ctx=context:
-            self.__onPrepareUploadFinished(
-                uploads, created_dir_count, folder_items, error, ctx
-            )
+            lambda entries, ef, efld, error, ctx=context:
+            self.__onPrepareUploadFinished(entries, ef, efld, error, ctx)
         )
         signals.finished.connect(lambda *_, sig=signals: (
             self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -1013,8 +1038,12 @@ class FileInterface(QWidget):
         QThreadPool.globalInstance().start(task)
 
     def __onPrepareUploadFinished(
-        self, uploads, created_dir_count, folder_items, error, context=None
+        self, entries, existing_file_names, existing_folder_names, error, context=None
     ):
+        logger.debug(
+            "PrepareUploadFinished: entries=%d, error=%s",
+            len(entries), error or "none",
+        )
         if context is not None:
             current_account_name = getattr(
                 self.transfer_interface, "current_account_name", ""
@@ -1026,13 +1055,111 @@ class FileInterface(QWidget):
         else:
             should_refresh_current_dir = True
 
-        if error and not uploads and not folder_items:
+        if error and not entries:
             InfoBar.error(
                 title="上传准备失败",
                 content=f"准备上传任务时发生错误: {error}",
                 parent=self,
             )
             return
+
+        # 分离有冲突/无冲突项
+        conflict_entries = [e for e in entries if e.get("conflict")]
+        no_conflict_entries = [e for e in entries if not e.get("conflict")]
+
+        # 处理冲突项
+        file_apply_all: ConflictAction | None = None
+        folder_apply_all: ConflictAction | None = None
+        resolved_entries = list(no_conflict_entries)
+
+        for i, entry in enumerate(conflict_entries):
+            is_dir = entry["is_dir"]
+            remaining = len(conflict_entries) - i - 1
+
+            # 检查是否已有"应用到所有"的决策
+            cached = folder_apply_all if is_dir else file_apply_all
+            if cached is not None:
+                action = cached
+            else:
+                dlg = UploadConflictDialog(
+                    entry["path"].name, is_dir, remaining, parent=self
+                )
+                if dlg.exec() != QDialog.DialogCode.Accepted or dlg.action is None:
+                    continue  # 用户关闭弹窗 → 跳过
+                action = dlg.action
+                if dlg.apply_all:
+                    if is_dir:
+                        folder_apply_all = action
+                    else:
+                        file_apply_all = action
+
+            if is_dir:
+                if action == ConflictAction.MERGE:
+                    entry["merge"] = True
+                    resolved_entries.append(entry)
+                elif action == ConflictAction.RENAME:
+                    entry["merge"] = False
+                    resolved_entries.append(entry)
+                # 其他情况跳过
+            else:
+                if action == ConflictAction.KEEP_BOTH:
+                    entry["rename"] = True
+                    resolved_entries.append(entry)
+                # SKIP → 不添加到 resolved_entries
+
+        # 执行实际上传准备
+        self.__executeUploadEntries(
+            resolved_entries, existing_file_names, error, context,
+            should_refresh_current_dir,
+        )
+
+    def __executeUploadEntries(
+        self, entries, existing_file_names, error, context, should_refresh_current_dir
+    ):
+        """根据已解决冲突的 entries 执行实际上传准备（创建目录、添加任务）。"""
+        target_dir_id = context["target_dir_id"] if context else self.current_dir_id
+        uploads = []
+        created_dir_count = 0
+        folder_items = []
+
+        for entry in entries:
+            path = entry["path"]
+            if entry["is_dir"]:
+                try:
+                    merge = entry.get("merge", False)
+                    plan = self.pan.prepare_folder_upload(
+                        path, target_dir_id, merge=merge
+                    )
+                    logger.debug(
+                        "PrepareUpload: folder plan files=%d, dirs=%d, root_id=%s, merge=%s",
+                        len(plan["file_targets"]),
+                        plan["created_dir_count"],
+                        plan["root_dir_id"],
+                        merge,
+                    )
+                    uploads.extend(plan["file_targets"])
+                    created_dir_count += int(plan["created_dir_count"])
+                    folder_items.append({
+                        "FileId": plan["root_dir_id"],
+                        "FileName": plan["root_dir_name"],
+                    })
+                except Exception as exc:
+                    logger.error("文件夹上传准备失败: %s: %s", path.name, exc)
+                    InfoBar.warning(
+                        title="文件夹上传失败",
+                        content=f"{path.name}: {exc}",
+                        parent=self,
+                    )
+            else:
+                file_name = path.name
+                if entry.get("rename"):
+                    file_name = _generate_keep_both_name(file_name, existing_file_names)
+                uploads.append({
+                    "file_name": file_name,
+                    "file_size": entry.get("file_size", path.stat().st_size),
+                    "local_path": str(path),
+                    "target_dir_id": target_dir_id,
+                })
 
         added_count = 0
         for upload in uploads:
@@ -1049,11 +1176,12 @@ class FileInterface(QWidget):
         if (uploads or folder_items) and should_refresh_current_dir:
             self.__refreshFileList()
 
-        InfoBar.success(
-            title="上传文件",
-            content=self.__buildUploadSummary(added_count, created_dir_count),
-            parent=self,
-        )
+        if added_count or created_dir_count:
+            InfoBar.success(
+                title="上传文件",
+                content=self.__buildUploadSummary(added_count, created_dir_count),
+                parent=self,
+            )
         if error:
             InfoBar.warning(
                 title="部分文件已跳过",
