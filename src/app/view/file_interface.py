@@ -241,15 +241,12 @@ class FileInterface(QWidget):
         self.fileTable.setBorderVisible(True)
         header = self.fileTable.horizontalHeader()
         if header is not None:
-            header.setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
-            header.setStretchLastSection(True)
-            header.resizeSection(0, 400)  # 名称
-            header.resizeSection(1, 100)  # 类型
-            # 列 2（大小）由 stretchLastSection 自动填充
+            header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+            header.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+            header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
             header.setSectionsClickable(True)
             header.setSortIndicatorShown(True)
             header.sortIndicatorChanged.connect(self.__onHeaderSortIndicatorChanged)
-            header.sectionDoubleClicked.connect(self.__onHeaderDoubleClicked)
         self.listLayout.addWidget(self.fileTable)
 
         self.statusLabel = BodyLabel("", self.listFrame)
@@ -937,10 +934,6 @@ class FileInterface(QWidget):
         result = folders + files
 
         return result
-
-    def __onHeaderDoubleClicked(self, logicalIndex):
-        """双击列头自适应列宽"""
-        self.fileTable.resizeColumnToContents(logicalIndex)
 
     def __onHeaderSortIndicatorChanged(self, logicalIndex, order):
         """列头排序指示器改变时的处理"""

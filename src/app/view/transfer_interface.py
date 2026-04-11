@@ -410,21 +410,13 @@ class TransferInterface(QWidget):
         self.mainLayout.addWidget(self.downloadFrame)
 
     def __setup_transfer_header(self, table):
-        """设置传输表格 header 为可拖拽 + 双击自适应"""
+        """设置传输表格 header：名称列 Stretch，其余列自适应内容"""
         h = table.horizontalHeader()
         if not h:
             return
-        h.setSectionResizeMode(h.ResizeMode.Interactive)
         h.setSectionResizeMode(COL_NAME, h.ResizeMode.Stretch)
-        h.setStretchLastSection(False)
-        h.resizeSection(COL_SIZE, 80)
-        h.resizeSection(COL_PERCENT, 70)
-        h.resizeSection(COL_SPEED, 90)
-        h.resizeSection(COL_ETA, 80)
-        h.resizeSection(COL_STATUS, 70)
-        h.resizeSection(COL_CONN, 60)
-        h.resizeSection(COL_ACTION, 160)
-        h.sectionDoubleClicked.connect(lambda idx, t=table: t.resizeColumnToContents(idx))
+        for c in range(1, NUM_COLS):
+            h.setSectionResizeMode(c, h.ResizeMode.ResizeToContents)
 
     def __initWidget(self):
         StyleSheet.VIEW_INTERFACE.apply(self)
