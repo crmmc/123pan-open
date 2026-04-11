@@ -818,7 +818,7 @@ class TransferInterface(QWidget):
     def _ensure_speed_timer(self):
         if not hasattr(self, "_speed_timer"):
             self._speed_timer = QTimer(self)
-            self._speed_timer.setInterval(2000)
+            self._speed_timer.setInterval(1000)
             self._speed_timer.timeout.connect(self.__tick_speed)
         if not self._speed_timer.isActive():
             self._speed_timer.start()
@@ -1153,6 +1153,7 @@ class TransferInterface(QWidget):
             if task_type == "upload":
                 if task.status == "已暂停" and task.thread is None:
                     task.status = "等待中"
+                    Database.instance().update_upload_task(task.db_task_id, status="等待中")
                     count += 1
                 elif task.status == "失败" and task.thread is None:
                     self.__retry_upload(task)
@@ -1160,6 +1161,7 @@ class TransferInterface(QWidget):
             else:
                 if task.status == "已暂停" and task.thread is None:
                     task.status = "等待中"
+                    Database.instance().update_download_task(task.resume_id, status="等待中")
                     count += 1
                 elif task.status == "失败" and task.thread is None:
                     self.__retry_download(task)

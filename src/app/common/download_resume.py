@@ -1,5 +1,6 @@
 import errno
 import hashlib
+import io
 import math
 import queue
 import shutil
@@ -194,6 +195,30 @@ def _validate_existing_parts(resume_id, part_plan):
             continue
         reusable_indexes.append(index)
         downloaded += expected_size
+
+    # 清理孤立分片文件（不在 reusable_indexes 中的 part 和 merged）
+    temp_dir = get_temp_dir(resume_id)
+    if temp_dir.exists():
+        reusable_set = set(reusable_indexes)
+        for entry in temp_dir.iterdir():
+            name = entry.name
+            if name == "merged":
+                try:
+                    entry.unlink()
+                except OSError:
+                    pass
+                continue
+            if name.startswith("part"):
+                try:
+                    idx = int(name[4:])
+                except (ValueError, IndexError):
+                    continue
+                if idx not in reusable_set:
+                    try:
+                        entry.unlink()
+                    except OSError:
+                        pass
+
     return downloaded, reusable_indexes
 
 
@@ -267,38 +292,47 @@ def _download_part(
 
     first_byte_signaled = False
     attempt = 0
+    buf = io.BytesIO()
     while True:
         attempt_downloaded = 0
         stop_result = _get_stop_result(task)
         if stop_result:
+            # 丢弃内存 buffer，磁盘无半截文件
+            if attempt_downloaded:
+                aggregator.record(-attempt_downloaded)
             return stop_result
         try:
             md5 = hashlib.md5()
+            buf.seek(0)
+            buf.truncate()
             with requests.get(redirect_url, headers=headers, stream=True, timeout=(5, 600)) as resp:
                 if resp.status_code in RATE_LIMIT_CODES:
                     return "rate_limited"
                 resp.raise_for_status()
-                with open(part_path, "wb") as f:
-                    for chunk in resp.iter_content(chunk_size=io_chunk_size):
-                        stop_result = _get_stop_result(task)
-                        if stop_result:
-                            _reset_partial_download(
-                                part_path, aggregator,
-                                attempt_downloaded, resume_id, index,
-                            )
-                            return stop_result
-                        if not chunk:
-                            continue
-                        if not first_byte_signaled and first_byte_callback:
-                            first_byte_callback()
-                            first_byte_signaled = True
-                        f.write(chunk)
-                        md5.update(chunk)
-                        attempt_downloaded += len(chunk)
-                        aggregator.record(len(chunk))
-            actual_size = part_path.stat().st_size
+                for chunk in resp.iter_content(chunk_size=io_chunk_size):
+                    stop_result = _get_stop_result(task)
+                    if stop_result:
+                        # 丢弃内存 buffer，回滚 aggregator 进度
+                        if attempt_downloaded:
+                            aggregator.record(-attempt_downloaded)
+                        Database.instance().remove_download_part(resume_id, index)
+                        return stop_result
+                    if not chunk:
+                        continue
+                    if not first_byte_signaled and first_byte_callback:
+                        first_byte_callback()
+                        first_byte_signaled = True
+                    buf.write(chunk)
+                    md5.update(chunk)
+                    attempt_downloaded += len(chunk)
+                    aggregator.record(len(chunk))
+            # 校验 + 一次性写磁盘
+            data = buf.getvalue()
+            actual_size = len(data)
             if actual_size != int(part["expected_size"]):
                 raise RuntimeError(f"分片 {index} 大小不匹配")
+            with open(part_path, "wb") as f:
+                f.write(data)
             Database.instance().record_download_part(resume_id, {
                 "index": index, "start": start, "end": end,
                 "expected_size": int(part["expected_size"]),
@@ -307,10 +341,16 @@ def _download_part(
             part["attempt"] = 0
             return "ok"
         except (requests.RequestException, RuntimeError, OSError) as exc:
-            _reset_partial_download(
-                part_path, aggregator,
-                attempt_downloaded, resume_id, index,
-            )
+            # 失败时回滚 aggregator 进度，清理 DB 记录
+            if attempt_downloaded:
+                aggregator.record(-attempt_downloaded)
+            Database.instance().remove_download_part(resume_id, index)
+            # 清理磁盘上可能存在的旧 part 文件（兜底历史残留）
+            if part_path.exists():
+                try:
+                    part_path.unlink()
+                except OSError:
+                    logger.warning("删除失败的分片文件失败: %s", part_path)
             if attempt >= max_retries:
                 queue_attempt += 1
                 part["attempt"] = queue_attempt

@@ -1225,6 +1225,17 @@ class Pan123:
             prefetched_result = [None, None]  # [url, exception]
             prefetch_thread = None
 
+            def _requeue_prefetch():
+                """将预取的 part 放回队列并清理预取状态。"""
+                nonlocal prefetched_part, prefetched_result, prefetch_thread
+                if prefetched_part is not None:
+                    part_queue.put(prefetched_part)
+                    prefetched_part = None
+                    prefetched_result = [None, None]
+                    if prefetch_thread is not None:
+                        prefetch_thread.join(timeout=5)
+                        prefetch_thread = None
+
             try:
                 while not failed[0]:
                     if _is_stopped():
@@ -1328,13 +1339,7 @@ class Pan123:
                                             allowed_workers[0] = new_limit
                                 # 回队当前 part + 清空预取
                                 part_queue.put(part)
-                                if prefetched_part is not None:
-                                    part_queue.put(prefetched_part)
-                                    prefetched_part = None
-                                    prefetched_result = [None, None]
-                                    if prefetch_thread is not None:
-                                        prefetch_thread.join(timeout=5)
-                                        prefetch_thread = None
+                                _requeue_prefetch()
                                 worker_feedback.set()
                                 logger.debug(
                                     "[T-%s W-%s] 分块 %s 命中 %s，回队，allowed=%s",
@@ -1372,13 +1377,7 @@ class Pan123:
                                         if new_limit < allowed_workers[0]:
                                             allowed_workers[0] = new_limit
                                 part_queue.put(part)
-                                if prefetched_part is not None:
-                                    part_queue.put(prefetched_part)
-                                    prefetched_part = None
-                                    prefetched_result = [None, None]
-                                    if prefetch_thread is not None:
-                                        prefetch_thread.join(timeout=5)
-                                        prefetch_thread = None
+                                _requeue_prefetch()
                                 worker_feedback.set()
                                 logger.warning(
                                     "[T-%s W-%s] 分块 %s 获取上传链接触发限流，回队重试: %s",
@@ -1403,13 +1402,7 @@ class Pan123:
                                             tid, wid, allowed_workers[0],
                                         )
                                     part_queue.put(part)
-                                    if prefetched_part is not None:
-                                        part_queue.put(prefetched_part)
-                                        prefetched_part = None
-                                        prefetched_result = [None, None]
-                                        if prefetch_thread is not None:
-                                            prefetch_thread.join(timeout=5)
-                                            prefetch_thread = None
+                                    _requeue_prefetch()
                                     worker_feedback.set()
                                     logger.warning(
                                         "[T-%s W-%s] 分块 %s 重试 %s 次仍失败，回队: %s",

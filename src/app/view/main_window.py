@@ -130,30 +130,35 @@ class MainWindow(FluentWindow):
         else:
             self.close()
 
-    def _stop_all_transfers(self):
-        """取消所有正在进行的传输任务并等待线程退出。"""
+    def _stop_all_transfers(self, save_progress=False):
+        """停止所有正在进行的传输任务并等待线程退出。
+
+        Args:
+            save_progress: True 时 pause 线程（保留进度），False 时 cancel（丢弃进度）。
+        """
         threads_to_wait = []
         seen = set()
+        stop_fn = "pause" if save_progress else "cancel"
         for thread in list(self.transfer_interface.upload_threads):
             if thread is None or id(thread) in seen:
                 continue
-            thread.cancel()
+            getattr(thread, stop_fn)()
             threads_to_wait.append(thread)
             seen.add(id(thread))
         for thread in list(self.transfer_interface.download_threads):
             if thread is None or id(thread) in seen:
                 continue
-            thread.cancel()
+            getattr(thread, stop_fn)()
             threads_to_wait.append(thread)
             seen.add(id(thread))
         for task in self.transfer_interface.upload_tasks:
             if task.thread and id(task.thread) not in seen and task.status in UPLOAD_ACTIVE_STATUSES:
-                task.thread.cancel()
+                getattr(task.thread, stop_fn)()
                 threads_to_wait.append(task.thread)
                 seen.add(id(task.thread))
         for task in self.transfer_interface.download_tasks:
             if task.thread and id(task.thread) not in seen and task.status in DOWNLOAD_ACTIVE_STATUSES:
-                task.thread.cancel()
+                getattr(task.thread, stop_fn)()
                 threads_to_wait.append(task.thread)
                 seen.add(id(task.thread))
         # M11: 总超时模式，避免串行等待阻塞 UI
@@ -164,9 +169,32 @@ class MainWindow(FluentWindow):
                 break
             thread.wait(remaining_ms)
 
+        if save_progress:
+            self._save_active_progress()
+
+    def _save_active_progress(self):
+        """兜底：对所有仍在活跃状态的任务强制更新 DB 为 "已暂停"。"""
+        db = Database.instance()
+        for task in self.transfer_interface.upload_tasks:
+            if task.status in UPLOAD_ACTIVE_STATUSES:
+                task.status = "已暂停"
+                if task.db_task_id:
+                    try:
+                        db.update_upload_task(task.db_task_id, status="已暂停")
+                    except Exception:
+                        pass
+        for task in self.transfer_interface.download_tasks:
+            if task.status in DOWNLOAD_ACTIVE_STATUSES:
+                task.status = "已暂停"
+                if task.resume_id:
+                    try:
+                        db.update_download_task(task.resume_id, status="已暂停", error="")
+                    except Exception:
+                        pass
+
     def closeEvent(self, event):
-        """H6: 关闭窗口时取消/等待传输线程。"""
-        self._stop_all_transfers()
+        """H6: 关闭窗口时暂停传输线程，保存进度以便下次续传。"""
+        self._stop_all_transfers(save_progress=True)
         event.accept()
         QApplication.instance().quit()
 
