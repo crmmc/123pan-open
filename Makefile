@@ -15,7 +15,10 @@ PACKAGE_EXCLUDES := \
 	-xr!__pycache__ \
 	-xr!*.pyc
 
-.PHONY: all
+.PHONY: all run
+
+run:
+	uv run src/123pan-open.py
 all: $(ARCHIVE)
 
 $(ARCHIVE): $(PACKAGE_INPUTS) FORCE

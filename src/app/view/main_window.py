@@ -71,11 +71,12 @@ class MainWindow(FluentWindow):
 
     def _onPageChanged(self, index):
         widget = self.stackedWidget.widget(index)
-        if widget is self.file_interface and self.pan is not None:
-            now = time.time()
-            if now - self._last_file_refresh_time > 30:
-                self.file_interface.refresh()
-                self._last_file_refresh_time = now
+        if widget is self.file_interface:
+            if self.pan is not None:
+                now = time.time()
+                if now - self._last_file_refresh_time > 30:
+                    self.file_interface.refresh()
+                    self._last_file_refresh_time = now
 
     def _startup_login_flow(self):
         db = Database.instance()
