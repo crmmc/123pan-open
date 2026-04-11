@@ -152,15 +152,23 @@ class FileInterface(QWidget):
 
         # 第二行：返回 + 面包屑 + 刷新
         self.navBarLayout = QHBoxLayout()
-        self.navBarLayout.setSpacing(4)
+        self.navBarLayout.setSpacing(8)
 
         self.backButton = ToolButton(FIF.LEFT_ARROW, self.topBarFrame)
         self.backButton.setToolTip("返回上一级")
-        self.breadcrumbBar = BreadcrumbBar(self.topBarFrame)
+
+        self.breadcrumbFrame = QFrame(self.topBarFrame)
+        self.breadcrumbFrame.setObjectName("frame")
+        breadcrumb_layout = QHBoxLayout(self.breadcrumbFrame)
+        breadcrumb_layout.setContentsMargins(8, 4, 8, 4)
+        breadcrumb_layout.setSpacing(0)
+        self.breadcrumbBar = BreadcrumbBar(self.breadcrumbFrame)
+        breadcrumb_layout.addWidget(self.breadcrumbBar)
+
         self.refreshButton = PushButton(FIF.UPDATE.icon(), "刷新", self.topBarFrame)
 
         self.navBarLayout.addWidget(self.backButton, 0)
-        self.navBarLayout.addWidget(self.breadcrumbBar, 1)
+        self.navBarLayout.addWidget(self.breadcrumbFrame, 1)
         self.navBarLayout.addWidget(self.refreshButton, 0)
 
         self.topBarOuterLayout.addLayout(self.actionBarLayout)

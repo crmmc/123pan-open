@@ -1,5 +1,7 @@
 """上传/下载共用的并发控制常量与慢启动调度工具。"""
+import queue
 import threading
+import time
 
 from .log import get_logger
 
@@ -94,3 +96,77 @@ def slow_start_scheduler(
     for t in threads:
         t.join()
     logger.debug("[调度器] 调度结束, 共创建 %s 线程", len(threads))
+
+
+class _ProgressAggregator:
+    """Worker 线程推送增量字节，Aggregator 线程负责累加、速度追踪、UI 进度信号。"""
+
+    def __init__(self, total, speed_tracker, signals, progress_interval):
+        self._queue: queue.Queue[int] = queue.Queue()
+        self._total = total
+        self._speed_tracker = speed_tracker
+        self._signals = signals
+        self._progress_interval = progress_interval
+        self._cumulative = 0        # 仅 Aggregator 线程写
+        self._last_emit_time = 0.0  # 仅 Aggregator 线程写
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def cumulative(self) -> int:
+        return self._cumulative  # CPython int 赋值原子，Worker 可安全读
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def set_initial(self, value: int):
+        """设置初始累计值（仅在 start() 之前调用）。"""
+        self._cumulative = value
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5)
+            self._thread = None
+
+    def record(self, n: int):
+        """Worker 调用: 正值增量 / 负值回滚。"""
+        self._queue.put(n)
+
+    def emit_final(self):
+        """排空队列后发射最终进度值。"""
+        while not self._queue.empty():
+            try:
+                self._cumulative += self._queue.get_nowait()
+            except queue.Empty:
+                break
+        if self._speed_tracker:
+            self._speed_tracker.record(self._cumulative)
+        if self._signals and self._total:
+            self._signals.progress.emit(int(self._cumulative * 100 / self._total))
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            try:
+                n = self._queue.get(timeout=0.05)
+            except queue.Empty:
+                continue
+            # 批量排空
+            batch = [n]
+            while not self._queue.empty():
+                try:
+                    batch.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            delta = sum(batch)
+            self._cumulative += delta
+            if self._speed_tracker:
+                self._speed_tracker.record(self._cumulative)
+            now = time.monotonic()
+            if now - self._last_emit_time >= self._progress_interval:
+                if self._signals and self._total:
+                    self._signals.progress.emit(
+                        int(self._cumulative * 100 / self._total)
+                    )
+                self._last_emit_time = now

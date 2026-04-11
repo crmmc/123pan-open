@@ -13,7 +13,7 @@ import requests
 from .config import CONFIG_DIR
 from .concurrency import (
     RATE_LIMIT_CODES, MAX_RATE_LIMITS, RATE_LIMIT_BACKOFF,
-    PROGRESS_INTERVAL, slow_start_scheduler,
+    PROGRESS_INTERVAL, slow_start_scheduler, _ProgressAggregator,
 )
 from .database import Database, get_download_part_size, _safe_int
 from .log import get_logger
@@ -121,15 +121,9 @@ def _save_download_status(resume_id, total, downloaded, status, error=None):
     )
 
 
-def _reset_partial_download(
-    part_path, downloaded, progress_lock, byte_count,
-    signals, total, resume_id, index,
-):
+def _reset_partial_download(part_path, aggregator, byte_count, resume_id, index):
     if byte_count:
-        with progress_lock:
-            downloaded[0] = max(0, downloaded[0] - byte_count)
-            current = downloaded[0]
-        _notify_progress(signals, total, current)
+        aggregator.record(-byte_count)
     Database.instance().remove_download_part(resume_id, index)
     if part_path.exists():
         try:
@@ -256,8 +250,7 @@ def _probe_download(redirect_url):
 # ---- download part ----
 
 def _download_part(
-    redirect_url, part, resume_id, downloaded, progress_lock,
-    last_progress_time, signals, total, task, speed_tracker,
+    redirect_url, part, resume_id, aggregator, signals, total, task,
     first_byte_callback=None,
 ):
     index = int(part["index"])
@@ -290,8 +283,8 @@ def _download_part(
                         stop_result = _get_stop_result(task)
                         if stop_result:
                             _reset_partial_download(
-                                part_path, downloaded, progress_lock,
-                                attempt_downloaded, signals, total, resume_id, index,
+                                part_path, aggregator,
+                                attempt_downloaded, resume_id, index,
                             )
                             return stop_result
                         if not chunk:
@@ -302,14 +295,7 @@ def _download_part(
                         f.write(chunk)
                         md5.update(chunk)
                         attempt_downloaded += len(chunk)
-                        with progress_lock:
-                            downloaded[0] += len(chunk)
-                            now = time.time()
-                            if speed_tracker:
-                                speed_tracker.record(downloaded[0])
-                            if now - last_progress_time[0] > PROGRESS_INTERVAL:
-                                _notify_progress(signals, total, downloaded[0])
-                                last_progress_time[0] = now
+                        aggregator.record(len(chunk))
             actual_size = part_path.stat().st_size
             if actual_size != int(part["expected_size"]):
                 raise RuntimeError(f"分片 {index} 大小不匹配")
@@ -322,8 +308,8 @@ def _download_part(
             return "ok"
         except (requests.RequestException, RuntimeError, OSError) as exc:
             _reset_partial_download(
-                part_path, downloaded, progress_lock,
-                attempt_downloaded, signals, total, resume_id, index,
+                part_path, aggregator,
+                attempt_downloaded, resume_id, index,
             )
             if attempt >= max_retries:
                 queue_attempt += 1
@@ -362,14 +348,15 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
     allowed_workers = [1]
     failed = [False]
     rate_limit_count = [0]
-    downloaded = [reused_bytes]
     progress_lock = threading.Lock()
-    last_progress_time = [0.0]
     worker_feedback = threading.Event()
     probe_thread_name = [None]
 
+    aggregator = _ProgressAggregator(total, speed_tracker, signals, PROGRESS_INTERVAL)
+    aggregator.set_initial(reused_bytes)
     if speed_tracker and reused_bytes:
         speed_tracker.record(reused_bytes)
+    aggregator.start()
 
     def _try_promote_probe():
         """当前线程是 probe 且收到首字节 → 转正。"""
@@ -399,12 +386,12 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                     return
 
                 result = _download_part(
-                    redirect_url, part, resume_id, downloaded, progress_lock,
-                    last_progress_time, signals, total, task, speed_tracker,
+                    redirect_url, part, resume_id, aggregator,
+                    signals, total, task,
                     first_byte_callback=_try_promote_probe,
                 )
                 if result == "ok":
-                    _save_download_status(resume_id, total, downloaded[0], "下载中")
+                    _save_download_status(resume_id, total, aggregator.cumulative, "下载中")
                     worker_feedback.set()
                     continue
                 if result in ("cancelled", "paused"):
@@ -463,16 +450,17 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         thread_prefix="dl_worker",
     )
 
+    aggregator.stop()
+    aggregator.emit_final()
     _notify_conn_info(signals, 0, max_workers)
-    _notify_progress(signals, total, downloaded[0])
 
     if _is_task_paused(task):
-        _save_download_status(resume_id, total, downloaded[0], "已暂停", "")
+        _save_download_status(resume_id, total, aggregator.cumulative, "已暂停", "")
         _notify_status(signals, "已暂停")
         return "已暂停"
 
     if _is_task_cancelled(task):
-        _save_download_status(resume_id, total, downloaded[0], "已取消", "用户取消下载")
+        _save_download_status(resume_id, total, aggregator.cumulative, "已取消", "用户取消下载")
         _notify_status(signals, "已取消")
         if getattr(task, "cleanup_on_cancel", False):
             Database.instance().delete_download_task(resume_id)
@@ -480,12 +468,12 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         return "已取消"
 
     if failed[0]:
-        _save_download_status(resume_id, total, downloaded[0], "失败", "分片下载失败")
+        _save_download_status(resume_id, total, aggregator.cumulative, "失败", "分片下载失败")
         _notify_status(signals, "失败")
         raise RuntimeError("分片下载失败")
 
     # ---- 合并阶段 ----
-    _save_download_status(resume_id, total, downloaded[0], "合并中")
+    _save_download_status(resume_id, total, aggregator.cumulative, "合并中")
     _notify_status(signals, "合并中")
     merged_path = get_merged_path(resume_id)
     merged_path.parent.mkdir(parents=True, exist_ok=True)
@@ -509,7 +497,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         raise RuntimeError(f"合并分片文件失败: {exc}") from exc
 
     if _is_task_paused(task):
-        _save_download_status(resume_id, total, downloaded[0], "已暂停", "")
+        _save_download_status(resume_id, total, aggregator.cumulative, "已暂停", "")
         _notify_status(signals, "已暂停")
         try:
             merged_path.unlink()
@@ -518,7 +506,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         return "已暂停"
 
     if _is_task_cancelled(task):
-        _save_download_status(resume_id, total, downloaded[0], "已取消", "用户取消下载")
+        _save_download_status(resume_id, total, aggregator.cumulative, "已取消", "用户取消下载")
         if getattr(task, "cleanup_on_cancel", False):
             Database.instance().delete_download_task(resume_id)
             cleanup_temp_dir(resume_id)
@@ -560,7 +548,7 @@ def _download_single_stream(redirect_url, out_path, total, signals, task, speed_
             done = 0
             last_t = 0.0
             with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in response.iter_content(chunk_size=256 * 1024):
                     stop_result = _get_stop_result(task)
                     if stop_result:
                         f.close()

@@ -5,6 +5,7 @@ import uuid
 from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -15,6 +16,7 @@ from PySide6.QtWidgets import (
 from qfluentwidgets import (
     ComboBox,
     InfoBar,
+    MessageBox,
     PushButton,
     SegmentedWidget,
     TableWidget,
@@ -42,6 +44,10 @@ logger = get_logger(__name__)
 
 DOWNLOAD_STATUS_FILTERS = [
     "全部", "等待中", "校验中", "下载中", "合并中",
+    "已暂停", "已完成", "失败", "已取消",
+]
+UPLOAD_STATUS_FILTERS = [
+    "全部", "等待中", "校验中", "上传中",
     "已暂停", "已完成", "失败", "已取消",
 ]
 
@@ -329,6 +335,7 @@ class TransferInterface(QWidget):
         self.pan = None
         self.current_account_name = ""
         self.download_status_filter = "全部"
+        self.upload_status_filter = "全部"
         self.__createTopBar()
         self.__createContent()
         self.__initWidget()
@@ -364,11 +371,18 @@ class TransferInterface(QWidget):
         self.downloadFilterCombo.setMinimumWidth(120)
         self.downloadFilterLabel.hide()
         self.downloadFilterCombo.hide()
+        self.uploadFilterLabel = QLabel("状态", self.topBarFrame)
+        self.uploadFilterCombo = ComboBox(self.topBarFrame)
+        self.uploadFilterCombo.addItems(UPLOAD_STATUS_FILTERS)
+        self.uploadFilterCombo.setCurrentText(self.upload_status_filter)
+        self.uploadFilterCombo.setMinimumWidth(120)
         self.openDownloadFolderButton = PushButton(FIF.FOLDER.icon(), "打开下载文件夹", self.topBarFrame)
         self.openDownloadFolderButton.hide()
+        self.topBarLayout.addWidget(self.uploadFilterLabel)
+        self.topBarLayout.addWidget(self.uploadFilterCombo)
+        self.topBarLayout.addWidget(self.openDownloadFolderButton)
         self.topBarLayout.addWidget(self.downloadFilterLabel)
         self.topBarLayout.addWidget(self.downloadFilterCombo)
-        self.topBarLayout.addWidget(self.openDownloadFolderButton)
         self.mainLayout.addWidget(self.topBarFrame)
 
     def __createContent(self):
@@ -382,11 +396,14 @@ class TransferInterface(QWidget):
         self.uploadTable.setHorizontalHeaderLabels(HEADER_LABELS)
         self.uploadTable.setBorderRadius(8)
         self.uploadTable.setBorderVisible(True)
+        self.uploadTable.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.uploadTable.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.uploadTable.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         uh = self.uploadTable.horizontalHeader()
         if uh:
             self.__setup_transfer_header(self.uploadTable)
-        self.uploadSpeedLabel = QLabel("总速度: --", self.uploadFrame)
-        self.uploadLayout.addWidget(self.uploadSpeedLabel)
+        self.uploadBatchBar, self._upload_batch_btns = self.__create_batch_toolbar(self.uploadFrame)
+        self.uploadLayout.addWidget(self.uploadBatchBar)
         self.uploadLayout.addWidget(self.uploadTable)
 
         self.downloadFrame = QFrame(self)
@@ -399,11 +416,14 @@ class TransferInterface(QWidget):
         self.downloadTable.setHorizontalHeaderLabels(HEADER_LABELS)
         self.downloadTable.setBorderRadius(8)
         self.downloadTable.setBorderVisible(True)
+        self.downloadTable.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.downloadTable.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.downloadTable.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         dh = self.downloadTable.horizontalHeader()
         if dh:
             self.__setup_transfer_header(self.downloadTable)
-        self.downloadSpeedLabel = QLabel("总速度: --", self.downloadFrame)
-        self.downloadLayout.addWidget(self.downloadSpeedLabel)
+        self.downloadBatchBar, self._download_batch_btns = self.__create_batch_toolbar(self.downloadFrame)
+        self.downloadLayout.addWidget(self.downloadBatchBar)
         self.downloadLayout.addWidget(self.downloadTable)
         self.downloadFrame.hide()
         self.mainLayout.addWidget(self.uploadFrame)
@@ -418,16 +438,68 @@ class TransferInterface(QWidget):
         for c in range(1, NUM_COLS):
             h.setSectionResizeMode(c, h.ResizeMode.ResizeToContents)
 
+    def __create_batch_toolbar(self, parent):
+        """创建批量操作工具栏，返回 (frame, buttons_dict)。"""
+        frame = QFrame(parent)
+        layout = QHBoxLayout(frame)
+        layout.setContentsMargins(12, 4, 12, 4)
+        layout.setSpacing(6)
+
+        btn_select_all = PushButton(FIF.CHECKBOX.icon(), "全选", frame)
+        btn_invert = PushButton(FIF.SYNC.icon(), "反选", frame)
+        btn_pause = PushButton(FIF.PAUSE.icon(), "暂停", frame)
+        btn_resume = PushButton(FIF.SYNC.icon(), "继续", frame)
+        btn_delete = PushButton(FIF.DELETE.icon(), "删除", frame)
+        for b in (btn_select_all, btn_invert, btn_pause, btn_resume, btn_delete):
+            b.setFixedHeight(28)
+            layout.addWidget(b)
+        layout.addStretch()
+        select_count = QLabel("已选 0 项", frame)
+        layout.addWidget(select_count)
+        layout.addSpacing(16)
+        speed_label = QLabel("总速度: --", frame)
+        layout.addWidget(speed_label)
+
+        return frame, {
+            'select_all': btn_select_all,
+            'invert': btn_invert,
+            'pause': btn_pause,
+            'resume': btn_resume,
+            'delete': btn_delete,
+            'count': select_count,
+            'speed': speed_label,
+        }
+
     def __initWidget(self):
         StyleSheet.VIEW_INTERFACE.apply(self)
         self.segmentedWidget.currentItemChanged.connect(self.__onSegmentChanged)
+        self.uploadFilterCombo.currentTextChanged.connect(self.__onUploadFilterChanged)
         self.downloadFilterCombo.currentTextChanged.connect(self.__onDownloadFilterChanged)
         self.openDownloadFolderButton.clicked.connect(self.__open_download_folder)
+        # 上传批量操作信号
+        ub = self._upload_batch_btns
+        ub['select_all'].clicked.connect(lambda: self.__select_all(self.uploadTable, self.__get_filtered_upload_tasks()))
+        ub['invert'].clicked.connect(lambda: self.__invert_selection(self.uploadTable, self.__get_filtered_upload_tasks()))
+        ub['pause'].clicked.connect(lambda: self.__batch_pause(self.uploadTable, self.__get_filtered_upload_tasks(), "upload"))
+        ub['resume'].clicked.connect(lambda: self.__batch_resume(self.uploadTable, self.__get_filtered_upload_tasks(), "upload"))
+        ub['delete'].clicked.connect(lambda: self.__batch_delete(self.uploadTable, self.__get_filtered_upload_tasks(), "upload"))
+        # 下载批量操作信号
+        db = self._download_batch_btns
+        db['select_all'].clicked.connect(lambda: self.__select_all(self.downloadTable, self.__get_filtered_download_tasks()))
+        db['invert'].clicked.connect(lambda: self.__invert_selection(self.downloadTable, self.__get_filtered_download_tasks()))
+        db['pause'].clicked.connect(lambda: self.__batch_pause(self.downloadTable, self.__get_filtered_download_tasks(), "download"))
+        db['resume'].clicked.connect(lambda: self.__batch_resume(self.downloadTable, self.__get_filtered_download_tasks(), "download"))
+        db['delete'].clicked.connect(lambda: self.__batch_delete(self.downloadTable, self.__get_filtered_download_tasks(), "download"))
+        # 选中变化 → 更新计数
+        self.uploadTable.itemSelectionChanged.connect(lambda: self.__update_batch_bar(self._upload_batch_btns, self.uploadTable))
+        self.downloadTable.itemSelectionChanged.connect(lambda: self.__update_batch_bar(self._download_batch_btns, self.downloadTable))
 
     def __onSegmentChanged(self, route_key):
         is_upload = route_key == "upload"
         self.uploadFrame.setVisible(is_upload)
         self.downloadFrame.setVisible(not is_upload)
+        self.uploadFilterLabel.setVisible(is_upload)
+        self.uploadFilterCombo.setVisible(is_upload)
         self.downloadFilterLabel.setVisible(not is_upload)
         self.downloadFilterCombo.setVisible(not is_upload)
         self.openDownloadFolderButton.setVisible(not is_upload)
@@ -436,10 +508,19 @@ class TransferInterface(QWidget):
         self.download_status_filter = status
         self.__update_download_table()
 
+    def __onUploadFilterChanged(self, status):
+        self.upload_status_filter = status
+        self.__update_upload_table()
+
     def __get_filtered_download_tasks(self):
         if self.download_status_filter == "全部":
             return self.download_tasks
         return [t for t in self.download_tasks if t.status == self.download_status_filter]
+
+    def __get_filtered_upload_tasks(self):
+        if self.upload_status_filter == "全部":
+            return self.upload_tasks
+        return [t for t in self.upload_tasks if t.status == self.upload_status_filter]
 
     def __resolve_download_folder(self):
         row = self.downloadTable.currentRow()
@@ -546,6 +627,8 @@ class TransferInterface(QWidget):
         return max(1, min(5, int(Database.instance().get_config("maxConcurrentDownloads", 5))))
 
     def __try_start_pending_uploads(self):
+        if getattr(self, '_batch_rebuild_suppressed', False):
+            return
         limit = self.__max_concurrent_uploads()
         for task in self.upload_tasks:
             if self.__active_upload_count() >= limit:
@@ -556,6 +639,8 @@ class TransferInterface(QWidget):
                 self.__start_upload_task(task)
 
     def __try_start_pending_downloads(self):
+        if getattr(self, '_batch_rebuild_suppressed', False):
+            return
         limit = self.__max_concurrent_downloads()
         for task in self.download_tasks:
             if self.__active_download_count() >= limit:
@@ -674,7 +759,7 @@ class TransferInterface(QWidget):
                 task._last_db_progress_time = now
         elif isinstance(task, UploadTask) and task.db_task_id:
             Database.instance().update_upload_task(task.db_task_id, progress=progress)
-        self.__refresh_table_for(task)
+        self.__partial_refresh(task)
 
     def __update_task_status(self, task, status):
         task.status = status
@@ -686,6 +771,7 @@ class TransferInterface(QWidget):
                     task.thread.disconnect()
                 except TypeError:
                     pass
+                task.thread.deleteLater()
                 if isinstance(task, UploadTask) and task.thread in self.upload_threads:
                     self.upload_threads.remove(task.thread)
                 elif isinstance(task, DownloadTask) and task.thread in self.download_threads:
@@ -714,7 +800,10 @@ class TransferInterface(QWidget):
                     error=task.last_error,
                     delete_requested=int(task.delete_requested),
                 )
-        self.__refresh_table_for(task)
+        if isinstance(task, UploadTask):
+            self.__update_upload_table()
+        else:
+            self.__update_download_table()
         if terminal:
             if isinstance(task, UploadTask):
                 self.__try_start_pending_uploads()
@@ -724,7 +813,7 @@ class TransferInterface(QWidget):
     def __update_task_conn_info(self, task, active, max_w):
         task.active_workers = active
         task.max_workers = max_w
-        self.__refresh_table_for(task)
+        self.__partial_refresh(task)
 
     def _ensure_speed_timer(self):
         if not hasattr(self, "_speed_timer"):
@@ -736,8 +825,8 @@ class TransferInterface(QWidget):
 
     def __tick_speed(self):
         has_active = False
-        upload_dirty = False
-        download_dirty = False
+        upload_dirty = []
+        download_dirty = []
 
         for task in self.upload_tasks:
             if task.status in UPLOAD_ACTIVE_STATUSES:
@@ -746,11 +835,11 @@ class TransferInterface(QWidget):
                 remaining = task.file_size - int(task.file_size * task.progress / 100) if task.file_size else 0
                 task.speed_bps = task.speed_tracker.speed()
                 task.eta_seconds = task.speed_tracker.eta(remaining)
-                upload_dirty = True
+                upload_dirty.append(task)
             elif task.speed_bps != 0.0:
                 task.speed_bps = 0.0
                 task.eta_seconds = -1.0
-                upload_dirty = True
+                upload_dirty.append(task)
 
         for task in self.download_tasks:
             if task.status in DOWNLOAD_ACTIVE_STATUSES:
@@ -759,22 +848,28 @@ class TransferInterface(QWidget):
                 remaining = task.file_size - int(task.file_size * task.progress / 100) if task.file_size else 0
                 task.speed_bps = task.speed_tracker.speed()
                 task.eta_seconds = task.speed_tracker.eta(remaining)
-                download_dirty = True
+                download_dirty.append(task)
             elif task.speed_bps != 0.0:
                 task.speed_bps = 0.0
                 task.eta_seconds = -1.0
-                download_dirty = True
+                download_dirty.append(task)
 
         if upload_dirty:
-            self.__update_upload_table()
+            visible = self.__get_filtered_upload_tasks()
+            for task in upload_dirty:
+                row = self.__find_task_row(task, visible)
+                self.__refresh_task_cells(self.uploadTable, row, task)
             total = sum(t.speed_bps for t in self.upload_tasks
                         if t.speed_bps > 0 and t.status not in _SPEED_EXCLUDE_STATUSES)
-            self.uploadSpeedLabel.setText(f"总速度: {format_speed(total)}")
+            self._upload_batch_btns['speed'].setText(f"总速度: {format_speed(total)}")
         if download_dirty:
-            self.__update_download_table()
+            visible = self.__get_filtered_download_tasks()
+            for task in download_dirty:
+                row = self.__find_task_row(task, visible)
+                self.__refresh_task_cells(self.downloadTable, row, task)
             total = sum(t.speed_bps for t in self.download_tasks
                         if t.speed_bps > 0 and t.status not in _SPEED_EXCLUDE_STATUSES)
-            self.downloadSpeedLabel.setText(f"总速度: {format_speed(total)}")
+            self._download_batch_btns['speed'].setText(f"总速度: {format_speed(total)}")
 
         if not has_active:
             self._speed_timer.stop()
@@ -831,11 +926,16 @@ class TransferInterface(QWidget):
                 delete_requested=int(task.delete_requested),
             )
 
-    def __refresh_table_for(self, task):
+    def __partial_refresh(self, task):
+        """局部刷新单个 task 的 speed/ETA/conn/percent 列。"""
         if isinstance(task, UploadTask):
-            self.__update_upload_table()
+            visible = self.__get_filtered_upload_tasks()
+            table = self.uploadTable
         else:
-            self.__update_download_table()
+            visible = self.__get_filtered_download_tasks()
+            table = self.downloadTable
+        row = self.__find_task_row(task, visible)
+        self.__refresh_task_cells(table, row, task)
 
     def __task_finished(self, task, task_type):
         task.active_workers = 0
@@ -852,8 +952,7 @@ class TransferInterface(QWidget):
             InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
             self.__try_start_pending_uploads()
             return
-        task.thread = None
-        task.status = "已完成"
+        # __update_task_status 已设置 task.thread = None 和 task.status = "已完成"
         Database.instance().delete_download_task(task.resume_id)
         self.__update_download_table()
         self.__try_start_pending_downloads()
@@ -986,14 +1085,12 @@ class TransferInterface(QWidget):
                 self.__update_upload_table()
             return
         if task.thread and task.status in {"下载中", "已暂停", "等待中", "校验中", "合并中"}:
-            try:
-                task.thread.disconnect()
-            except TypeError:
-                pass
             if task.thread in self.download_threads:
                 self.download_threads.remove(task.thread)
             task.cleanup_on_cancel = True
             task.thread.cancel()
+            # 不 disconnect：线程检测 cancel 后发射 status_updated("已取消")
+            # → __update_task_status 终态处理 disconnect + deleteLater
         else:
             Database.instance().delete_download_task(task.resume_id)
             cleanup_temp_dir(task.resume_id)
@@ -1001,6 +1098,102 @@ class TransferInterface(QWidget):
             self.download_tasks.remove(task)
             self.__update_download_table()
         self.__try_start_pending_downloads()
+
+    # ---- batch operations ----
+
+    def __update_batch_bar(self, btns, table):
+        count = len(table.selectionModel().selectedRows())
+        btns['count'].setText(f"已选 {count} 项")
+
+    @staticmethod
+    def __get_selected_tasks(table, tasks):
+        rows = sorted({idx.row() for idx in table.selectionModel().selectedRows()})
+        return [tasks[r] for r in rows if 0 <= r < len(tasks)]
+
+    @staticmethod
+    def __select_all(table, _tasks):
+        table.selectAll()
+
+    @staticmethod
+    def __invert_selection(table, tasks):
+        current = {idx.row() for idx in table.selectionModel().selectedRows()}
+        table.blockSignals(True)
+        table.clearSelection()
+        for i in range(len(tasks)):
+            if i not in current:
+                table.selectRow(i)
+        table.blockSignals(False)
+        table.itemSelectionChanged.emit()
+
+    def __batch_pause(self, table, tasks, task_type):
+        selected = self.__get_selected_tasks(table, tasks)
+        if not selected:
+            InfoBar.warning(title="提示", content="请先选择任务", parent=self)
+            return
+        count = 0
+        for task in selected:
+            if task_type == "upload":
+                if task.status in UPLOAD_ACTIVE_STATUSES:
+                    self.__toggle_pause_upload(task)
+                    count += 1
+            else:
+                if task.status in DOWNLOAD_ACTIVE_STATUSES:
+                    self.__toggle_pause(task)
+                    count += 1
+        if count:
+            InfoBar.success(title="批量暂停", content=f"已暂停 {count} 个任务", parent=self)
+
+    def __batch_resume(self, table, tasks, task_type):
+        selected = self.__get_selected_tasks(table, tasks)
+        if not selected:
+            InfoBar.warning(title="提示", content="请先选择任务", parent=self)
+            return
+        count = 0
+        for task in selected:
+            if task_type == "upload":
+                if task.status == "已暂停" and task.thread is None:
+                    task.status = "等待中"
+                    count += 1
+                elif task.status == "失败" and task.thread is None:
+                    self.__retry_upload(task)
+                    count += 1
+            else:
+                if task.status == "已暂停" and task.thread is None:
+                    task.status = "等待中"
+                    count += 1
+                elif task.status == "失败" and task.thread is None:
+                    self.__retry_download(task)
+                    count += 1
+        if count:
+            if task_type == "upload":
+                self.__update_upload_table()
+                self.__try_start_pending_uploads()
+            else:
+                self.__update_download_table()
+                self.__try_start_pending_downloads()
+            InfoBar.success(title="批量继续", content=f"已恢复 {count} 个任务", parent=self)
+
+    def __batch_delete(self, table, tasks, task_type):
+        selected = self.__get_selected_tasks(table, tasks)
+        if not selected:
+            InfoBar.warning(title="提示", content="请先选择任务", parent=self)
+            return
+        msg = MessageBox("确认批量删除", f"确定要删除选中的 {len(selected)} 个任务吗？", self)
+        if not msg.exec():
+            return
+        self._batch_rebuild_suppressed = True
+        try:
+            for task in selected:
+                self.__remove_task(task, task_type)
+        finally:
+            self._batch_rebuild_suppressed = False
+        if task_type == "upload":
+            self.__update_upload_table()
+            self.__try_start_pending_uploads()
+        else:
+            self.__update_download_table()
+            self.__try_start_pending_downloads()
+        InfoBar.success(title="批量删除", content=f"已删除 {len(selected)} 个任务", parent=self)
 
     # ---- table helpers ----
 
@@ -1131,13 +1324,65 @@ class TransferInterface(QWidget):
             sb.setEnabled(True)
             self.__bind_button(sb, lambda _, t=task: self.__remove_task(t, "download"))
 
+    # ---- selection persistence ----
+
+    @staticmethod
+    def __save_selection(table):
+        """从表格 COL_NAME item 的 UserRole 读取选中行 task id 集合。"""
+        saved = set()
+        for idx in table.selectionModel().selectedRows():
+            item = table.item(idx.row(), COL_NAME)
+            if item:
+                tid = item.data(Qt.ItemDataRole.UserRole)
+                if tid:
+                    saved.add(tid)
+        return saved
+
+    @staticmethod
+    def __restore_selection(table, tasks, saved):
+        """根据 saved 集合恢复选中行。"""
+        if not saved:
+            return
+        table.blockSignals(True)
+        for row, task in enumerate(tasks):
+            tid = getattr(task, 'db_task_id', None) or getattr(task, 'resume_id', None)
+            if tid and tid in saved:
+                table.selectRow(row)
+        table.blockSignals(False)
+
+    @staticmethod
+    def __find_task_row(task, visible_tasks):
+        """在可见任务列表中找到 task 对应行号，返回 -1 表示不可见。"""
+        for i, t in enumerate(visible_tasks):
+            if t is task:
+                return i
+        return -1
+
+    def __refresh_task_cells(self, table, row, task):
+        """局部刷新：只更新 progress/speed/ETA/conn 四列，不动结构/选中/action 按钮。"""
+        if row < 0 or row >= table.rowCount():
+            return
+        center = Qt.AlignmentFlag.AlignCenter
+        self.__set_table_item_text(table, row, COL_PERCENT, f"{task.progress}%", center)
+        self.__set_table_item_text(table, row, COL_SPEED, format_speed(task.speed_bps), center)
+        self.__set_table_item_text(table, row, COL_ETA, format_eta(task.eta_seconds), center)
+        conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
+        self.__set_table_item_text(table, row, COL_CONN, conn, center)
+
     # ---- table updates ----
 
     def __update_upload_table(self):
-        self.uploadTable.setRowCount(len(self.upload_tasks))
+        if getattr(self, '_batch_rebuild_suppressed', False):
+            return
+        sel = self.__save_selection(self.uploadTable)
+        visible = self.__get_filtered_upload_tasks()
+        self.uploadTable.setRowCount(len(visible))
         center = Qt.AlignmentFlag.AlignCenter
-        for row, task in enumerate(self.upload_tasks):
+        for row, task in enumerate(visible):
             self.__set_table_item_text(self.uploadTable, row, COL_NAME, task.file_name or "(未知)")
+            item = self.uploadTable.item(row, COL_NAME)
+            if item:
+                item.setData(Qt.ItemDataRole.UserRole, task.db_task_id or "")
             self.__set_table_item_text(self.uploadTable, row, COL_SIZE, format_file_size(task.file_size))
             self.__set_table_item_text(self.uploadTable, row, COL_PERCENT, f"{task.progress}%", center)
             self.__set_table_item_text(self.uploadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
@@ -1146,13 +1391,20 @@ class TransferInterface(QWidget):
             conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
             self.__set_table_item_text(self.uploadTable, row, COL_CONN, conn, center)
             self.__configure_upload_actions(row, task)
+        self.__restore_selection(self.uploadTable, visible, sel)
 
     def __update_download_table(self):
+        if getattr(self, '_batch_rebuild_suppressed', False):
+            return
+        sel = self.__save_selection(self.downloadTable)
         visible = self.__get_filtered_download_tasks()
         self.downloadTable.setRowCount(len(visible))
         center = Qt.AlignmentFlag.AlignCenter
         for row, task in enumerate(visible):
             self.__set_table_item_text(self.downloadTable, row, COL_NAME, task.file_name or "(未知)")
+            item = self.downloadTable.item(row, COL_NAME)
+            if item:
+                item.setData(Qt.ItemDataRole.UserRole, task.resume_id or "")
             self.__set_table_item_text(self.downloadTable, row, COL_SIZE, format_file_size(task.file_size))
             self.__set_table_item_text(self.downloadTable, row, COL_PERCENT, f"{task.progress}%", center)
             self.__set_table_item_text(self.downloadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
@@ -1161,3 +1413,4 @@ class TransferInterface(QWidget):
             conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
             self.__set_table_item_text(self.downloadTable, row, COL_CONN, conn, center)
             self.__configure_download_actions(row, task)
+        self.__restore_selection(self.downloadTable, visible, sel)

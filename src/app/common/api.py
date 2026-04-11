@@ -1,5 +1,4 @@
 import hashlib
-import io
 import json
 import math
 import os
@@ -20,7 +19,7 @@ from urllib3.util.retry import Retry
 from .database import Database, UPLOAD_PART_SIZE, _safe_int, _safe_float, get_upload_part_size
 from .concurrency import (
     RATE_LIMIT_CODES, MAX_RATE_LIMITS, RATE_LIMIT_BACKOFF,
-    PROGRESS_INTERVAL, slow_start_scheduler,
+    PROGRESS_INTERVAL, slow_start_scheduler, _ProgressAggregator,
 )
 from .const import all_device_type, all_os_versions
 from .log import get_logger
@@ -70,32 +69,44 @@ BACKOFF_MULTIPLIER = 2
 MAX_CREATE_DIR_RETRIES = 10
 
 
-class _ProgressIO:
-    """将 bytes 包装为 file-like 对象，按阈值触发进度回调。"""
-    _REPORT_SIZE = 256 * 1024  # 累积 256KB 才汇报一次
+class _ProgressFileIO:
+    """按需从文件读取并上报进度的 file-like 对象，零预分配。"""
+    _REPORT_SIZE = 256 * 1024
 
-    def __init__(self, data, callback):
-        self._buf = io.BytesIO(data)
+    def __init__(self, file_path, offset, size, callback):
+        self._f = open(file_path, "rb")  # noqa: SIM115
+        self._f.seek(offset)
+        self._size = size
+        self._remaining = size
         self._cb = callback
         self._pending = 0
         self.reported = 0
 
     def read(self, size=-1):
-        chunk = self._buf.read(size)
+        if self._remaining <= 0:
+            if self._pending > 0:
+                self._cb(self._pending)
+                self.reported += self._pending
+                self._pending = 0
+            return b""
+        if size < 0 or size > self._remaining:
+            size = self._remaining
+        chunk = self._f.read(size)
         if chunk:
+            self._remaining -= len(chunk)
             self._pending += len(chunk)
             if self._pending >= self._REPORT_SIZE:
                 self._cb(self._pending)
                 self.reported += self._pending
                 self._pending = 0
-        elif self._pending > 0:
-            self._cb(self._pending)
-            self.reported += self._pending
-            self._pending = 0
         return chunk
 
     def __len__(self):
-        return len(self._buf.getbuffer())
+        return self._size
+
+    def close(self):
+        if self._f and not self._f.closed:
+            self._f.close()
 
 
 class RateLimitError(RuntimeError):
@@ -114,6 +125,8 @@ def _parse_json_response(response):
         raise RuntimeError(
             f"JSON 解析失败 (HTTP {response.status_code}): {response.text[:200]}"
         ) from exc
+    finally:
+        response.close()
 
 
 def _calculate_file_md5(
@@ -1149,12 +1162,14 @@ class Pan123:
         active_workers = [0]
         allowed_workers = [1]
         failed = [False]
-        uploaded = [done_bytes]
         transient_failure_count = [0]
         progress_lock = threading.Lock()
-        last_progress_time = [0.0]
         worker_feedback = threading.Event()
         probe_thread_name = [None]
+
+        aggregator = _ProgressAggregator(fsize, speed_tracker, signals, PROGRESS_INTERVAL)
+        aggregator.set_initial(done_bytes)
+        aggregator.start()
 
         # 续传时立即发送已有进度
         if done_bytes > 0 and signals and fsize:
@@ -1171,6 +1186,29 @@ class Pan123:
                 return True
             return False
 
+        def _fetch_presigned_url(part):
+            pn = part["part_number"]
+            url_data = {
+                "bucket": bucket, "key": upload_key,
+                "partNumberEnd": pn + 1, "partNumberStart": pn,
+                "uploadId": upload_id, "StorageNode": storage_node,
+            }
+            url_res = self._api_request(
+                self.session.post,
+                "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch",
+                headers=headers, data=json.dumps(url_data), timeout=30,
+            )
+            url_json = _parse_json_response(url_res)
+            if url_json.get("code", -1) != 0:
+                raise requests.RequestException(
+                    "获取上传链接失败: " + json.dumps(url_json, ensure_ascii=False)
+                )
+            presigned_urls = url_json.get("data", {}).get("presignedUrls", {})
+            url = presigned_urls.get(str(pn), "")
+            if not url:
+                raise requests.RequestException(f"分块 {pn} 无 presigned URL")
+            return url
+
         def _upload_worker():
             wid = uuid.uuid4().hex[:4]
             max_retries = _safe_int(
@@ -1182,6 +1220,10 @@ class Pan123:
                 if signals and hasattr(signals, "conn_info"):
                     signals.conn_info.emit(active_workers[0], max_workers)
             logger.debug("[T-%s W-%s] 启动: active=%s", tid, wid, active_workers[0])
+
+            prefetched_part = None
+            prefetched_result = [None, None]  # [url, exception]
+            prefetch_thread = None
 
             try:
                 while not failed[0]:
@@ -1198,11 +1240,23 @@ class Pan123:
                                 allowed_workers[0],
                             )
                             return
-                    try:
-                        part = part_queue.get_nowait()
-                    except queue.Empty:
-                        logger.debug("[T-%s W-%s] 队列为空，退出", tid, wid)
-                        return
+
+                    # 1. 获取当前 part 和 URL
+                    if prefetched_part is not None:
+                        part = prefetched_part
+                        if prefetch_thread is not None:
+                            prefetch_thread.join(timeout=10)
+                            prefetch_thread = None
+                        url = prefetched_result[0]
+                        prefetched_part = None
+                        prefetched_result = [None, None]
+                    else:
+                        try:
+                            part = part_queue.get_nowait()
+                        except queue.Empty:
+                            logger.debug("[T-%s W-%s] 队列为空，退出", tid, wid)
+                            return
+                        url = None
 
                     pn = part["part_number"]
                     offset = part["offset"]
@@ -1213,6 +1267,27 @@ class Pan123:
                         tid, wid, pn, part_queue.qsize(),
                     )
 
+                    # 2. 启动下一个 part 的 URL 预取
+                    try:
+                        next_part = part_queue.get_nowait()
+                    except queue.Empty:
+                        next_part = None
+
+                    if next_part is not None:
+                        prefetched_part = next_part
+
+                        def _prefetch(target_part):
+                            try:
+                                prefetched_result[0] = _fetch_presigned_url(target_part)
+                            except Exception as exc:
+                                prefetched_result[1] = exc
+
+                        prefetch_thread = threading.Thread(
+                            target=_prefetch, args=(next_part,), daemon=True,
+                        )
+                        prefetch_thread.start()
+
+                    # 3. 上传当前分块
                     attempt = 0
                     while True:
                         progress_io = None
@@ -1220,37 +1295,8 @@ class Pan123:
                             logger.debug("[T-%s W-%s] 分块 %s 上传中停止", tid, wid, pn)
                             return
                         try:
-                            # 逐块获取 presigned URL（避免批量获取导致 URL 过期）
-                            url_data = {
-                                "bucket": bucket,
-                                "key": upload_key,
-                                "partNumberEnd": pn + 1,
-                                "partNumberStart": pn,
-                                "uploadId": upload_id,
-                                "StorageNode": storage_node,
-                            }
-                            url_res = self._api_request(
-                                self.session.post,
-                                "https://www.123pan.com/b/api/file/s3_repare_upload_parts_batch",
-                                headers=headers,
-                                data=json.dumps(url_data),
-                                timeout=30,
-                            )
-                            url_json = _parse_json_response(url_res)
-                            if url_json.get("code", -1) != 0:
-                                raise requests.RequestException(
-                                    "获取上传链接失败: "
-                                    + json.dumps(url_json, ensure_ascii=False)
-                                )
-                            presigned_urls = url_json.get("data", {}).get("presignedUrls", {})
-                            url = presigned_urls.get(str(pn), "")
-                            if not url:
-                                raise requests.RequestException(f"分块 {pn} 无 presigned URL")
-
-                            with open(file_path, "rb") as f:
-                                f.seek(offset)
-                                block = f.read(size)
-
+                            if url is None:
+                                url = _fetch_presigned_url(part)
                             def _on_chunk(n):
                                 nonlocal probe_promoted
                                 if not probe_promoted:
@@ -1262,23 +1308,13 @@ class Pan123:
                                     probe_promoted = True
                                     logger.debug("[T-%s W-%s] probe 转正, allowed=%s", tid, wid, allowed_workers[0])
                                     worker_feedback.set()
-                                with progress_lock:
-                                    uploaded[0] += n
-                                    if speed_tracker:
-                                        speed_tracker.record(uploaded[0])
-                                    if signals and fsize:
-                                        now = time.time()
-                                        if now - last_progress_time[0] > PROGRESS_INTERVAL:
-                                            signals.progress.emit(
-                                                int(uploaded[0] * 100 / fsize)
-                                            )
-                                            last_progress_time[0] = now
+                                aggregator.record(n)
 
-                            progress_io = _ProgressIO(block, _on_chunk)
+                            progress_io = _ProgressFileIO(file_path, offset, size, _on_chunk)
                             resp = requests.put(url, data=progress_io, timeout=(10, 120))
                             if resp.status_code in RATE_LIMIT_CODES:
+                                aggregator.record(-progress_io.reported)
                                 with progress_lock:
-                                    uploaded[0] -= progress_io.reported
                                     transient_failure_count[0] += 1
                                     if transient_failure_count[0] > MAX_RATE_LIMITS:
                                         failed[0] = True
@@ -1290,7 +1326,15 @@ class Pan123:
                                         new_limit = max(1, active_workers[0] - 1)
                                         if new_limit < allowed_workers[0]:
                                             allowed_workers[0] = new_limit
+                                # 回队当前 part + 清空预取
                                 part_queue.put(part)
+                                if prefetched_part is not None:
+                                    part_queue.put(prefetched_part)
+                                    prefetched_part = None
+                                    prefetched_result = [None, None]
+                                    if prefetch_thread is not None:
+                                        prefetch_thread.join(timeout=5)
+                                        prefetch_thread = None
                                 worker_feedback.set()
                                 logger.debug(
                                     "[T-%s W-%s] 分块 %s 命中 %s，回队，allowed=%s",
@@ -1311,8 +1355,7 @@ class Pan123:
                             break
                         except Exception as exc:
                             if progress_io is not None and progress_io.reported > 0:
-                                with progress_lock:
-                                    uploaded[0] -= progress_io.reported
+                                aggregator.record(-progress_io.reported)
                             is_conn_err = isinstance(exc, (requests.ConnectionError, requests.Timeout))
                             is_rate_limit_err = isinstance(exc, RateLimitError)
                             if is_rate_limit_err:
@@ -1329,6 +1372,13 @@ class Pan123:
                                         if new_limit < allowed_workers[0]:
                                             allowed_workers[0] = new_limit
                                 part_queue.put(part)
+                                if prefetched_part is not None:
+                                    part_queue.put(prefetched_part)
+                                    prefetched_part = None
+                                    prefetched_result = [None, None]
+                                    if prefetch_thread is not None:
+                                        prefetch_thread.join(timeout=5)
+                                        prefetch_thread = None
                                 worker_feedback.set()
                                 logger.warning(
                                     "[T-%s W-%s] 分块 %s 获取上传链接触发限流，回队重试: %s",
@@ -1353,6 +1403,13 @@ class Pan123:
                                             tid, wid, allowed_workers[0],
                                         )
                                     part_queue.put(part)
+                                    if prefetched_part is not None:
+                                        part_queue.put(prefetched_part)
+                                        prefetched_part = None
+                                        prefetched_result = [None, None]
+                                        if prefetch_thread is not None:
+                                            prefetch_thread.join(timeout=5)
+                                            prefetch_thread = None
                                     worker_feedback.set()
                                     logger.warning(
                                         "[T-%s W-%s] 分块 %s 重试 %s 次仍失败，回队: %s",
@@ -1371,6 +1428,9 @@ class Pan123:
                                 "[T-%s W-%s] 分块 %s 第 %s 次重试: %s", tid, wid, pn, attempt, exc
                             )
                             time.sleep(attempt)
+                        finally:
+                            if progress_io is not None:
+                                progress_io.close()
             finally:
                 with progress_lock:
                     if threading.current_thread().name == probe_thread_name[0]:
@@ -1402,18 +1462,18 @@ class Pan123:
             thread_prefix="upload_worker",
         )
 
+        aggregator.stop()
+        aggregator.emit_final()
+        if signals and hasattr(signals, "conn_info"):
+            signals.conn_info.emit(0, max_workers)
+
         logger.debug(
             "[T-%s] 分块上传结束: uploaded=%s/%s, failed=%s",
             tid,
-            uploaded[0],
+            aggregator.cumulative,
             fsize,
             failed[0],
         )
-
-        if signals and fsize:
-            signals.progress.emit(int(uploaded[0] * 100 / fsize))
-        if signals and hasattr(signals, "conn_info"):
-            signals.conn_info.emit(0, max_workers)
 
         if task and getattr(task, "is_cancelled", False):
             return "已取消"

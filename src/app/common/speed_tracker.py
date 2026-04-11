@@ -5,32 +5,22 @@ from collections import deque
 class SpeedTracker:
     """滑动窗口速度计算器。
 
-    worker 线程调 record()（deque.append，原子操作，无锁）。
-    UI 线程调 flush() 消费队列，再读 speed()/eta()。
+    Aggregator 线程调 record()（deque.append，原子操作，无锁）。
+    UI 线程调 flush() 裁剪窗口并计算速度，再读 speed()/eta()。
     """
 
     WINDOW_SECONDS = 60.0
 
     def __init__(self):
-        # worker 线程写入，UI 线程 flush 消费
-        self._pending: deque[tuple[float, int]] = deque(maxlen=50000)
-        # flush 后的滑动窗口（仅 UI 线程访问）
         self._samples: deque[tuple[float, int]] = deque()
         self._last_speed = 0.0
 
     def record(self, cumulative_bytes: int) -> None:
-        """worker 线程调用，零开销。"""
-        self._pending.append((time.monotonic(), cumulative_bytes))
+        """Aggregator 线程调用，直接写入滑动窗口。"""
+        self._samples.append((time.monotonic(), cumulative_bytes))
 
     def flush(self) -> None:
-        """UI 线程调用，将 pending 数据消费到滑动窗口并计算速度。"""
-        while self._pending:
-            try:
-                sample = self._pending.popleft()
-            except IndexError:
-                break
-            self._samples.append(sample)
-
+        """UI 线程调用，裁剪窗口并计算速度。"""
         now = time.monotonic()
         cutoff = now - self.WINDOW_SECONDS
         while self._samples and self._samples[0][0] < cutoff:
@@ -56,6 +46,5 @@ class SpeedTracker:
         return remaining_bytes / self._last_speed
 
     def reset(self) -> None:
-        self._pending.clear()
         self._samples.clear()
         self._last_speed = 0.0

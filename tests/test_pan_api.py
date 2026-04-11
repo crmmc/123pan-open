@@ -11,7 +11,7 @@ import requests
 
 from src.app.common import database as database_module
 from src.app.common.database import Database
-from src.app.common.api import Pan123, RateLimitError, UPLOAD_PART_SIZE, _RWLock
+from src.app.common.api import Pan123, RateLimitError, UPLOAD_PART_SIZE, _RWLock, _ProgressFileIO
 from src.app.view.transfer_interface import UploadThread
 
 
@@ -941,3 +941,103 @@ class TestQrPoll:
         ):
             with pytest.raises(requests.exceptions.RequestException):
                 pan.qr_poll("uni-abc-123")
+
+
+# ── _ProgressFileIO 单元测试 ──
+
+
+class TestProgressFileIO:
+    """_ProgressFileIO：按需从文件读取并上报进度。"""
+
+    def test_read_all_at_once(self, tmp_path):
+        """read(-1) 一次性读取全部内容。"""
+        data = b"Hello, World! " * 100  # ~1.4 KB
+        f = tmp_path / "test.bin"
+        f.write_bytes(data)
+
+        reported = []
+        pio = _ProgressFileIO(str(f), 0, len(data), reported.append)
+        assert len(pio) == len(data)
+
+        result = pio.read(-1)
+        assert result == data
+        # requests 会再调一次 read()，触发剩余 pending 刷新
+        assert pio.read(-1) == b""
+        assert pio.reported == len(data)
+        assert reported == [len(data)]
+        pio.close()
+
+    def test_chunked_read_with_threshold(self, tmp_path):
+        """分段读取，进度按 _REPORT_SIZE 阈值触发。"""
+        data = b"X" * (512 * 1024)  # 512 KB
+        f = tmp_path / "test.bin"
+        f.write_bytes(data)
+
+        reported = []
+        pio = _ProgressFileIO(str(f), 0, len(data), reported.append)
+        chunk_size = 64 * 1024
+        total_read = 0
+        while True:
+            chunk = pio.read(chunk_size)
+            if not chunk:
+                break
+            total_read += len(chunk)
+
+        assert total_read == len(data)
+        assert pio.reported == len(data)
+        assert sum(reported) == len(data)
+        pio.close()
+
+    def test_read_with_offset(self, tmp_path):
+        """从文件中间偏移处开始读取。"""
+        data = b"0123456789ABCDEF"
+        f = tmp_path / "test.bin"
+        f.write_bytes(data)
+
+        pio = _ProgressFileIO(str(f), 5, 6, lambda n: None)  # offset=5, size=6
+        result = pio.read(-1)
+        assert result == b"56789A"
+        pio.read(-1)  # 触发 pending 刷新
+        assert pio.reported == 6
+        pio.close()
+
+    def test_read_returns_empty_after_exhausted(self, tmp_path):
+        """读取完毕后再 read 返回空串。"""
+        f = tmp_path / "test.bin"
+        f.write_bytes(b"short")
+
+        pio = _ProgressFileIO(str(f), 0, 5, lambda n: None)
+        pio.read(-1)
+        assert pio.read(-1) == b""
+        assert pio.read(100) == b""
+        pio.close()
+
+    def test_read_truncates_oversized_request(self, tmp_path):
+        """read(size) 超出剩余时自动截断到 _remaining。"""
+        f = tmp_path / "test.bin"
+        f.write_bytes(b"0123456789")
+
+        pio = _ProgressFileIO(str(f), 0, 5, lambda n: None)
+        result = pio.read(999)
+        assert result == b"01234"
+        pio.read(-1)  # 触发 pending 刷新
+        assert pio.reported == 5
+        pio.close()
+
+    def test_close_idempotent(self, tmp_path):
+        """多次 close 不报错。"""
+        f = tmp_path / "test.bin"
+        f.write_bytes(b"data")
+
+        pio = _ProgressFileIO(str(f), 0, 4, lambda n: None)
+        pio.close()
+        pio.close()  # 不应抛异常
+
+    def test_len_returns_size(self, tmp_path):
+        """__len__ 返回构造时的 size 而非文件大小。"""
+        f = tmp_path / "test.bin"
+        f.write_bytes(b"0123456789")
+
+        pio = _ProgressFileIO(str(f), 0, 3, lambda n: None)
+        assert len(pio) == 3
+        pio.close()

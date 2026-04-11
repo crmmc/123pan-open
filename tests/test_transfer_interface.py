@@ -3,7 +3,7 @@ from unittest.mock import MagicMock
 
 from src.app.common import database as database_module
 from src.app.common.database import Database
-from src.app.view.transfer_interface import DownloadTask, TransferInterface
+from src.app.view.transfer_interface import DownloadTask, TransferInterface, UploadTask
 
 
 class _FakeSignal:
@@ -84,6 +84,8 @@ def test_task_finished_deletes_download_record(tmp_path, monkeypatch):
         "save_path": task.save_path,
     })
 
+    # 模拟真实信号流：__update_task_status("已完成") 先于 __task_finished
+    task.status = "已完成"
     interface._TransferInterface__task_finished(task, "download")
 
     assert task.status == "已完成"
@@ -353,9 +355,13 @@ def test_download_task_error_keeps_thread_until_terminal_cleanup(tmp_path, monke
     class _FakeThread:
         def __init__(self):
             self.disconnected = False
+            self.delete_later_called = False
 
         def disconnect(self):
             self.disconnected = True
+
+        def deleteLater(self):
+            self.delete_later_called = True
 
     thread = _FakeThread()
     task.thread = thread
@@ -370,6 +376,7 @@ def test_download_task_error_keeps_thread_until_terminal_cleanup(tmp_path, monke
     interface._TransferInterface__update_task_status(task, "失败")
 
     assert thread.disconnected is True
+    assert thread.delete_later_called is True
     assert interface.download_threads == []
     stored = db.get_download_task(task.resume_id)
     assert stored is not None
@@ -480,3 +487,37 @@ def test_configure_upload_actions_disables_primary_button_without_receivers_call
     assert primary.text == ""
     assert primary.enabled is False
     assert primary.clicked.disconnected
+
+
+def test_upload_task_terminal_cleanup_calls_deleteLater(tmp_path, monkeypatch):
+    """上传任务终态时 disconnect + deleteLater + 从 upload_threads 移除。"""
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+
+    class _FakeThread:
+        def __init__(self):
+            self.disconnected = False
+            self.delete_later_called = False
+
+        def disconnect(self):
+            self.disconnected = True
+
+        def deleteLater(self):
+            self.delete_later_called = True
+
+    thread = _FakeThread()
+    task.thread = thread
+    interface.upload_threads.append(thread)
+    monkeypatch.setattr("src.app.view.transfer_interface.InfoBar.error", lambda **_kwargs: None)
+
+    interface._TransferInterface__update_task_status(task, "已完成")
+
+    assert thread.disconnected is True
+    assert thread.delete_later_called is True
+    assert task.thread is None
+    assert interface.upload_threads == []
