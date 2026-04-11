@@ -1,5 +1,7 @@
+import hashlib
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -7,8 +9,11 @@ from src.app.common import database as database_module
 from src.app.common import download_resume
 from src.app.common.database import Database
 from src.app.common.download_resume import (
+    _download_part,
+    _validate_existing_parts,
     build_resume_id,
     get_part_path,
+    get_temp_dir,
     stream_download_from_url,
 )
 
@@ -407,3 +412,277 @@ def test_stream_download_pause_then_resume_from_last_completed_part(tmp_path, mo
     assert requested_ranges.count(f"bytes=0-{PART_SIZE - 1}") == 1
     assert requested_ranges.count(pause_range) == 2
     assert db.get_download_task(task.resume_id) is not None
+
+
+# ---- _validate_existing_parts 孤立清理测试 ----
+
+
+def test_validate_existing_parts_cleans_orphan_merged_file(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-merged-cleanup"
+    temp_dir = get_temp_dir(resume_id)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    content = b"a" * 1024
+    part0_path = get_part_path(resume_id, 0)
+    part0_path.write_bytes(content)
+    merged_path = temp_dir / "merged"
+    merged_path.write_bytes(b"old-merged-data")
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+    db.record_download_part(resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": 1023,
+        "expected_size": 1024,
+        "actual_size": 1024,
+        "md5": hashlib.md5(content).hexdigest(),
+    })
+
+    part_plan = [{"index": 0, "start": 0, "end": 1023, "expected_size": 1024}]
+    _validate_existing_parts(resume_id, part_plan)
+
+    assert part0_path.exists()
+    assert not merged_path.exists()
+
+
+def test_validate_existing_parts_cleans_orphan_part_files(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-orphan-parts"
+    temp_dir = get_temp_dir(resume_id)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    content = b"a" * 1024
+    part0_path = get_part_path(resume_id, 0)
+    part0_path.write_bytes(content)
+    # part1 和 part2 不在 reusable_indexes 中，应被清理
+    part1_path = get_part_path(resume_id, 1)
+    part1_path.write_bytes(b"orphan1")
+    part2_path = get_part_path(resume_id, 2)
+    part2_path.write_bytes(b"orphan2")
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+    db.record_download_part(resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": 1023,
+        "expected_size": 1024,
+        "actual_size": 1024,
+        "md5": hashlib.md5(content).hexdigest(),
+    })
+
+    part_plan = [{"index": 0, "start": 0, "end": 1023, "expected_size": 1024}]
+    _validate_existing_parts(resume_id, part_plan)
+
+    assert part0_path.exists()
+    assert not part1_path.exists()
+    assert not part2_path.exists()
+
+
+def test_validate_existing_parts_skips_non_part_files(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-non-part"
+    temp_dir = get_temp_dir(resume_id)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    content = b"a" * 1024
+    part0_path = get_part_path(resume_id, 0)
+    part0_path.write_bytes(content)
+    random_file = temp_dir / "random.txt"
+    random_file.write_text("keep me")
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+    db.record_download_part(resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": 1023,
+        "expected_size": 1024,
+        "actual_size": 1024,
+        "md5": hashlib.md5(content).hexdigest(),
+    })
+
+    part_plan = [{"index": 0, "start": 0, "end": 1023, "expected_size": 1024}]
+    _validate_existing_parts(resume_id, part_plan)
+
+    assert part0_path.exists()
+    assert random_file.exists()
+
+
+def test_validate_existing_parts_handles_malformed_part_names(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-malformed"
+    temp_dir = get_temp_dir(resume_id)
+    temp_dir.mkdir(parents=True, exist_ok=True)
+
+    content = b"a" * 1024
+    part0_path = get_part_path(resume_id, 0)
+    part0_path.write_bytes(content)
+    malformed = temp_dir / "part_abc"
+    malformed.write_bytes(b"bad-name")
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+    db.record_download_part(resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": 1023,
+        "expected_size": 1024,
+        "actual_size": 1024,
+        "md5": hashlib.md5(content).hexdigest(),
+    })
+
+    part_plan = [{"index": 0, "start": 0, "end": 1023, "expected_size": 1024}]
+    # 不应抛异常
+    _validate_existing_parts(resume_id, part_plan)
+
+    assert part0_path.exists()
+    # malformed 文件名不以 "part" 开头后跟数字，被忽略
+    assert malformed.exists()
+
+
+# ---- _download_part 内存缓存暂停回滚测试 ----
+
+
+def test_download_part_memory_buffer_no_partial_file_on_pause(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-mem-pause"
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+
+    part_size = 2048
+    content = b"x" * part_size
+    part_path = get_part_path(resume_id, 0)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+
+    part = {"index": 0, "start": 0, "end": part_size - 1, "expected_size": part_size}
+    aggregator = MagicMock()
+    aggregator.record = MagicMock()
+
+    task = SimpleNamespace(is_cancelled=False, pause_requested=False)
+
+    small_chunk = 512
+    chunks_yielded = 0
+
+    class _PauseMidChunkResponse:
+        status_code = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size=8192):
+            nonlocal chunks_yielded, task
+            # 忽略调用方传入的 chunk_size，使用小块以产生多次迭代
+            for offset in range(0, len(content), small_chunk):
+                if chunks_yielded >= 2:
+                    task.pause_requested = True
+                yield content[offset:offset + small_chunk]
+                chunks_yielded += 1
+
+    def fake_get(url, **kwargs):
+        return _PauseMidChunkResponse()
+
+    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    monkeypatch.setattr(download_resume.time, "sleep", lambda *_a, **_kw: None)
+
+    result = _download_part(
+        "https://example.test/file",
+        part, resume_id, aggregator, None, part_size, task,
+    )
+
+    assert result == "paused"
+    # 磁盘无 part 文件（内存缓存，pause 时不写磁盘）
+    assert not part_path.exists()
+    # aggregator 进度被回滚（record 调用中有负值）
+    records = [call.args[0] for call in aggregator.record.call_args_list]
+    assert any(r < 0 for r in records), f"Expected negative record, got: {records}"
+    # DB 无该 part 记录
+    assert db.get_download_parts(resume_id) == []
+
+
+def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "test-write-after-validate"
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+
+    part_size = 1024
+    content = b"y" * part_size
+    part_path = get_part_path(resume_id, 0)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+
+    part = {"index": 0, "start": 0, "end": part_size - 1, "expected_size": part_size}
+    aggregator = MagicMock()
+    task = SimpleNamespace(is_cancelled=False, pause_requested=False)
+
+    class _OkResponse:
+        status_code = 200
+        def __enter__(self):
+            return self
+        def __exit__(self, *args):
+            return False
+        def raise_for_status(self):
+            pass
+        def iter_content(self, chunk_size=8192):
+            for offset in range(0, len(content), chunk_size):
+                yield content[offset:offset + chunk_size]
+
+    def fake_get(url, **kwargs):
+        return _OkResponse()
+
+    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+
+    # part 文件在调用前不存在
+    assert not part_path.exists()
+
+    result = _download_part(
+        "https://example.test/file",
+        part, resume_id, aggregator, None, part_size, task,
+    )
+
+    assert result == "ok"
+    # size 校验通过后才写入磁盘
+    assert part_path.exists()
+    assert part_path.read_bytes() == content
+    # DB 有记录
+    parts = db.get_download_parts(resume_id)
+    assert len(parts) == 1
+    assert parts[0]["part_index"] == 0
