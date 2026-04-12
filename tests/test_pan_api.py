@@ -11,7 +11,10 @@ import requests
 
 from src.app.common import database as database_module
 from src.app.common.database import Database
-from src.app.common.api import Pan123, RateLimitError, UPLOAD_PART_SIZE, _RWLock, _ProgressFileIO
+from src.app.common.api import (
+    Pan123, RateLimitError, UPLOAD_PART_SIZE, _RWLock, _ProgressFileIO,
+    _calculate_file_md5, _parse_json_response, _reset_transient_failure_count, format_file_size,
+)
 from src.app.view.transfer_interface import UploadThread
 
 
@@ -1041,3 +1044,146 @@ class TestProgressFileIO:
         pio = _ProgressFileIO(str(f), 0, 3, lambda n: None)
         assert len(pio) == 3
         pio.close()
+
+
+# ── _parse_json_response 单元测试 ──
+
+
+class TestParseJsonResponse:
+    def test_parse_json_returns_dict(self):
+        resp = MagicMock()
+        resp.json.return_value = {"code": 0, "message": "ok"}
+        resp.status_code = 200
+
+        result = _parse_json_response(resp)
+        assert result == {"code": 0, "message": "ok"}
+
+    def test_parse_json_raises_on_invalid(self):
+        resp = MagicMock()
+        resp.json.side_effect = ValueError("bad json")
+        resp.status_code = 200
+        resp.text = "not json"
+
+        with pytest.raises(RuntimeError, match="JSON 解析失败"):
+            _parse_json_response(resp)
+
+    def test_parse_json_closes_response(self):
+        resp = MagicMock()
+        resp.json.return_value = {"code": 0}
+
+        _parse_json_response(resp)
+        resp.close.assert_called()
+
+
+# ── format_file_size 单元测试 ──
+
+
+class TestFormatFileSize:
+    def test_format_file_size_bytes(self):
+        assert format_file_size(500) == "500 B"
+
+    def test_format_file_size_kb(self):
+        assert format_file_size(2048) == "2.0 KB"
+
+    def test_format_file_size_mb(self):
+        assert format_file_size(2 * 1024 * 1024) == "2.0 MB"
+
+    def test_format_file_size_gb(self):
+        assert format_file_size(2 * 1024 ** 3) == "2.0 GB"
+
+    def test_format_file_size_zero(self):
+        assert format_file_size(0) == "0 B"
+
+
+# ── _calculate_file_md5 单元测试 ──
+
+
+class TestCalculateFileMd5:
+    def test_calculate_md5_correct_hash(self, tmp_path):
+        f = tmp_path / "test.bin"
+        content = b"hello world"
+        f.write_bytes(content)
+        expected = hashlib.md5(content).hexdigest()
+
+        err, md5_hex = _calculate_file_md5(str(f), len(content))
+        assert err is None
+        assert md5_hex == expected
+
+    def test_calculate_md5_cancelled(self, tmp_path):
+        f = tmp_path / "test.bin"
+        f.write_bytes(b"data")
+        task = MagicMock()
+        task.is_cancelled = True
+
+        err, md5_hex = _calculate_file_md5(str(f), 4, task=task)
+        assert err == "已取消"
+        assert md5_hex == ""
+
+    def test_calculate_md5_emits_progress(self, tmp_path):
+        f = tmp_path / "test.bin"
+        content = b"x" * (2 * 1024 * 1024)
+        f.write_bytes(content)
+        signals = MagicMock()
+
+        _calculate_file_md5(str(f), len(content), signals=signals)
+        signals.progress.emit.assert_called()
+
+
+# ── _RWLock 单元测试 ──
+
+
+class TestRWLock:
+    def test_rwlock_multiple_reads_allowed(self):
+        lock = _RWLock()
+        results = []
+        barrier = threading.Barrier(2, timeout=5)
+
+        def reader(idx):
+            with lock.rlock():
+                barrier.wait()  # 两个读线程同时持有读锁
+                results.append(idx)
+
+        t1 = threading.Thread(target=reader, args=(1,))
+        t2 = threading.Thread(target=reader, args=(2,))
+        t1.start()
+        t2.start()
+        t1.join(timeout=5)
+        t2.join(timeout=5)
+        assert sorted(results) == [1, 2]
+
+    def test_rwlock_write_exclusive(self):
+        lock = _RWLock()
+        write_held = threading.Event()
+        write_blocked = threading.Event()
+
+        def writer():
+            with lock.wlock():
+                write_held.set()
+                write_blocked.wait(timeout=5)
+
+        t = threading.Thread(target=writer)
+        t.start()
+        write_held.wait(timeout=5)
+        # 写锁持有期间，再次获取写锁应阻塞
+        acquired = threading.Event()
+
+        def try_write():
+            with lock.wlock():
+                acquired.set()
+
+        t2 = threading.Thread(target=try_write)
+        t2.start()
+        assert not acquired.is_set()
+        write_blocked.set()
+        t.join(timeout=5)
+        t2.join(timeout=5)
+        assert acquired.is_set()
+
+
+# ── _reset_transient_failure_count 单元测试 ──
+
+
+def test_reset_transient_failure_count_sets_zero():
+    counter = [5]
+    _reset_transient_failure_count(counter)
+    assert counter[0] == 0

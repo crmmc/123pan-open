@@ -9,9 +9,17 @@ from src.app.common import database as database_module
 from src.app.common import download_resume
 from src.app.common.database import Database
 from src.app.common.download_resume import (
+    _build_parts,
     _download_part,
+    _get_stop_result,
+    _is_task_cancelled,
+    _is_task_paused,
+    _notify_conn_info,
+    _notify_progress,
+    _replace_output_file,
     _validate_existing_parts,
     build_resume_id,
+    cleanup_temp_dir,
     get_part_path,
     get_temp_dir,
     stream_download_from_url,
@@ -686,3 +694,126 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
     parts = db.get_download_parts(resume_id)
     assert len(parts) == 1
     assert parts[0]["part_index"] == 0
+
+
+# ---- 3a. _build_parts ----
+
+
+def test_build_parts_returns_empty_for_zero_total():
+    assert _build_parts(0) == []
+
+
+def test_build_parts_single_part_when_small():
+    parts = _build_parts(100, part_size=200)
+    assert len(parts) == 1
+    assert parts[0] == {"index": 0, "start": 0, "end": 99, "expected_size": 100}
+
+
+def test_build_parts_exact_multiple():
+    parts = _build_parts(100, part_size=50)
+    assert len(parts) == 2
+    assert parts[0] == {"index": 0, "start": 0, "end": 49, "expected_size": 50}
+    assert parts[1] == {"index": 1, "start": 50, "end": 99, "expected_size": 50}
+
+
+def test_build_parts_with_remainder():
+    parts = _build_parts(110, part_size=50)
+    assert len(parts) == 3
+    assert parts[2] == {"index": 2, "start": 100, "end": 109, "expected_size": 10}
+
+
+def test_build_parts_default_part_size(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("downloadPartSizeMB", 5)
+    parts = _build_parts(10 * 1024 * 1024)
+    assert len(parts) == 2
+
+
+# ---- 3b. 状态判断 ----
+
+
+def test_is_task_cancelled_none_returns_false():
+    assert _is_task_cancelled(None) is False
+
+
+def test_is_task_cancelled_true():
+    assert _is_task_cancelled(SimpleNamespace(is_cancelled=True)) is True
+
+
+def test_is_task_paused_true():
+    assert _is_task_paused(SimpleNamespace(pause_requested=True)) is True
+
+
+def test_get_stop_result_cancelled_priority():
+    task = SimpleNamespace(is_cancelled=True, pause_requested=True)
+    assert _get_stop_result(task) == "cancelled"
+
+
+# ---- 3c. _replace_output_file ----
+
+
+def test_replace_output_file_same_device(tmp_path):
+    src = tmp_path / "src.bin"
+    dst = tmp_path / "dst.bin"
+    src.write_bytes(b"hello")
+    _replace_output_file(src, dst)
+    assert dst.read_bytes() == b"hello"
+    assert not src.exists()
+
+
+def test_replace_output_file_cross_device(tmp_path, monkeypatch):
+    src = tmp_path / "src.bin"
+    dst = tmp_path / "dst.bin"
+    src.write_bytes(b"cross")
+
+    import errno as errno_mod
+    real_replace = Path.replace
+
+    def fake_replace(self, target):
+        if self == src:
+            exc = OSError(errno_mod.EXDEV, "cross-device")
+            raise exc
+        return real_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fake_replace)
+    _replace_output_file(src, dst)
+    assert dst.read_bytes() == b"cross"
+
+
+# ---- 3d. signal helpers ----
+
+
+def test_notify_progress_emits_when_total_nonzero():
+    signals = MagicMock()
+    _notify_progress(signals, 100, 50)
+    signals.progress.emit.assert_called_once_with(50)
+
+
+def test_notify_progress_skips_when_total_zero():
+    signals = MagicMock()
+    _notify_progress(signals, 0, 50)
+    signals.progress.emit.assert_not_called()
+
+
+def test_notify_conn_info_skips_when_no_attr():
+    signals = MagicMock(spec=[])
+    _notify_conn_info(signals, 1, 4)
+    # 无 conn_info 属性，不报错即可
+
+
+# ---- 3e. cleanup_temp_dir ----
+
+
+def test_cleanup_temp_dir_removes_existing(tmp_path, monkeypatch):
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+    resume_id = "cleanup-test"
+    temp = get_temp_dir(resume_id)
+    temp.mkdir(parents=True)
+    (temp / "part0").write_bytes(b"data")
+    cleanup_temp_dir(resume_id)
+    assert not temp.exists()
+
+
+def test_cleanup_temp_dir_silently_handles_missing(tmp_path, monkeypatch):
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+    cleanup_temp_dir("nonexistent-id")  # 不报错即可

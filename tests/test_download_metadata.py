@@ -4,6 +4,11 @@ from src.app.common.download_metadata import (
     DOWNLOAD_METADATA_VERSION,
     LEGACY_RESUME_TASK_ERROR,
     DownloadMetadataError,
+    _candidate_directory_ids,
+    _ensure_required_fields,
+    _match_file_detail,
+    _restore_pan_state,
+    _snapshot_pan_state,
     is_resume_metadata_compatible,
     resolve_download_file_detail,
 )
@@ -84,3 +89,93 @@ def test_resume_metadata_requires_current_version():
     )
     assert not is_resume_metadata_compatible({})
     assert LEGACY_RESUME_TASK_ERROR
+
+
+# ---- 2a. _ensure_required_fields ----
+
+
+def test_ensure_required_fields_passes_complete_detail():
+    _ensure_required_fields({
+        "FileId": 1, "FileName": "a.txt", "Type": 0,
+        "Size": 100, "Etag": "e", "S3KeyFlag": True,
+    })
+
+
+def test_ensure_required_fields_raises_on_missing_base():
+    with pytest.raises(DownloadMetadataError, match="缺少必要字段"):
+        _ensure_required_fields({"FileName": "a.txt", "Type": 0})
+
+
+def test_ensure_required_fields_raises_on_missing_file_fields():
+    with pytest.raises(DownloadMetadataError, match="缺少必要字段"):
+        _ensure_required_fields({"FileId": 1, "FileName": "a.txt", "Type": 0})
+
+
+def test_ensure_required_fields_skips_file_fields_for_folder():
+    _ensure_required_fields({"FileId": 1, "FileName": "dir", "Type": 1})
+
+
+# ---- 2b. _match_file_detail ----
+
+
+def test_match_file_detail_returns_matching_item():
+    items = [{"FileId": 10, "FileName": "a.txt", "Type": 0, "Size": 5, "Etag": "e", "S3KeyFlag": False}]
+    result = _match_file_detail(items, 10)
+    assert result is not None
+    assert result["FileId"] == 10
+
+
+def test_match_file_detail_returns_none_for_empty_list():
+    assert _match_file_detail([], 1) is None
+
+
+def test_match_file_detail_returns_none_when_no_match():
+    items = [{"FileId": 10, "FileName": "a.txt", "Type": 0, "Size": 5, "Etag": "e", "S3KeyFlag": False}]
+    assert _match_file_detail(items, 99) is None
+
+
+def test_match_file_detail_validates_fields():
+    with pytest.raises(DownloadMetadataError, match="缺少必要字段"):
+        _match_file_detail([{"FileId": 10, "FileName": "a.txt", "Type": 0}], 10)
+
+
+# ---- 2c. _candidate_directory_ids ----
+
+
+def test_candidate_directory_ids_returns_unique():
+    pan = _FakePan()
+    pan.parent_file_id = 5
+    result = _candidate_directory_ids(pan, 3)
+    assert result == [3, 5, 0]
+
+
+def test_candidate_directory_ids_deduplicates():
+    pan = _FakePan()
+    pan.parent_file_id = 5
+    result = _candidate_directory_ids(pan, 5)
+    assert result == [5, 0]
+
+
+def test_candidate_directory_ids_skips_none_and_empty():
+    pan = _FakePan()
+    pan.parent_file_id = None
+    result = _candidate_directory_ids(pan, None)
+    assert result == [0]
+
+
+# ---- 2d. _snapshot_pan_state / _restore_pan_state ----
+
+
+def test_snapshot_restore_roundtrip():
+    pan = _FakePan()
+    state = _snapshot_pan_state(pan)
+    assert state == {"file_page": 7, "all_file": True, "total": 99}
+
+    pan.file_page = 100
+    pan.all_file = False
+    pan.total = 0
+
+    _restore_pan_state(pan, state)
+    assert pan.file_page == 7
+    assert pan.all_file is True
+    assert pan.total == 99
