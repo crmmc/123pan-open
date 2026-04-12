@@ -160,8 +160,10 @@ def test_stream_download_reuses_good_parts_and_redownloads_bad_part(tmp_path, mo
         end = int(end_text)
         return _MockResponse(body=content[start: end + 1], status_code=206)
 
-    monkeypatch.setattr(download_resume.requests, "head", fake_head)
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     result = stream_download_from_url(
         "https://example.test/download",
@@ -202,8 +204,10 @@ def test_stream_download_raises_on_final_hash_mismatch(tmp_path, monkeypatch):
         end = int(end_text)
         return _MockResponse(body=content[start: end + 1], status_code=206)
 
-    monkeypatch.setattr(download_resume.requests, "head", fake_head)
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     with pytest.raises(RuntimeError, match="整文件校验失败"):
         stream_download_from_url(
@@ -222,12 +226,10 @@ def test_stream_download_failure_keeps_existing_output_when_overwriting(tmp_path
     out_path = tmp_path / "existing.bin"
     out_path.write_bytes(b"keep-me")
 
-    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (123, False))
-    monkeypatch.setattr(
-        download_resume.requests,
-        "get",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("network boom")),
-    )
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (123, False, False))
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("network boom"))
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     with pytest.raises(RuntimeError, match="network boom"):
         stream_download_from_url(
@@ -274,8 +276,10 @@ def test_stream_download_requeues_part_after_retryable_failure(tmp_path, monkeyp
         end = int(end_text)
         return _MockResponse(body=content[start: end + 1], status_code=206)
 
-    monkeypatch.setattr(download_resume.requests, "head", fake_head)
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     result = stream_download_from_url(
         "https://example.test/download",
@@ -325,8 +329,10 @@ def test_stream_download_requeues_rate_limited_part(tmp_path, monkeypatch):
         end = int(end_text)
         return _MockResponse(body=content[start: end + 1], status_code=206)
 
-    monkeypatch.setattr(download_resume.requests, "head", fake_head)
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     result = stream_download_from_url(
         "https://example.test/download",
@@ -390,8 +396,10 @@ def test_stream_download_pause_then_resume_from_last_completed_part(tmp_path, mo
             return _PauseResponse(body=body, status_code=206)
         return _MockResponse(body=body, status_code=206)
 
-    monkeypatch.setattr(download_resume.requests, "head", fake_head)
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     paused_result = stream_download_from_url(
         "https://example.test/download",
@@ -621,7 +629,9 @@ def test_download_part_memory_buffer_no_partial_file_on_pause(tmp_path, monkeypa
     def fake_get(url, **kwargs):
         return _PauseMidChunkResponse()
 
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
     monkeypatch.setattr(download_resume.time, "sleep", lambda *_a, **_kw: None)
 
     result = _download_part(
@@ -676,7 +686,9 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
     def fake_get(url, **kwargs):
         return _OkResponse()
 
-    monkeypatch.setattr(download_resume.requests, "get", fake_get)
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
 
     # part 文件在调用前不存在
     assert not part_path.exists()

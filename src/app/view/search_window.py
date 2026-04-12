@@ -145,6 +145,8 @@ class SearchDialog(QDialog):
         super().closeEvent(event)
 
     def __doSearch(self, text):
+        if not text.strip():
+            return
         self._search_request_id += 1
         current_request_id = self._search_request_id
         self.resultList.clear()
@@ -163,7 +165,7 @@ class SearchDialog(QDialog):
             def run(self):
                 try:
                     code, items = self.pan.get_dir_by_id(
-                        0, save=False, all=True, limit=100, search_data=self.text
+                        0, all=True, limit=100, search_data=self.text
                     )
                     self.signals.finished.emit(items if code == 0 else [], "")
                 except Exception as e:
@@ -235,8 +237,8 @@ class SearchDialog(QDialog):
                             path_list = details.get("paths", [])
                             names = [p.get("fileName", "") for p in path_list]
                             result[pid] = names
-                    except Exception:
-                        pass
+                    except Exception as e:
+                        logger.warning("获取路径失败 (fid=%s): %s", fid, e)
                 self.signals.finished.emit(result)
 
         self._path_signals = PathSignals()

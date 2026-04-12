@@ -24,7 +24,7 @@ from qfluentwidgets import (
 from qfluentwidgets import FluentIcon as FIF
 
 from ..common.api import format_file_size
-from ..common.database import Database, UPLOAD_PART_SIZE, get_upload_part_size
+from ..common.database import Database, UPLOAD_PART_SIZE, get_upload_part_size, _safe_int
 from ..common.download_metadata import (
     DOWNLOAD_METADATA_VERSION,
     LEGACY_RESUME_TASK_ERROR,
@@ -228,7 +228,13 @@ class UploadThread(QThread):
                 task=self.task,
                 speed_tracker=self.task.speed_tracker,
                 resume_info=resume_info,
+                file_name_override=self.task.file_name,
             )
+            # 统一提交所有分片记录（配合 record_upload_part(commit=False)）
+            try:
+                Database.instance().flush()
+            except Exception:
+                pass
             if result == "已取消":
                 self.status_updated.emit("已取消")
                 return
@@ -239,6 +245,7 @@ class UploadThread(QThread):
             self.status_updated.emit("已完成")
             self.finished.emit()
         except Exception as exc:
+            logger.error("上传错误: %s", exc, exc_info=True)
             self.error.emit(str(exc))
             self.status_updated.emit("失败")
 
@@ -298,11 +305,18 @@ class DownloadThread(QThread):
                     self.conn_info = self._SignalProxy(thread.conn_info_updated)
                     self.status = self._SignalProxy(thread.status_updated)
 
+            def _refresh_url():
+                new_url = self.pan.link_by_fileDetail(file_detail, showlink=False)
+                if isinstance(new_url, int):
+                    return None
+                return new_url
+
             result = _stream_download_from_url(
                 download_url, Path(self.task.save_path),
                 signals=_SignalsAdapter(self), task=self.task,
                 overwrite=True, resume_task=self.task,
                 speed_tracker=self.task.speed_tracker,
+                refresh_url_fn=_refresh_url,
             )
             if result == "已取消":
                 self.status_updated.emit("已取消")
@@ -618,13 +632,14 @@ class TransferInterface(QWidget):
         return sum(1 for t in self.upload_tasks if self.__upload_occupies_slot(t))
 
     def __active_download_count(self):
-        return sum(1 for t in self.download_tasks if t.status in DOWNLOAD_ACTIVE_STATUSES)
+        return sum(1 for t in self.download_tasks
+                   if getattr(t, "thread", None) is not None or t.status in DOWNLOAD_ACTIVE_STATUSES)
 
     def __max_concurrent_uploads(self):
-        return max(1, min(5, int(Database.instance().get_config("maxConcurrentUploads", 3))))
+        return max(1, min(5, _safe_int(Database.instance().get_config("maxConcurrentUploads", 3))))
 
     def __max_concurrent_downloads(self):
-        return max(1, min(5, int(Database.instance().get_config("maxConcurrentDownloads", 5))))
+        return max(1, min(5, _safe_int(Database.instance().get_config("maxConcurrentDownloads", 5))))
 
     def __try_start_pending_uploads(self):
         if getattr(self, '_batch_rebuild_suppressed', False):
@@ -651,6 +666,10 @@ class TransferInterface(QWidget):
     # ---- add tasks ----
 
     def add_upload_task(self, file_name, file_size, local_path, target_dir_id):
+        # 去重检查：同一文件 + 同目标目录不重复添加
+        for t in self.upload_tasks:
+            if t.local_path == local_path and t.target_dir_id == target_dir_id and t.status not in ("已完成", "已取消"):
+                return t
         task = UploadTask(file_name, file_size, local_path, target_dir_id)
         task.db_task_id = uuid.uuid4().hex
         db = Database.instance()
@@ -797,6 +816,7 @@ class TransferInterface(QWidget):
                 Database.instance().update_upload_task(
                     task.db_task_id,
                     status=status,
+                    progress=task.progress,
                     error=task.last_error,
                     delete_requested=int(task.delete_requested),
                 )
@@ -896,7 +916,7 @@ class TransferInterface(QWidget):
 
     def __on_upload_part_done(self, task, part_index, etag):
         if task.db_task_id:
-            Database.instance().record_upload_part(task.db_task_id, part_index, etag)
+            Database.instance().record_upload_part(task.db_task_id, part_index, etag, commit=False)
 
     def __reset_upload_session(self, task, *, clear_progress):
         task.bucket = ""
@@ -938,29 +958,27 @@ class TransferInterface(QWidget):
         self.__refresh_task_cells(table, row, task)
 
     def __task_finished(self, task, task_type):
+        if task_type == "upload":
+            if task.delete_requested:
+                return
+            InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
+            return
+        # ---- 以下为下载逻辑 ----
         task.active_workers = 0
         task.max_workers = 0
         task.speed_bps = 0.0
         task.eta_seconds = -1.0
-        if task_type == "upload":
-            if task.delete_requested:
-                self.__try_start_pending_uploads()
-                return
-            if task.db_task_id:
-                Database.instance().update_upload_task(task.db_task_id, status="已完成", progress=100)
-            self.__update_upload_table()
-            InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
-            self.__try_start_pending_uploads()
-            return
-        # __update_task_status 已设置 task.thread = None 和 task.status = "已完成"
+        task.speed_tracker = None
         Database.instance().delete_download_task(task.resume_id)
+        if task in self.download_tasks:
+            self.download_tasks.remove(task)
         self.__update_download_table()
-        self.__try_start_pending_downloads()
 
     def __task_error(self, task, error):
         logger.error("任务错误: %s", error)
         if isinstance(task, DownloadTask):
             task.last_error = error
+            task.status = "失败"
             InfoBar.error(title="下载失败", content=f"{task.file_name}: {error}", parent=self)
             return
         task.last_error = error
@@ -1015,7 +1033,7 @@ class TransferInterface(QWidget):
         task.last_error = ""
         task.active_workers = 0
         task.max_workers = 0
-        self.__reset_upload_session(task, clear_progress=True)
+        self.__reset_upload_session(task, clear_progress=False)
         if task.db_task_id:
             Database.instance().update_upload_task(
                 task.db_task_id,
@@ -1153,7 +1171,19 @@ class TransferInterface(QWidget):
             if task_type == "upload":
                 if task.status == "已暂停" and task.thread is None:
                     task.status = "等待中"
-                    Database.instance().update_upload_task(task.db_task_id, status="等待中")
+                    if task.db_task_id:
+                        Database.instance().update_upload_task(task.db_task_id, status="等待中")
+                    else:
+                        task.db_task_id = uuid.uuid4().hex
+                        Database.instance().save_upload_task({
+                            "task_id": task.db_task_id,
+                            "account_name": self.current_account_name,
+                            "file_name": task.file_name,
+                            "file_size": task.file_size,
+                            "local_path": task.local_path,
+                            "target_dir_id": task.target_dir_id,
+                            "status": "等待中",
+                        })
                     count += 1
                 elif task.status == "失败" and task.thread is None:
                     self.__retry_upload(task)
@@ -1292,7 +1322,7 @@ class TransferInterface(QWidget):
     def __configure_download_actions(self, row, task):
         w = self.__get_or_create_actions(self.downloadTable, row, COL_ACTION)
         pb, sb = w.primary_button, w.secondary_button
-        if task.status in ("下载中", "合并中"):
+        if task.status in DOWNLOAD_ACTIVE_STATUSES:
             pb.setIcon(FIF.PAUSE.icon())
             pb.setText("暂停")
             pb.setEnabled(True)

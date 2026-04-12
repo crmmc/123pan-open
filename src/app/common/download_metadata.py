@@ -56,7 +56,6 @@ def _load_directory_items(pan, directory_id):
     try:
         code, items = pan.get_dir_by_id(
             directory_id,
-            save=False,
             all=True,
             limit=1000,
         )

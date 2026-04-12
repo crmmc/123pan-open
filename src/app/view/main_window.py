@@ -92,6 +92,7 @@ class MainWindow(FluentWindow):
             dlg = LoginDialog(self)
             if dlg.exec() != QDialog.DialogCode.Accepted:
                 dlg.deleteLater()
+                self.close()
                 return
             self.pan = dlg.get_pan()
             dlg.deleteLater()
@@ -119,6 +120,7 @@ class MainWindow(FluentWindow):
     def _show_relogin_dialog(self):
         msg = MessageBox("登录过期", "登录凭证已过期，请重新登录。", self)
         msg.exec()
+        msg.deleteLater()
         dlg = LoginDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self.pan = dlg.get_pan()
@@ -169,8 +171,20 @@ class MainWindow(FluentWindow):
                 break
             thread.wait(remaining_ms)
 
+        # P1-21: 超时后强制终止仍在运行的线程，防止 crash
+        for thread in threads_to_wait:
+            if thread.isRunning():
+                from ..common.log import get_logger as _get_logger
+                _get_logger(__name__).warning("强制终止残留线程: %s", thread)
+                thread.terminate()
+                thread.wait(2000)
+
         if save_progress:
-            self._save_active_progress()
+            try:
+                self._save_active_progress()
+            except Exception:
+                from ..common.log import get_logger as _get_logger
+                _get_logger(__name__).warning("保存进度失败（可能因锁已被终止线程持有）", exc_info=True)
 
     def _save_active_progress(self):
         """兜底：对所有仍在活跃状态的任务强制更新 DB 为 "已暂停"。"""
@@ -180,7 +194,7 @@ class MainWindow(FluentWindow):
                 task.status = "已暂停"
                 if task.db_task_id:
                     try:
-                        db.update_upload_task(task.db_task_id, status="已暂停")
+                        db.update_upload_task(task.db_task_id, status="已暂停", progress=task.progress)
                     except Exception:
                         pass
         for task in self.transfer_interface.download_tasks:
@@ -188,33 +202,42 @@ class MainWindow(FluentWindow):
                 task.status = "已暂停"
                 if task.resume_id:
                     try:
-                        db.update_download_task(task.resume_id, status="已暂停", error="")
+                        db.update_download_task(task.resume_id, status="已暂停", progress=task.progress)
                     except Exception:
                         pass
 
     def closeEvent(self, event):
         """H6: 关闭窗口时暂停传输线程，保存进度以便下次续传。"""
         self._stop_all_transfers(save_progress=True)
+        if self.pan:
+            self.pan.close()
+        Database.instance().close()
         event.accept()
-        QApplication.instance().quit()
 
     def clear_login_config(self):
         """清除登录配置信息"""
+        from ..common.credential_store import delete_credential
         db = Database.instance()
         for key in ("userName", "passWord", "authorization", "deviceType", "osVersion", "loginuuid"):
             db.set_config(key, "")
         db.set_config("rememberPassword", False)
+        delete_credential("passWord")
+        delete_credential("authorization")
 
     def handle_logout(self):
         """处理退出登录请求"""
         msg = MessageBox("退出登录", "确定要退出登录吗？", self)
         if msg.exec():
+            msg.deleteLater()
             # M8: 退出登录前停止传输
             self._stop_all_transfers()
             self._force_cleanup_tasks()
+            if self.pan:
+                self.pan.password = ""
+                self.pan.authorization = ""
+                self.pan.close()
             self.clear_login_config()
             dlg = LoginDialog(self)
-            dlg.deleteLater()
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.pan = dlg.get_pan()
                 self.pan.on_token_expired = self._handle_token_expired
@@ -224,6 +247,7 @@ class MainWindow(FluentWindow):
                 self.file_interface.reload()
             else:
                 self.close()
+            dlg.deleteLater()
 
     def _force_cleanup_tasks(self):
         """M7: 强制清理所有残留任务状态，防止重登后线程冲突。"""

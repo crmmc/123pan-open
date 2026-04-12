@@ -37,7 +37,7 @@ class RenameDialog(QDialog):
         self.name_input = LineEdit()
         self.name_input.setText(old_name)
         self.name_input.selectAll()
-        self.name_input.returnPressed.connect(self.accept)
+        self.name_input.returnPressed.connect(self._validate_and_accept)
         layout.addWidget(self.name_input)
 
         # 按钮布局
@@ -52,11 +52,16 @@ class RenameDialog(QDialog):
         # 确定按钮
         ok_button = PrimaryPushButton("确定")
         ok_button.setMinimumWidth(100)
-        ok_button.clicked.connect(self.accept)
+        ok_button.clicked.connect(self._validate_and_accept)
 
         button_layout.addWidget(cancel_button)
         button_layout.addWidget(ok_button)
         layout.addLayout(button_layout)
+
+    def _validate_and_accept(self):
+        if not self.name_input.text().strip():
+            return
+        self.accept()
 
     def get_new_name(self):
         """获取新名称"""

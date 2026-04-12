@@ -22,4 +22,5 @@ if platform.system() == "Windows":
 elif platform.system() == "Darwin":
     CONFIG_DIR = Path.home() / "Library" / "Application Support" / "123pan-open"
 else:
-    CONFIG_DIR = Path.home() / ".config" / "123pan-open"
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    CONFIG_DIR = Path(xdg) / "123pan-open" if xdg else Path.home() / ".config" / "123pan-open"

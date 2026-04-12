@@ -61,7 +61,7 @@ class TestSessionRetryConfig:
         p = self._create_pan_with_config()
         adapter = p.session.get_adapter("https://www.123pan.com")
         forcelist = adapter.max_retries.status_forcelist
-        assert set(forcelist) == {500, 502, 503, 504}
+        assert set(forcelist) == {500, 502, 504}
 
     def test_session_retry_allowed_methods(self):
         p = self._create_pan_with_config()

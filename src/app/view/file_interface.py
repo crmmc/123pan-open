@@ -41,6 +41,7 @@ from qfluentwidgets import (
 from ..common.database import Database
 from ..common.style_sheet import StyleSheet
 from ..common.api import format_file_size
+from ..common.filename_utils import sanitize_filename as _sanitize_filename
 
 from ..common.log import get_logger
 from .newfolder_window import NewFolderDialog
@@ -50,28 +51,6 @@ from .search_window import SearchDialog
 from .upload_conflict_dialog import ConflictAction, UploadConflictDialog
 
 logger = get_logger(__name__)
-
-# Windows 保留名
-_WINDOWS_RESERVED = frozenset(
-    "CON PRN AUX NUL COM1 COM2 COM3 COM4 COM5 COM6 COM7 COM8 COM9 "
-    "LPT1 LPT2 LPT3 LPT4 LPT5 LPT6 LPT7 LPT8 LPT9".split()
-)
-
-
-def _sanitize_filename(name: str) -> str:
-    """H10: 过滤非法字符和保留名，防止路径注入。"""
-    import re as _re
-    name = _re.sub(r'[<>:"|?*\\]', '_', name)
-    name = name.rstrip('. ')
-    if not name:
-        name = "_unnamed"
-    stem = Path(name).stem.upper()
-    if stem in _WINDOWS_RESERVED:
-        name = "_" + name
-    if len(name) > 200:
-        ext = Path(name).suffix
-        name = name[:200 - len(ext)] + ext
-    return name
 
 
 def _generate_keep_both_name(file_name: str, existing_names: set[str]) -> str:
@@ -112,6 +91,8 @@ class FileInterface(QWidget):
         self.sort_mode = 0
         # 排序方向: True=升序, False=降序
         self.sort_ascending = True
+        # 文件列表缓存（排序切换时复用，避免重复网络请求）
+        self._cached_file_list = []
 
         self.mainLayout = QVBoxLayout(self)
         self.mainLayout.setContentsMargins(24, 20, 24, 24)
@@ -120,6 +101,16 @@ class FileInterface(QWidget):
         self.__createTopBar()
         self.__createContent()
         self.__initWidget()
+
+    def _cleanup_stale_signals(self):
+        if len(self._pending_signals) > 50:
+            stale = self._pending_signals[:-10]
+            for sig in stale:
+                try:
+                    sig.deleteLater()
+                except RuntimeError:
+                    pass
+            self._pending_signals = self._pending_signals[-10:]
 
     def __createTopBar(self):
         self.topBarFrame = QFrame(self)
@@ -564,6 +555,7 @@ class FileInterface(QWidget):
 
         # 持有 signals 引用防止 QRunnable autoDelete 后 signals 被 GC
         signals = task.signals
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
 
         def _on_finished(items, err, rid=current_request_id, sig=signals):
@@ -771,6 +763,16 @@ class FileInterface(QWidget):
                 )
                 return
 
+            # 检查非法字符
+            sanitized = _sanitize_filename(folder_name)
+            if sanitized != folder_name:
+                InfoBar.warning(
+                    title="输入错误",
+                    content="文件夹名称包含非法字符，请移除 <>:\"/\\|?*",
+                    parent=self,
+                )
+                return
+
             # 创建任务执行创建文件夹操作
             class CreateFolderSignals(QObject):
                 finished = Signal(
@@ -831,6 +833,7 @@ class FileInterface(QWidget):
             task = CreateFolderTask(self.pan, folder_name, self.current_dir_id, signals)
 
             # 持有 signals 引用防止 GC
+            self._cleanup_stale_signals()
             self._pending_signals.append(signals)
             signals.finished.connect(lambda *_, sig=signals: (
                 self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -852,8 +855,9 @@ class FileInterface(QWidget):
                 parent=self,
             )
 
-            # 更新文件列表（轻量级UI操作）
-            self.__updateFileListUI(file_items)
+            # 更新文件列表（轻量级UI操作，刷新失败时保留当前列表）
+            if file_items is not None:
+                self.__updateFileListUI(self.__sortFileList(file_items))
 
             # 更新树结构（轻量级UI操作）
             self.__updateTreeUI(folder_items)
@@ -912,6 +916,8 @@ class FileInterface(QWidget):
                 parent=self,
             )
         else:
+            # 缓存原始文件列表供排序切换复用
+            self._cached_file_list = list(file_items)
             # 对文件列表进行排序
             sorted_items = self.__sortFileList(file_items)
             # 更新文件列表（轻量级UI操作）
@@ -958,8 +964,9 @@ class FileInterface(QWidget):
                     self.sort_ascending = False
                 else:
                     self.sort_ascending = True
-            # 重新加载当前列表以应用新的排序
-            self.__loadCurrentList()
+            # 从缓存排序，避免重复网络请求
+            sorted_items = self.__sortFileList(self._cached_file_list)
+            self.__updateFileListUI(sorted_items)
             # M10: 同步排序指示器方向（blockSignals 防递归）
             header = self.fileTable.horizontalHeader()
             qt_order = Qt.SortOrder.AscendingOrder if self.sort_ascending else Qt.SortOrder.DescendingOrder
@@ -1048,6 +1055,7 @@ class FileInterface(QWidget):
             "target_dir_id": self.current_dir_id,
         }
         signals = task.signals
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         signals.finished.connect(
             lambda entries, ef, efld, error, ctx=context:
@@ -1134,22 +1142,30 @@ class FileInterface(QWidget):
             should_refresh_current_dir,
         )
 
-    def __executeUploadEntries(
-        self, entries, existing_file_names, error, context, should_refresh_current_dir
-    ):
-        """根据已解决冲突的 entries 执行实际上传准备（创建目录、添加任务）。"""
-        target_dir_id = context["target_dir_id"] if context else self.current_dir_id
-        uploads = []
-        created_dir_count = 0
-        folder_items = []
+    class _FolderUploadPrepareTask(QRunnable):
+        """后台线程：执行 prepare_folder_upload 避免阻塞 UI。"""
 
-        for entry in entries:
-            path = entry["path"]
-            if entry["is_dir"]:
+        class _Signals(QObject):
+            finished = Signal(list, list, int, str)  # uploads, folder_items, created_dir_count, error
+
+        def __init__(self, pan, folder_entries, target_dir_id):
+            super().__init__()
+            self.pan = pan
+            self.folder_entries = folder_entries
+            self.target_dir_id = target_dir_id
+            self.signals = _FolderUploadPrepareTask._Signals()
+
+        def run(self):
+            uploads = []
+            folder_items = []
+            created_dir_count = 0
+            error_parts = []
+            for entry in self.folder_entries:
+                path = entry["path"]
                 try:
                     merge = entry.get("merge", False)
                     plan = self.pan.prepare_folder_upload(
-                        path, target_dir_id, merge=merge
+                        path, self.target_dir_id, merge=merge
                     )
                     logger.debug(
                         "PrepareUpload: folder plan files=%d, dirs=%d, root_id=%s, merge=%s",
@@ -1166,11 +1182,25 @@ class FileInterface(QWidget):
                     })
                 except Exception as exc:
                     logger.error("文件夹上传准备失败: %s: %s", path.name, exc)
-                    InfoBar.warning(
-                        title="文件夹上传失败",
-                        content=f"{path.name}: {exc}",
-                        parent=self,
-                    )
+                    error_parts.append(f"{path.name}: {exc}")
+            self.signals.finished.emit(
+                uploads, folder_items, created_dir_count,
+                "；".join(error_parts),
+            )
+
+    def __executeUploadEntries(
+        self, entries, existing_file_names, error, context, should_refresh_current_dir
+    ):
+        """根据已解决冲突的 entries 执行实际上传准备（创建目录、添加任务）。"""
+        target_dir_id = context["target_dir_id"] if context else self.current_dir_id
+        uploads = []
+        folder_entries = []
+
+        # 单文件直接在主线程处理（无 I/O），文件夹收集后交给后台线程
+        for entry in entries:
+            path = entry["path"]
+            if entry["is_dir"]:
+                folder_entries.append(entry)
             else:
                 file_name = path.name
                 if entry.get("rename"):
@@ -1182,6 +1212,7 @@ class FileInterface(QWidget):
                     "target_dir_id": target_dir_id,
                 })
 
+        # 先添加单文件任务
         added_count = 0
         for upload in uploads:
             self.transfer_interface.add_upload_task(
@@ -1192,23 +1223,77 @@ class FileInterface(QWidget):
             )
             added_count += 1
 
-        if folder_items and should_refresh_current_dir:
-            self.__updateTreeUI(folder_items, remove_missing=False)
-        if (uploads or folder_items) and should_refresh_current_dir:
-            self.__refreshFileList()
+        # 无文件夹则直接完成
+        if not folder_entries:
+            if (uploads or folder_entries) and should_refresh_current_dir:
+                self.__refreshFileList()
+            if added_count:
+                InfoBar.success(
+                    title="上传文件",
+                    content=self.__buildUploadSummary(added_count, 0),
+                    parent=self,
+                )
+            if error:
+                InfoBar.warning(
+                    title="部分文件已跳过",
+                    content=error,
+                    parent=self,
+                )
+            return
 
-        if added_count or created_dir_count:
-            InfoBar.success(
-                title="上传文件",
-                content=self.__buildUploadSummary(added_count, created_dir_count),
-                parent=self,
-            )
+        # 文件夹交给后台线程
+        task = self._FolderUploadPrepareTask(self.pan, folder_entries, target_dir_id)
+        signals = task.signals
+        self._cleanup_stale_signals()
+        self._pending_signals.append(signals)
+
+        def _on_folder_prepare_done(
+            folder_uploads, folder_items, created_dir_count, folder_error,
+            sig=signals,
+            _added_count=added_count,
+            _error=error,
+            _should_refresh=should_refresh_current_dir,
+        ):
+            if sig in self._pending_signals:
+                self._pending_signals.remove(sig)
+
+            # 添加文件夹内的文件上传任务
+            for upload in folder_uploads:
+                self.transfer_interface.add_upload_task(
+                    upload["file_name"],
+                    upload["file_size"],
+                    upload["local_path"],
+                    upload["target_dir_id"],
+                )
+                _added_count += 1
+
+            if folder_items and _should_refresh:
+                self.__updateTreeUI(folder_items, remove_missing=False)
+            if (folder_uploads or folder_items) and _should_refresh:
+                self.__refreshFileList()
+
+            total_count = _added_count
+            total_dirs = created_dir_count
+            if total_count or total_dirs:
+                InfoBar.success(
+                    title="上传文件",
+                    content=self.__buildUploadSummary(total_count, total_dirs),
+                    parent=self,
+                )
+            if _error:
+                InfoBar.warning(title="部分文件已跳过", content=_error, parent=self)
+            if folder_error:
+                for part in folder_error.split("；"):
+                    if part:
+                        InfoBar.warning(
+                            title="文件夹上传失败", content=part, parent=self,
+                        )
+
+        signals.finished.connect(_on_folder_prepare_done)
+        QThreadPool.globalInstance().start(task)
+
         if error:
-            InfoBar.warning(
-                title="部分文件已跳过",
-                content=error,
-                parent=self,
-            )
+            InfoBar.warning(title="部分文件已跳过", content=error, parent=self)
 
     @staticmethod
     def __buildUploadSummary(upload_count, created_dir_count):
@@ -1265,6 +1350,20 @@ class FileInterface(QWidget):
                 single_save_path = chosen
 
         added = 0
+        used_names = set()
+        # 收集目标目录中已有文件名，防止同名覆盖
+        if download_dir:
+            download_path = Path(download_dir)
+            if download_path.exists():
+                for entry in download_path.iterdir():
+                    used_names.add(entry.name)
+            # 也收集正在下载的任务的文件名（同名文件可能还在下载中）
+            if self.transfer_interface:
+                for task in self.transfer_interface.download_tasks:
+                    if task.status in ("下载中", "等待中", "校验中", "合并中", "已暂停"):
+                        task_dir = str(Path(task.save_path).parent)
+                        if task_dir == str(download_path):
+                            used_names.add(Path(task.save_path).name)
         for row in rows:
             name_item = self.fileTable.item(row, 0)
             file_id = name_item.data(Qt.ItemDataRole.UserRole)
@@ -1276,6 +1375,15 @@ class FileInterface(QWidget):
                 file_name += ".zip"
 
             file_name = _sanitize_filename(file_name)
+            # 同名文件去重
+            base_name = file_name
+            counter = 1
+            while file_name in used_names:
+                stem = Path(base_name).stem
+                suffix = Path(base_name).suffix
+                file_name = f"{stem} ({counter}){suffix}"
+                counter += 1
+            used_names.add(file_name)
 
             if download_dir is not None:
                 save_path = str(Path(download_dir) / file_name)
@@ -1328,20 +1436,23 @@ class FileInterface(QWidget):
         if file_type == 1:
             target_dir_id = file_id
             select_file_id = None
+            target_name = result.get("FileName", "")
         else:
             target_dir_id = parent_id
             select_file_id = file_id
+            target_name = None
 
         class JumpSignals(QObject):
-            finished = Signal(object, int, object, str)
+            finished = Signal(object, int, object, str, str)
 
         class JumpTask(QRunnable):
-            def __init__(self, pan, file_id, target_dir_id, select_file_id, signals):
+            def __init__(self, pan, file_id, target_dir_id, select_file_id, target_name, signals):
                 super().__init__()
                 self.pan = pan
                 self.file_id = file_id
                 self.target_dir_id = target_dir_id
                 self.select_file_id = select_file_id
+                self.target_name = target_name
                 self.signals = signals
 
             def run(self):
@@ -1349,23 +1460,23 @@ class FileInterface(QWidget):
                     details = self.pan.file_details([self.file_id])
                     detail_paths = details.get("paths", []) if details else []
                     self.signals.finished.emit(
-                        detail_paths, self.target_dir_id, self.select_file_id, ""
+                        detail_paths, self.target_dir_id, self.select_file_id, "", self.target_name or ""
                     )
                 except Exception as e:
-                    self.signals.finished.emit([], self.target_dir_id, None, str(e))
+                    self.signals.finished.emit([], self.target_dir_id, None, str(e), "")
 
         self._jump_signals = JumpSignals()
         self._jump_signals.finished.connect(
-            lambda detail_paths, target_dir_id, selected_file_id, error, rid=current_request_id:
+            lambda detail_paths, target_dir_id, selected_file_id, error, target_name, rid=current_request_id:
             self.__onJumpFinished(
-                detail_paths, target_dir_id, selected_file_id, error, rid
+                detail_paths, target_dir_id, selected_file_id, error, target_name, rid
             )
         )
-        task = JumpTask(self.pan, file_id, target_dir_id, select_file_id, self._jump_signals)
+        task = JumpTask(self.pan, file_id, target_dir_id, select_file_id, target_name, self._jump_signals)
         QThreadPool.globalInstance().start(task)
 
     def __onJumpFinished(
-        self, detail_paths, target_dir_id, select_file_id, error, request_id=None
+        self, detail_paths, target_dir_id, select_file_id, error, target_name="", request_id=None
     ):
         if request_id is not None and request_id != self._jump_request_id:
             logger.info("搜索跳转结果已过期，丢弃回调")
@@ -1382,10 +1493,13 @@ class FileInterface(QWidget):
             if fid != 0:
                 self.path_stack.append((fid, fname))
         if self.path_stack[-1][0] != target_dir_id:
-            for p in detail_paths:
-                if int(p.get("fileId", 0)) == target_dir_id:
-                    self.path_stack.append((target_dir_id, p.get("fileName", "")))
-                    break
+            if target_name:
+                self.path_stack.append((target_dir_id, target_name))
+            else:
+                for p in detail_paths:
+                    if int(p.get("fileId", 0)) == target_dir_id:
+                        self.path_stack.append((target_dir_id, p.get("fileName", "")))
+                        break
 
         self.current_dir_id = target_dir_id
         self.__updateBreadcrumb()
@@ -1398,6 +1512,7 @@ class FileInterface(QWidget):
 
         # 持有 signals 引用防止 GC
         signals = task.signals
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
 
         def _cleanup(*_, sig=signals):
@@ -1431,7 +1546,13 @@ class FileInterface(QWidget):
         count = len(self.__getSelectedRows())
         total = self.fileTable.rowCount()
         if count:
-            self.statusLabel.setText(f"已选中 {count} 个，共 {total} 个")
+            selected_size = 0
+            for row in self.__getSelectedRows():
+                size_item = self.fileTable.item(row, 0)
+                if size_item:
+                    selected_size += int(size_item.data(Qt.ItemDataRole.UserRole) or 0)
+            size_text = f"，总大小 {format_file_size(selected_size)}" if selected_size else ""
+            self.statusLabel.setText(f"已选中 {count} 个，共 {total} 个{size_text}")
         else:
             self.statusLabel.setText(f"共 {total} 个")
 
@@ -1499,7 +1620,7 @@ class FileInterface(QWidget):
                         detail = item_map.get(str(fid))
                         if detail:
                             try:
-                                self.pan.delete_file(detail, by_num=False, operation=True)
+                                self.pan.delete_file(detail, operation=True)
                                 ok_count += 1
                             except Exception as e:
                                 errors.append(f"{fname}: {e}")
@@ -1532,6 +1653,7 @@ class FileInterface(QWidget):
         task = DeleteFilesTask(
             self.pan, delete_list, self.current_dir_id, signals
         )
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         signals.finished.connect(lambda *_, sig=signals: (
             self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -1548,7 +1670,6 @@ class FileInterface(QWidget):
             InfoBar.error(
                 title="删除失败", content=f"删除时发生错误: {error}", parent=self,
             )
-            return
 
         if ok_count > 0:
             InfoBar.success(
@@ -1558,7 +1679,7 @@ class FileInterface(QWidget):
             )
 
         if file_items:
-            self.__updateFileListUI(file_items)
+            self.__updateFileListUI(self.__sortFileList(file_items))
             self.__updateTreeUI(folder_items)
             current_item = self.__findTreeItemById(self.current_dir_id)
             if current_item:
@@ -1687,6 +1808,7 @@ class FileInterface(QWidget):
         )
 
         # 持有 signals 引用防止 GC
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         signals.finished.connect(lambda *_, sig=signals: (
             self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -1710,8 +1832,9 @@ class FileInterface(QWidget):
                 parent=self,
             )
 
-            # 更新文件列表（轻量级UI操作）
-            self.__updateFileListUI(file_items)
+            # 更新文件列表（轻量级UI操作，刷新失败时保留当前列表）
+            if file_items is not None:
+                self.__updateFileListUI(self.__sortFileList(file_items))
 
             # 更新树结构（轻量级UI操作）
             self.__updateTreeUI(folder_items)
@@ -1762,6 +1885,23 @@ class FileInterface(QWidget):
             InfoBar.warning(title="移动错误", content="目标文件夹与当前文件夹相同", parent=self)
             return
 
+        # 不允许将文件夹移动到自身内部（循环引用）
+        source_folder_ids = set()
+        for row in rows:
+            name_item = self.fileTable.item(row, 0)
+            file_type = name_item.data(Qt.ItemDataRole.UserRole + 1)
+            file_id = name_item.data(Qt.ItemDataRole.UserRole)
+            if file_type == 1:  # 文件夹
+                source_folder_ids.add(file_id)
+        if target_id in source_folder_ids:
+            InfoBar.warning(title="移动错误", content="不能将文件夹移动到自身内部", parent=self)
+            return
+        # 检查目标是否是源文件夹的后代（深度循环引用）
+        ancestor_ids = dialog.get_ancestor_ids()
+        if source_folder_ids & ancestor_ids:
+            InfoBar.warning(title="移动错误", content="不能将文件夹移动到其子文件夹中", parent=self)
+            return
+
         # 后台执行移动
         file_id_list = [fid for fid, _ in move_list]
 
@@ -1793,6 +1933,7 @@ class FileInterface(QWidget):
             self.__onMoveFilesFinished(success, count, moved_target_name, error, ctx)
         )
         task = MoveFilesTask(self.pan, file_id_list, target_id, target_name, signals)
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         signals.finished.connect(lambda *_, sig=signals: (
             self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -1855,6 +1996,7 @@ class FileInterface(QWidget):
             self.__onFileDetailsFinished(detail_name, data, error, ctx)
         )
         task = FileDetailsTask(self.pan, file_id, file_name, signals)
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         signals.finished.connect(lambda *_, sig=signals: (
             self._pending_signals.remove(sig) if sig in self._pending_signals else None
@@ -1974,7 +2116,7 @@ class FileInterface(QWidget):
                 else:
                     self.signals.finished.emit((0, 0))
             except Exception as e:
-                logger.error(f"获取存储信息失败: {e}")
+                logger.error("获取存储信息失败: %s", e)
                 self.signals.finished.emit((0, 0))
 
     def load_and_update_storage_info(self):
@@ -1984,6 +2126,7 @@ class FileInterface(QWidget):
 
         task = self.StorageTask(self.pan)
         signals = task.signals
+        self._cleanup_stale_signals()
         self._pending_signals.append(signals)
         context = self.__buildAsyncContext()
 

@@ -23,6 +23,7 @@ from .concurrency import (
 )
 from .const import all_device_type, all_os_versions
 from .log import get_logger
+from .filename_utils import sanitize_filename
 
 logger = get_logger(__name__)
 
@@ -94,11 +95,18 @@ class _ProgressFileIO:
         chunk = self._f.read(size)
         if chunk:
             self._remaining -= len(chunk)
+            if self._remaining < 0:
+                logger.warning("_ProgressFileIO: _remaining 变为负值 (%d)", self._remaining)
             self._pending += len(chunk)
             if self._pending >= self._REPORT_SIZE:
                 self._cb(self._pending)
                 self.reported += self._pending
                 self._pending = 0
+        elif self._remaining > 0:
+            logger.warning(
+                "_ProgressFileIO: 文件在 offset=%d 处提前结束 (剩余 %d 字节未读)",
+                self._f.tell(), self._remaining,
+            )
         return chunk
 
     def __len__(self):
@@ -107,6 +115,13 @@ class _ProgressFileIO:
     def close(self):
         if self._f and not self._f.closed:
             self._f.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
 
 
 class RateLimitError(RuntimeError):
@@ -181,8 +196,6 @@ class Pan123:
 
         self.on_token_expired = None  # callback: 通知 UI token 过期需重新登录
         self.recycle_list = None
-        self.list = []
-        self.total = 0
         self.parent_file_name_list = []
         self.all_file = False
         self.file_page = 0
@@ -193,12 +206,11 @@ class Pan123:
             backoff_factor=_safe_float(db.get_config("retryBackoffFactor", 0.5), 0.5, 0.1, 10.0),
             allowed_methods=["GET", "POST", "PUT", "HEAD"],
             raise_on_status=False,
-            status_forcelist=[500, 502, 503, 504],
+            status_forcelist=[500, 502, 504],
         )
-        adapter = HTTPAdapter(max_retries=retry)
+        adapter = HTTPAdapter(pool_connections=16, pool_maxsize=32, max_retries=retry)
         self.session = requests.Session()
         self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
         self._session_lock = _RWLock()
         if readfile:
             self.read_ini(user_name, password, input_pwd, authorization)
@@ -225,6 +237,13 @@ class Pan123:
         self.parent_file_list = [0]
         self._login_lock = threading.Lock()
 
+    def close(self):
+        """关闭 session，释放连接池资源。"""
+        try:
+            self.session.close()
+        except Exception:
+            pass
+
     def login(self):
         with self._login_lock:
             return self._login_without_lock()
@@ -237,13 +256,13 @@ class Pan123:
             "https://www.123pan.com/b/api/user/sign_in",
             headers=self.header_logined,
             data=json.dumps(data),
-            timeout=(3, 5),
+            timeout=(5, 15),
         )
 
         res_sign = _parse_json_response(login_res)
         res_code_login = res_sign.get("code", -1)
         if res_code_login != 200:
-            logger.error("code = 1 Error:" + str(res_code_login))
+            logger.error("code = 1 Error: %s", res_code_login)
             logger.error(res_sign.get("message", ""))
             return res_code_login
 
@@ -315,20 +334,30 @@ class Pan123:
             stay_logged_in = bool(db.get_config("stayLoggedIn", True))
             db.set_many_config({
                 "userName": self.user_name,
-                "passWord": self.password if remember_password else "",
-                "authorization": self.authorization if stay_logged_in else "",
+                "passWord": "",
+                "authorization": "",
                 "deviceType": self.devicetype,
                 "osVersion": self.osversion,
+                "loginuuid": self.loginuuid,
             })
+            from .credential_store import save_credential, delete_credential
+            if remember_password:
+                save_credential("passWord", self.password)
+            else:
+                delete_credential("passWord")
+            if stay_logged_in:
+                save_credential("authorization", self.authorization)
+            else:
+                delete_credential("authorization")
             logger.info("账号已保存")
         except Exception as e:
             logger.error("保存账号失败: %s", e)
 
-    def get_dir_by_id(self, file_id, save=True, all=False, limit=100, search_data=""):
+    def get_dir_by_id(self, file_id, all=False, limit=100, search_data=""):
         """按文件夹ID获取文件列表（支持分页）"""
         get_pages = 3
-        page = 1 if all or not save else self.file_page * get_pages + 1
-        length_now = 0 if all or not save else len(self.list)
+        page = 1
+        length_now = 0
         lists = []
         total = -1
         times = 0
@@ -355,45 +384,34 @@ class Pan123:
                 logger.error("获取文件列表触发 429 限流")
                 return -1, []
             except requests.exceptions.Timeout:
-                logger.error(f"请求超时: {base_url}")
+                logger.error("请求超时: %s", base_url)
                 return -1, []
             except requests.exceptions.ConnectionError as e:
-                logger.error(f"连接失败: {e}")
+                logger.error("连接失败: %s", e)
                 return -1, []
             except requests.exceptions.RequestException as e:
-                logger.error(f"请求异常: {e}")
+                logger.error("请求异常: %s", e)
                 return -1, []
             text = _parse_json_response(response)
             res_code_getdir = text.get("code", -1)
             if res_code_getdir != 0:
-                logger.error("code = 2 Error:" + str(res_code_getdir))
+                logger.error("code = 2 Error: %s", res_code_getdir)
                 logger.error(text.get("message", ""))
                 return res_code_getdir, []
             data = text.get("data") or {}
             lists_page = data.get("InfoList") or []
             lists += lists_page
-            total = data.get("Total", 0)
+            if total <= 0:
+                total = data.get("Total", 0)
             length_now += len(lists_page)
             page += 1
             times += 1
             if times % 5 == 0:
                 logger.warning(
-                    "警告：文件夹内文件过多：" + str(length_now) + "/" + str(total)
+                    "警告：文件夹内文件过多: %s/%s", length_now, total
                 )
                 logger.info("为防止对服务器造成影响，暂停3秒")
                 time.sleep(3)
-
-        if not save:
-            return res_code_getdir, lists
-        if length_now < total:
-            logger.warning("文件夹内文件过多：" + str(length_now) + "/" + str(total))
-            self.all_file = False
-        else:
-            self.all_file = True
-        self.total = total
-        self.file_page += 1
-        if save:
-            self.list.extend(lists)
 
         return res_code_getdir, lists
 
@@ -424,19 +442,23 @@ class Pan123:
             data=json.dumps(down_request_data),
             timeout=10,
         )
-        link_res_json = _parse_json_response(link_res)
+        try:
+            link_res_json = _parse_json_response(link_res)
+        finally:
+            link_res.close()
         res_code_download = link_res_json.get("code", -1)
         if res_code_download != 0:
-            logger.error("获取下载链接失败，返回码: " + str(res_code_download))
+            logger.error("获取下载链接失败，返回码: %s", res_code_download)
             logger.error(link_res_json.get("message", ""))
             return res_code_download
         down_load_url = link_res_json.get("data", {}).get("DownloadUrl", "")
         if not down_load_url:
             logger.error("响应中缺少 DownloadUrl")
             return -1
-        next_to_get = self._raw_request(
+        with self._raw_request(
             self.session.get, down_load_url, timeout=10, allow_redirects=False
-        ).text
+        ) as next_resp:
+            next_to_get = next_resp.text
         url_pattern = re.compile(r"""href=["'](https?://[^"']+)["']""")
         matches = url_pattern.findall(next_to_get)
         if not matches:
@@ -445,7 +467,7 @@ class Pan123:
         redirect_url = matches[0]
         if showlink:
             parsed = urlparse(redirect_url)
-            logger.info(f"获取下载链接成功: {parsed.hostname}")
+            logger.info("获取下载链接成功: %s", parsed.hostname)
 
         return redirect_url
 
@@ -468,20 +490,11 @@ class Pan123:
         recycle_list = json_recycle.get("data", {}).get("InfoList", [])
         self.recycle_list = recycle_list
 
-    def delete_file(self, file, by_num=True, operation=True):
+    def delete_file(self, file_detail, operation=True):
         """删除或恢复文件"""
-        if by_num:
-            if not str(file).isdigit():
-                raise ValueError("文件索引必须是数字")
-            if 0 <= file < len(self.list):
-                file_detail = self.list[file]
-            else:
-                raise IndexError("文件索引超出范围")
-        else:
-            file_detail = file
         data_delete = {
             "driveId": 0,
-            "fileTrashInfoList": file_detail,
+            "fileTrashInfoList": [file_detail],
             "operation": operation,
         }
         delete_res = self._api_request(
@@ -496,9 +509,9 @@ class Pan123:
             raise RuntimeError(
                 "删除文件失败: " + json.dumps(dele_json, ensure_ascii=False)
             )
-        logger.debug(f"删除文件响应: {dele_json}")
+        logger.debug("删除文件响应: %s", dele_json)
         message = dele_json.get("message", "")
-        logger.info(f"删除文件消息: {message}")
+        logger.info("删除文件消息: %s", message)
 
     def rename_file(self, file_id, new_name):
         """重命名文件或文件夹"""
@@ -512,12 +525,12 @@ class Pan123:
         )
         rename_json = _parse_json_response(rename_res)
         code = rename_json.get("code", -1)
-        logger.debug(f"重命名文件响应: {rename_json}")
+        logger.debug("重命名文件响应: %s", rename_json)
         if code != 0:
             message = rename_json.get("message", "")
-            logger.error(f"重命名失败: {message}")
+            logger.error("重命名失败: %s", message)
             return False
-        logger.info(f"重命名成功: {new_name}")
+        logger.info("重命名成功: %s", new_name)
         return True
 
     def move_file(self, file_id_list, target_parent_id):
@@ -535,12 +548,12 @@ class Pan123:
         )
         move_json = _parse_json_response(move_res)
         code = move_json.get("code", -1)
-        logger.debug(f"移动文件响应: {move_json}")
+        logger.debug("移动文件响应: %s", move_json)
         if code != 0:
             message = move_json.get("message", "")
-            logger.error(f"移动文件失败: {message}")
+            logger.error("移动文件失败: %s", message)
             return False
-        logger.info(f"移动文件成功: {len(file_id_list)} 个文件")
+        logger.info("移动文件成功: %s 个文件", len(file_id_list))
         return True
 
     def user_info(self):
@@ -555,7 +568,7 @@ class Pan123:
         code = res_json.get("code", -1)
         if code != 0:
             message = res_json.get("message", "")
-            logger.error(f"获取用户信息失败: {message}")
+            logger.error("获取用户信息失败: %s", message)
             return None
         return res_json.get("data")
 
@@ -665,10 +678,10 @@ class Pan123:
         code = res_json.get("code", -1)
         if code != 0:
             message = res_json.get("message", "")
-            logger.error(f"获取文件详情失败: {message}")
+            logger.error("获取文件详情失败: %s", message)
             return None
         data = res_json.get("data")
-        logger.debug(f"file_details 响应 paths: {data.get('paths') if data else None}")
+        logger.debug("file_details 响应 paths: %s", data.get('paths') if data else None)
         return data
 
     def share(self, file_id_list, share_pwd=""):
@@ -719,26 +732,29 @@ class Pan123:
             if loginuuid:
                 self.loginuuid = loginuuid
             user_name = db.get_config("userName", user_name) or user_name
-            password = db.get_config("passWord", password) or password
-            authorization = db.get_config("authorization", authorization) or authorization
+            from .credential_store import load_credential
+            password = load_credential("passWord") or password
+            authorization = load_credential("authorization") or authorization
         except Exception as e:
-            logger.error(f"获取配置失败: {e}")
+            logger.error("获取配置失败: %s", e)
             if user_name == "" or password == "":
-                raise Exception("无法从配置获取账号信息")
+                raise RuntimeError("无法从配置获取账号信息") from e
 
         self.user_name = user_name
         self.password = password
         self.authorization = authorization
 
-    def mkdir(self, dirname, remakedir=False):
+    def mkdir(self, dirname, parent_id=None, remakedir=False):
         """创建文件夹"""
+        pid = parent_id if parent_id is not None else self.parent_file_id
         if not remakedir:
-            for i in self.list:
-                if i["FileName"] == dirname:
-                    logger.info("文件夹已存在")
-                    return i["FileId"]
+            code, items = self.get_dir_by_id(pid, limit=100)
+            if code == 0:
+                for i in items:
+                    if i["FileName"] == dirname:
+                        return i["FileId"]
 
-        return self._create_directory(self.parent_file_id, dirname)
+        return self._create_directory(pid, dirname)
 
     def _create_directory(self, parent_id, dirname):
         """在指定父目录下创建文件夹。"""
@@ -771,9 +787,9 @@ class Pan123:
         code_mkdir = res_json.get("code", -1)
 
         if code_mkdir == 0:
-            logger.info(f"创建成功: {res_json.get('data', {}).get('FileId')}")
+            logger.info("创建成功: %s", res_json.get('data', {}).get('FileId'))
             return res_json.get("data", {}).get("Info", {}).get("FileId")
-        logger.error(f"创建失败: {res_json}")
+        logger.error("创建失败: %s", res_json)
         raise RuntimeError(
             f"创建目录 '{dirname}' 失败: code={code_mkdir}, "
             f"message={res_json.get('message', '')}"
@@ -801,7 +817,7 @@ class Pan123:
 
     def _get_dir_items_by_id(self, parent_id):
         """获取指定目录下的完整文件列表，不污染当前分页状态。"""
-        code, items = self.get_dir_by_id(parent_id, save=False, all=True, limit=100)
+        code, items = self.get_dir_by_id(parent_id, all=True, limit=100)
         if code != 0:
             raise RuntimeError(f"获取目录失败，返回码: {code}")
         return items
@@ -855,14 +871,14 @@ class Pan123:
 
         top_level_dirs = self._get_child_directory_map(target_parent_id)
 
-        if merge and local_dir_path.name in top_level_dirs:
+        if merge and sanitize_filename(local_dir_path.name) in top_level_dirs:
             # 合并模式：复用已有顶层目录
-            root_name = local_dir_path.name
+            root_name = sanitize_filename(local_dir_path.name)
             root_dir_id = top_level_dirs[root_name]
             created_dir_count = 0
         else:
             root_name = self._choose_available_directory_name(
-                set(top_level_dirs), local_dir_path.name
+                set(top_level_dirs), sanitize_filename(local_dir_path.name)
             )
             root_dir_id = self._create_directory_with_backoff(target_parent_id, root_name)
             if not root_dir_id:
@@ -890,13 +906,14 @@ class Pan123:
                             existing_file_names.add(item.get("FileName", ""))
 
                 for dir_name in dir_names:
-                    child_relative = relative_root / dir_name
-                    if merge and dir_name in existing_child_dirs:
-                        dir_id_map[child_relative] = existing_child_dirs[dir_name]
+                    sanitized_dir = sanitize_filename(dir_name)
+                    child_relative = relative_root / sanitized_dir
+                    if merge and sanitized_dir in existing_child_dirs:
+                        dir_id_map[child_relative] = existing_child_dirs[sanitized_dir]
                         continue
                     child_dir_id = self._create_directory_with_backoff(
                         remote_parent_id,
-                        dir_name,
+                        sanitized_dir,
                     )
                     if not child_dir_id:
                         raise RuntimeError(f"创建目录失败: {child_relative}")
@@ -918,7 +935,6 @@ class Pan123:
                 try:
                     self.delete_file(
                         {"FileId": root_dir_id, "Type": 1, "FileName": root_name},
-                        by_num=False,
                     )
                 except Exception as cleanup_exc:
                     logger.warning("回滚上传目录失败: %s", cleanup_exc)
@@ -933,13 +949,15 @@ class Pan123:
 
     def upload_file_stream(
         self, file_path, dup_choice=1, task_id=None, signals=None, task=None,
-        speed_tracker=None, resume_info=None, parent_id=0,
+        speed_tracker=None, resume_info=None, parent_id=0, file_name_override=None,
     ):
         """上传文件（分块），支持断点续传、progress 回调与取消/暂停控制。"""
         tid = uuid.uuid4().hex[:6]
-        file_path = file_path.replace('"', "").replace("\\", "/")
+        file_path = file_path.replace('"', "")
+        if os.name == "nt":
+            file_path = file_path.replace("\\", "/")
         file_path_obj = Path(file_path)
-        file_name = file_path_obj.name
+        file_name = sanitize_filename(file_name_override or file_path_obj.name)
         if not file_path_obj.exists():
             raise FileNotFoundError("文件不存在")
         if file_path_obj.is_dir():
@@ -1109,8 +1127,47 @@ class Pan123:
                 signals.status.emit("上传中")
             if signals:
                 signals.progress.emit(0)
-            if speed_tracker:
-                speed_tracker.reset()
+
+        # 0 字节文件：跳过分片上传和 speed_tracker.reset()，直接完成
+        if fsize == 0:
+            if signals:
+                signals.progress.emit(100)
+            comp_data = {
+                "bucket": bucket, "key": upload_key,
+                "uploadId": upload_id, "storageNode": storage_node,
+                "parts": [],
+            }
+            complete_res = self._api_request(
+                self.session.post,
+                "https://www.123pan.com/b/api/file/s3_complete_multipart_upload",
+                headers=headers,
+                data=json.dumps(comp_data),
+                timeout=30,
+            )
+            complete_json = _parse_json_response(complete_res)
+            if complete_json.get("code", -1) != 0:
+                raise RuntimeError(
+                    "0字节文件合并失败: " + json.dumps(complete_json, ensure_ascii=False)
+                )
+            close_data = {"fileId": up_file_id}
+            for _attempt in range(5):
+                if _attempt > 0:
+                    time.sleep(min(2 ** _attempt, 8))
+                close_res = self._api_request(
+                    self.session.post,
+                    "https://www.123pan.com/b/api/file/upload_complete",
+                    headers=headers,
+                    data=json.dumps(close_data),
+                    timeout=30,
+                )
+                cr = _parse_json_response(close_res)
+                if cr.get("code", -1) == 0:
+                    logger.debug("[T-%s] 0字节文件上传完成", tid)
+                    return up_file_id
+            raise RuntimeError("0字节文件 upload_complete 超时")
+
+        if speed_tracker:
+            speed_tracker.reset()
 
         # 初始化 multipart upload session（123pan 要求在获取 presigned URL 前调用）
         init_data = {
@@ -1209,6 +1266,9 @@ class Pan123:
                 raise requests.RequestException(f"分块 {pn} 无 presigned URL")
             return url
 
+        uploaded_parts_map = {}
+        uploaded_parts_lock = threading.Lock()
+
         def _upload_worker():
             wid = uuid.uuid4().hex[:4]
             max_retries = _safe_int(
@@ -1224,6 +1284,7 @@ class Pan123:
             prefetched_part = None
             prefetched_result = [None, None]  # [url, exception]
             prefetch_thread = None
+            _current_part = None  # 追踪当前 part，用于 finally 回队
 
             def _requeue_prefetch():
                 """将预取的 part 放回队列并清理预取状态。"""
@@ -1268,6 +1329,8 @@ class Pan123:
                             logger.debug("[T-%s W-%s] 队列为空，退出", tid, wid)
                             return
                         url = None
+
+                    _current_part = part  # 追踪当前 part 用于 finally 回队
 
                     pn = part["part_number"]
                     offset = part["offset"]
@@ -1322,42 +1385,45 @@ class Pan123:
                                 aggregator.record(n)
 
                             progress_io = _ProgressFileIO(file_path, offset, size, _on_chunk)
-                            resp = requests.put(url, data=progress_io, timeout=(10, 120))
-                            if resp.status_code in RATE_LIMIT_CODES:
-                                aggregator.record(-progress_io.reported)
+                            with self.session.put(url, data=progress_io, timeout=(10, 120)) as resp:
+                                if resp.status_code in RATE_LIMIT_CODES:
+                                    aggregator.record(-progress_io.reported)
+                                    with progress_lock:
+                                        transient_failure_count[0] += 1
+                                        if transient_failure_count[0] > MAX_RATE_LIMITS:
+                                            failed[0] = True
+                                            logger.error("[T-%s W-%s] 限流次数过多，上传终止", tid, wid)
+                                            return
+                                        if threading.current_thread().name == probe_thread_name[0]:
+                                            probe_thread_name[0] = None
+                                        else:
+                                            new_limit = max(1, active_workers[0] - 1)
+                                            if new_limit < allowed_workers[0]:
+                                                allowed_workers[0] = new_limit
+                                    # 回队当前 part
+                                    part_queue.put(part)
+                                    _current_part = None  # 已回队
+                                    worker_feedback.set()
+                                    logger.debug(
+                                        "[T-%s W-%s] 分块 %s 命中 %s，回队，allowed=%s",
+                                        tid, wid, pn, resp.status_code, allowed_workers[0],
+                                    )
+                                    time.sleep(RATE_LIMIT_BACKOFF)
+                                    break
+                                resp.raise_for_status()
+                                part_etag = resp.headers.get("ETag", "")
+                                with uploaded_parts_lock:
+                                    uploaded_parts_map[pn] = {"ETag": str(part_etag), "PartNumber": pn}
+                                if signals and hasattr(signals, "part_done"):
+                                    signals.part_done.emit(pn, part_etag)
                                 with progress_lock:
-                                    transient_failure_count[0] += 1
-                                    if transient_failure_count[0] > MAX_RATE_LIMITS:
-                                        failed[0] = True
-                                        logger.error("[T-%s W-%s] 限流次数过多，上传终止", tid, wid)
-                                        return
-                                    if threading.current_thread().name == probe_thread_name[0]:
-                                        probe_thread_name[0] = None
-                                    else:
-                                        new_limit = max(1, active_workers[0] - 1)
-                                        if new_limit < allowed_workers[0]:
-                                            allowed_workers[0] = new_limit
-                                # 回队当前 part + 清空预取
-                                part_queue.put(part)
-                                _requeue_prefetch()
+                                    _reset_transient_failure_count(transient_failure_count)
+                                    if allowed_workers[0] < max_workers:
+                                        allowed_workers[0] = min(max_workers, allowed_workers[0] + 1)
                                 worker_feedback.set()
-                                logger.debug(
-                                    "[T-%s W-%s] 分块 %s 命中 %s，回队，allowed=%s",
-                                    tid, wid, pn, resp.status_code, allowed_workers[0],
-                                )
-                                time.sleep(RATE_LIMIT_BACKOFF)
+                                logger.debug("[T-%s W-%s] 分块 %s 上传成功", tid, wid, pn)
+                                _current_part = None  # 已成功处理
                                 break
-                            resp.raise_for_status()
-                            part_etag = resp.headers.get("ETag", "")
-                            if signals and hasattr(signals, "part_done"):
-                                signals.part_done.emit(pn, part_etag)
-                            with progress_lock:
-                                _reset_transient_failure_count(transient_failure_count)
-                                if allowed_workers[0] < max_workers:
-                                    allowed_workers[0] = min(max_workers, allowed_workers[0] + 1)
-                            worker_feedback.set()
-                            logger.debug("[T-%s W-%s] 分块 %s 上传成功", tid, wid, pn)
-                            break
                         except Exception as exc:
                             if progress_io is not None and progress_io.reported > 0:
                                 aggregator.record(-progress_io.reported)
@@ -1377,7 +1443,7 @@ class Pan123:
                                         if new_limit < allowed_workers[0]:
                                             allowed_workers[0] = new_limit
                                 part_queue.put(part)
-                                _requeue_prefetch()
+                                _current_part = None  # 已回队
                                 worker_feedback.set()
                                 logger.warning(
                                     "[T-%s W-%s] 分块 %s 获取上传链接触发限流，回队重试: %s",
@@ -1402,7 +1468,7 @@ class Pan123:
                                             tid, wid, allowed_workers[0],
                                         )
                                     part_queue.put(part)
-                                    _requeue_prefetch()
+                                    _current_part = None  # 已回队
                                     worker_feedback.set()
                                     logger.warning(
                                         "[T-%s W-%s] 分块 %s 重试 %s 次仍失败，回队: %s",
@@ -1417,6 +1483,7 @@ class Pan123:
                                 worker_feedback.set()
                                 return
                             attempt += 1
+                            url = None  # 重试时重新获取 presigned URL
                             logger.warning(
                                 "[T-%s W-%s] 分块 %s 第 %s 次重试: %s", tid, wid, pn, attempt, exc
                             )
@@ -1425,6 +1492,11 @@ class Pan123:
                             if progress_io is not None:
                                 progress_io.close()
             finally:
+                # 统一回队：任何退出路径都确保 part 和预取不丢失
+                if _current_part is not None:
+                    part_queue.put(_current_part)
+                    logger.debug("[T-%s W-%s] 回队当前 part", tid, wid)
+                _requeue_prefetch()
                 with progress_lock:
                     if threading.current_thread().name == probe_thread_name[0]:
                         probe_thread_name[0] = None
@@ -1469,6 +1541,22 @@ class Pan123:
         )
 
         if task and getattr(task, "is_cancelled", False):
+            # 取消上传时尝试 abort S3 multipart upload
+            try:
+                abort_data = {
+                    "bucket": bucket, "key": upload_key,
+                    "uploadId": upload_id, "storageNode": storage_node,
+                }
+                self._api_request(
+                    self.session.post,
+                    "https://www.123pan.com/b/api/file/s3_abort_multipart_upload",
+                    headers=headers,
+                    data=json.dumps(abort_data),
+                    timeout=10,
+                )
+                logger.debug("[T-%s] S3 multipart upload 已 abort", tid)
+            except Exception as abort_exc:
+                logger.warning("[T-%s] S3 abort 失败（可忽略）: %s", tid, abort_exc)
             return "已取消"
         if task and getattr(task, "pause_requested", False):
             return "已暂停"
@@ -1482,6 +1570,7 @@ class Pan123:
             "key": upload_key,
             "uploadId": upload_id,
             "storageNode": storage_node,
+            "parts": sorted(uploaded_parts_map.values(), key=lambda p: p["PartNumber"]),
         }
         # C2: 检查 s3_list_upload_parts 和 s3_complete_multipart_upload 返回值
         list_res = self._api_request(

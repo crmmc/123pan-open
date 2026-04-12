@@ -1,4 +1,5 @@
 from PySide6.QtWidgets import QApplication
+from unittest.mock import patch
 
 from src.app.common import database as database_module
 from src.app.common.database import Database
@@ -26,20 +27,20 @@ def test_setting_interface_uses_database_defaults_for_download_controls(tmp_path
 def test_setting_interface_clears_password_and_token_when_switches_disabled(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_many_config({
-        "passWord": "secret",
-        "authorization": "Bearer token",
         "rememberPassword": True,
         "stayLoggedIn": True,
     })
 
     interface = SettingInterface()
-    interface._SettingInterface__onRememberPasswordChanged(False)
-    interface._SettingInterface__onStayLoggedInChanged(False)
+
+    with patch("src.app.common.credential_store.delete_credential") as mock_del:
+        interface._SettingInterface__onRememberPasswordChanged(False)
+        interface._SettingInterface__onStayLoggedInChanged(False)
+        mock_del.assert_any_call("passWord")
+        mock_del.assert_any_call("authorization")
 
     assert db.get_config("rememberPassword", None) is False
     assert db.get_config("stayLoggedIn", None) is False
-    assert db.get_config("passWord", "") == ""
-    assert db.get_config("authorization", "") == ""
 
 
 def test_setting_interface_clamps_invalid_numeric_config(tmp_path, monkeypatch):

@@ -114,7 +114,10 @@ class TestLogin:
             "stayLoggedIn": False,
         })
 
-        pan.save_file()
+        with patch("src.app.common.credential_store.delete_credential") as mock_del:
+            pan.save_file()
+            mock_del.assert_any_call("passWord")
+            mock_del.assert_any_call("authorization")
 
         assert db.get_config("userName", "") == "testuser"
         assert db.get_config("passWord", "") == ""
@@ -127,10 +130,10 @@ class TestLogin:
             "stayLoggedIn": True,
         })
 
-        pan.save_file()
-
-        assert db.get_config("passWord", "") == "testpwd"
-        assert db.get_config("authorization", "") == "Bearer token123"
+        with patch("src.app.common.credential_store.save_credential") as mock_save:
+            pan.save_file()
+            mock_save.assert_any_call("passWord", "testpwd")
+            mock_save.assert_any_call("authorization", "Bearer token123")
 
 
 class TestGetDir:
@@ -183,30 +186,15 @@ class TestGetDir:
         )
 
         with patch.object(pan.session, "get", return_value=resp):
-            code, items = pan.get_dir_by_id(123, save=False)
+            code, items = pan.get_dir_by_id(123)
 
         assert code == 0
         assert items == [{"FileId": 2}]
+        # 不再修改实例属性
         assert pan.file_page == 7
         assert pan.total == 99
         assert pan.all_file is True
         assert pan.list == [{"FileId": 1}]
-
-    def test_get_dir_by_id_save_true_updates_shared_state(self, pan):
-        resp = _mock_response(
-            200,
-            {"code": 0, "data": {"Total": 1, "InfoList": [{"FileId": 2}]}}
-        )
-
-        with patch.object(pan.session, "get", return_value=resp):
-            code, items = pan.get_dir_by_id(123, save=True)
-
-        assert code == 0
-        assert items == [{"FileId": 2}]
-        assert pan.file_page == 1
-        assert pan.total == 1
-        assert pan.all_file is True
-        assert pan.list == [{"FileId": 2}]
 
 
 class TestTokenRefresh:
@@ -362,56 +350,50 @@ class TestShare:
 
 
 class TestDeleteFile:
-    def test_delete_by_num(self, pan):
-        pan.list = [{"FileName": "a.txt", "FileId": 1, "Type": 0, "Size": 100, "Etag": "x", "S3KeyFlag": "y"}]
-        resp = _mock_response(200, {"code": 0, "message": "ok"})
-
-        with patch.object(pan.session, "post", return_value=resp) as mock_post:
-            pan.delete_file(0)
-            mock_post.assert_called_once()
-
-    def test_delete_invalid_num(self, pan):
-        with pytest.raises(IndexError):
-            pan.delete_file(999)
-
-    def test_delete_non_digit_string(self, pan):
-        with pytest.raises(ValueError):
-            pan.delete_file("abc")
-
-    def test_delete_accepts_detail_dict_without_shared_list(self, pan):
+    def test_delete_by_detail_dict(self, pan):
         file_detail = {"FileId": 1, "Type": 0, "FileName": "a.txt"}
         resp = _mock_response(200, {"code": 0, "message": "ok"})
 
         with patch.object(pan.session, "post", return_value=resp) as mock_post:
-            pan.delete_file(file_detail, by_num=False)
+            pan.delete_file(file_detail)
+            mock_post.assert_called_once()
+
+    def test_delete_accepts_detail_dict(self, pan):
+        file_detail = {"FileId": 1, "Type": 0, "FileName": "a.txt"}
+        resp = _mock_response(200, {"code": 0, "message": "ok"})
+
+        with patch.object(pan.session, "post", return_value=resp) as mock_post:
+            pan.delete_file(file_detail)
 
         mock_post.assert_called_once()
 
 
 class TestMkdir:
     def test_mkdir_new_folder(self, pan):
-        pan.list = []
-        resp = _mock_response(200, {
+        getdir_resp = _mock_response(200, {"code": 0, "data": {"InfoList": [], "Total": 0}, "message": "ok"})
+        create_resp = _mock_response(200, {
             "code": 0, "data": {"FileId": 42, "Info": {"FileId": 42}}, "message": "ok"
         })
 
-        with patch.object(pan.session, "post", return_value=resp):
-            result = pan.mkdir("new_folder")
-            assert result == 42
+        with patch.object(pan, "get_dir_by_id", return_value=(0, [])):
+            with patch.object(pan.session, "post", return_value=create_resp):
+                result = pan.mkdir("new_folder")
+                assert result == 42
 
     def test_mkdir_existing_folder(self, pan):
-        pan.list = [{"FileName": "existing", "FileId": 10, "Type": 1}]
+        existing = [{"FileName": "existing", "FileId": 10, "Type": 1}]
 
-        result = pan.mkdir("existing")
-        assert result == 10
+        with patch.object(pan, "get_dir_by_id", return_value=(0, existing)):
+            result = pan.mkdir("existing")
+            assert result == 10
 
     def test_mkdir_api_failure(self, pan):
-        pan.list = []
         resp = _mock_response(200, {"code": -1, "message": "创建失败"})
 
-        with patch.object(pan.session, "post", return_value=resp):
-            with pytest.raises(RuntimeError, match="创建目录 'fail_folder' 失败"):
-                pan.mkdir("fail_folder")
+        with patch.object(pan, "get_dir_by_id", return_value=(0, [])):
+            with patch.object(pan.session, "post", return_value=resp):
+                with pytest.raises(RuntimeError, match="创建目录 'fail_folder' 失败"):
+                    pan.mkdir("fail_folder")
 
 
 class TestFolderUploadPlan:
@@ -639,7 +621,7 @@ class TestUploadFileStream:
             pan,
             "_api_request",
             side_effect=[upload_res, init_res, get_link_res, ok_res, ok_res, ok_res],
-        ), patch("src.app.common.api.requests.put", return_value=put_res), \
+        ), patch.object(pan.session, "put", return_value=put_res), \
              patch("src.app.common.api.Database.instance") as mock_db:
             mock_db.return_value.get_config.return_value = 1
             pan.upload_file_stream(str(local_file), parent_id=999, signals=_Signals())
@@ -679,7 +661,7 @@ class TestUploadFileStream:
             "_api_request",
             side_effect=[server_parts_res, init_res, get_link_res, ok_res, ok_res, ok_res],
         ), \
-             patch("src.app.common.api.requests.put", return_value=put_res) as mock_put, \
+             patch.object(pan.session, "put", return_value=put_res) as mock_put, \
              patch("src.app.common.api.Database.instance") as mock_db:
             mock_db.return_value.get_config.return_value = 1
 
@@ -719,7 +701,7 @@ class TestUploadFileStream:
             "_api_request",
             side_effect=[server_parts_res, init_res, get_link_res, ok_res, ok_res, ok_res],
         ), \
-             patch("src.app.common.api.requests.put", return_value=put_res) as mock_put, \
+             patch.object(pan.session, "put", return_value=put_res) as mock_put, \
              patch("src.app.common.api.Database.instance") as mock_db:
             mock_db.return_value.get_config.return_value = 1
 
@@ -791,7 +773,7 @@ class TestUploadFileStream:
                 ok_res,
                 ok_res,
             ],
-        ), patch("src.app.common.api.requests.put", return_value=put_res) as mock_put, \
+        ), patch.object(pan.session, "put", return_value=put_res) as mock_put, \
              patch("src.app.common.api.Database.instance") as mock_db, \
              patch("src.app.common.api.time.sleep") as mock_sleep:
             mock_db.return_value.get_config.return_value = 1
@@ -823,7 +805,6 @@ class TestUploadFileStream:
 
         mock_delete.assert_called_once_with(
             {"FileId": 101, "Type": 1, "FileName": "资料"},
-            by_num=False,
         )
 
 

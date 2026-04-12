@@ -28,6 +28,21 @@ def get_download_part_size() -> int:
 
 CURRENT_SCHEMA_VERSION = 4
 
+_DOWNLOAD_TASK_COLUMNS = frozenset({
+    "account_name", "file_name", "file_id", "file_type",
+    "file_size", "save_path", "current_dir_id", "etag", "s3key_flag",
+    "status", "progress", "error", "supports_resume", "metadata_version",
+    "created_at", "updated_at",
+})
+
+_UPLOAD_TASK_COLUMNS = frozenset({
+    "account_name", "file_name", "file_size", "local_path",
+    "target_dir_id", "status", "progress", "error", "bucket",
+    "storage_node", "upload_key", "upload_id_s3", "up_file_id",
+    "total_parts", "block_size", "etag", "file_mtime",
+    "delete_requested", "created_at", "updated_at",
+})
+
 
 def _get_db_path():
     from .config import CONFIG_DIR
@@ -67,10 +82,12 @@ class Database:
     def __init__(self, db_path: Path):
         self._db_path = db_path
         self._lock = threading.RLock()
+        self._closed = False
         self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._create_tables()
         self._migrate()
         self._init_defaults()
@@ -87,14 +104,30 @@ class Database:
 
     @classmethod
     def reset(cls):
+        """关闭当前数据库连接并清除单例引用。
+
+        仅在确定无其他线程使用数据库时调用（如测试 teardown）。
+        """
         global _db_instance
+        conn = None
         with _db_lock:
             if _db_instance is not None:
-                try:
-                    _db_instance._conn.close()
-                except Exception:
-                    pass
+                inst = _db_instance
+                with inst._lock:
+                    inst._closed = True
+                    conn = inst._conn
+                    inst._conn = None  # 解除引用，防止旧引用访问
                 _db_instance = None
+        # 锁外关闭连接，减少锁持有时间
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    def _check_closed(self):
+        if self._closed:
+            raise RuntimeError("Database connection is closed")
 
     def _create_tables(self):
         self._conn.executescript(f"""
@@ -165,55 +198,62 @@ class Database:
                 FOREIGN KEY (task_id) REFERENCES upload_tasks(task_id)
                     ON DELETE CASCADE
             );
+            CREATE INDEX IF NOT EXISTS idx_download_tasks_account
+                ON download_tasks(account_name);
+            CREATE INDEX IF NOT EXISTS idx_upload_tasks_account
+                ON upload_tasks(account_name);
         """)
 
     def _migrate(self):
         """基于 PRAGMA user_version 的 schema 迁移。"""
         version = self._conn.execute("PRAGMA user_version").fetchone()[0]
         if version < CURRENT_SCHEMA_VERSION:
-            if version < 2:
-                # autoLogin --> rememberPassword + stayLoggedIn
-                old_row = self._conn.execute(
-                    "SELECT value FROM config WHERE key = 'autoLogin'"
-                ).fetchone()
-                if old_row:
-                    try:
-                        was_auto = json.loads(old_row[0])
-                    except (json.JSONDecodeError, ValueError):
-                        was_auto = False
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                        ("rememberPassword", json.dumps(bool(was_auto))),
-                    )
-                    self._conn.execute(
-                        "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
-                        ("stayLoggedIn", json.dumps(True)),
-                    )
-                    self._conn.execute("DELETE FROM config WHERE key = 'autoLogin'")
+            self._conn.execute("BEGIN")
+            try:
+                if version < 2:
+                    # autoLogin --> rememberPassword + stayLoggedIn
+                    old_row = self._conn.execute(
+                        "SELECT value FROM config WHERE key = 'autoLogin'"
+                    ).fetchone()
+                    if old_row:
+                        try:
+                            was_auto = json.loads(old_row[0])
+                        except (json.JSONDecodeError, ValueError):
+                            was_auto = False
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                            ("rememberPassword", json.dumps(bool(was_auto))),
+                        )
+                        self._conn.execute(
+                            "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
+                            ("stayLoggedIn", json.dumps(True)),
+                        )
+                        self._conn.execute("DELETE FROM config WHERE key = 'autoLogin'")
+                if version < 3:
+                    columns = {
+                        row[1]
+                        for row in self._conn.execute("PRAGMA table_info(upload_tasks)").fetchall()
+                    }
+                    if "delete_requested" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE upload_tasks ADD COLUMN delete_requested "
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                if version < 4:
+                    columns = {
+                        row[1]
+                        for row in self._conn.execute("PRAGMA table_info(upload_tasks)").fetchall()
+                    }
+                    if "file_mtime" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE upload_tasks ADD COLUMN file_mtime "
+                            "REAL NOT NULL DEFAULT 0"
+                        )
                 self._conn.commit()
-            if version < 3:
-                columns = {
-                    row[1]
-                    for row in self._conn.execute("PRAGMA table_info(upload_tasks)").fetchall()
-                }
-                if "delete_requested" not in columns:
-                    self._conn.execute(
-                        "ALTER TABLE upload_tasks ADD COLUMN delete_requested "
-                        "INTEGER NOT NULL DEFAULT 0"
-                    )
-                self._conn.commit()
-            if version < 4:
-                columns = {
-                    row[1]
-                    for row in self._conn.execute("PRAGMA table_info(upload_tasks)").fetchall()
-                }
-                if "file_mtime" not in columns:
-                    self._conn.execute(
-                        "ALTER TABLE upload_tasks ADD COLUMN file_mtime "
-                        "REAL NOT NULL DEFAULT 0"
-                    )
-                self._conn.commit()
-            self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _init_defaults(self):
         """首次创建时写入默认配置。"""
@@ -249,15 +289,20 @@ class Database:
 
     def get_config(self, key: str, default=None):
         with self._lock:
+            self._check_closed()
             row = self._conn.execute(
                 "SELECT value FROM config WHERE key = ?", (key,)
             ).fetchone()
         if row is None:
             return default
-        return json.loads(row[0])
+        try:
+            return json.loads(row[0])
+        except (json.JSONDecodeError, ValueError):
+            return default
 
     def set_config(self, key: str, value) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
                 (key, json.dumps(value)),
@@ -266,6 +311,7 @@ class Database:
 
     def set_many_config(self, items: dict) -> None:
         with self._lock:
+            self._check_closed()
             for key, value in items.items():
                 self._conn.execute(
                     "INSERT OR REPLACE INTO config (key, value) VALUES (?, ?)",
@@ -275,14 +321,22 @@ class Database:
 
     def get_all_config(self) -> dict:
         with self._lock:
+            self._check_closed()
             rows = self._conn.execute("SELECT key, value FROM config").fetchall()
-        return {row[0]: json.loads(row[1]) for row in rows}
+        result = {}
+        for row in rows:
+            try:
+                result[row[0]] = json.loads(row[1])
+            except (json.JSONDecodeError, ValueError):
+                pass
+        return result
 
     # ---- Download tasks ----
 
     def save_download_task(self, task: dict) -> None:
         now = time.time()
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 """INSERT INTO download_tasks
                 (resume_id, account_name, file_name, file_id, file_type,
@@ -323,6 +377,7 @@ class Database:
 
     def get_download_task(self, resume_id: str) -> dict | None:
         with self._lock:
+            self._check_closed()
             row = self._conn.execute(
                 "SELECT * FROM download_tasks WHERE resume_id = ?", (resume_id,)
             ).fetchone()
@@ -332,6 +387,7 @@ class Database:
 
     def get_download_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
+            self._check_closed()
             if account_name:
                 rows = self._conn.execute(
                     "SELECT * FROM download_tasks WHERE account_name = ?",
@@ -344,10 +400,14 @@ class Database:
     def update_download_task(self, resume_id: str, **fields) -> None:
         if not fields:
             return
+        unknown = set(fields) - _DOWNLOAD_TASK_COLUMNS
+        if unknown:
+            raise ValueError(f"Unknown download task columns: {unknown}")
         fields["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [resume_id]
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 f"UPDATE download_tasks SET {set_clause} WHERE resume_id = ?",
                 values,
@@ -356,6 +416,7 @@ class Database:
 
     def delete_download_task(self, resume_id: str) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 "DELETE FROM download_tasks WHERE resume_id = ?", (resume_id,)
             )
@@ -363,8 +424,9 @@ class Database:
 
     # ---- Download parts ----
 
-    def record_download_part(self, resume_id: str, part: dict) -> None:
+    def record_download_part(self, resume_id: str, part: dict, *, commit: bool = True) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 """INSERT OR REPLACE INTO download_parts
                 (resume_id, part_index, start_byte, end_byte,
@@ -376,10 +438,12 @@ class Database:
                     part.get("md5", ""),
                 ),
             )
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
 
     def remove_download_part(self, resume_id: str, part_index: int) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 "DELETE FROM download_parts WHERE resume_id = ? AND part_index = ?",
                 (resume_id, part_index),
@@ -388,6 +452,7 @@ class Database:
 
     def get_download_parts(self, resume_id: str) -> list[dict]:
         with self._lock:
+            self._check_closed()
             rows = self._conn.execute(
                 "SELECT * FROM download_parts WHERE resume_id = ? ORDER BY part_index",
                 (resume_id,),
@@ -399,6 +464,7 @@ class Database:
     def save_upload_task(self, task: dict) -> None:
         now = time.time()
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 """INSERT INTO upload_tasks
                 (task_id, account_name, file_name, file_size, local_path,
@@ -447,6 +513,7 @@ class Database:
 
     def get_upload_task(self, task_id: str) -> dict | None:
         with self._lock:
+            self._check_closed()
             row = self._conn.execute(
                 "SELECT * FROM upload_tasks WHERE task_id = ?", (task_id,)
             ).fetchone()
@@ -456,6 +523,7 @@ class Database:
 
     def get_upload_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
+            self._check_closed()
             if account_name:
                 rows = self._conn.execute(
                     "SELECT * FROM upload_tasks WHERE account_name = ?",
@@ -468,10 +536,14 @@ class Database:
     def update_upload_task(self, task_id: str, **fields) -> None:
         if not fields:
             return
+        unknown = set(fields) - _UPLOAD_TASK_COLUMNS
+        if unknown:
+            raise ValueError(f"Unknown upload task columns: {unknown}")
         fields["updated_at"] = time.time()
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         values = list(fields.values()) + [task_id]
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 f"UPDATE upload_tasks SET {set_clause} WHERE task_id = ?",
                 values,
@@ -480,6 +552,7 @@ class Database:
 
     def delete_upload_task(self, task_id: str) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 "DELETE FROM upload_tasks WHERE task_id = ?", (task_id,)
             )
@@ -487,18 +560,21 @@ class Database:
 
     # ---- Upload parts ----
 
-    def record_upload_part(self, task_id: str, part_index: int, etag: str = "") -> None:
+    def record_upload_part(self, task_id: str, part_index: int, etag: str = "", *, commit: bool = True) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 """INSERT OR REPLACE INTO upload_parts
                 (task_id, part_index, etag, uploaded)
                 VALUES (?, ?, ?, 1)""",
                 (task_id, part_index, etag),
             )
-            self._conn.commit()
+            if commit:
+                self._conn.commit()
 
     def delete_upload_parts(self, task_id: str) -> None:
         with self._lock:
+            self._check_closed()
             self._conn.execute(
                 "DELETE FROM upload_parts WHERE task_id = ?", (task_id,)
             )
@@ -506,9 +582,16 @@ class Database:
 
     def get_upload_parts(self, task_id: str) -> list[dict]:
         with self._lock:
+            self._check_closed()
             rows = self._conn.execute(
                 "SELECT task_id, part_index, etag, uploaded FROM upload_parts "
                 "WHERE task_id = ? ORDER BY part_index",
                 (task_id,),
             ).fetchall()
         return [dict(row) for row in rows]
+
+    def flush(self) -> None:
+        """手动提交未提交的事务（配合 record_*_part(commit=False) 使用）。"""
+        with self._lock:
+            self._check_closed()
+            self._conn.commit()

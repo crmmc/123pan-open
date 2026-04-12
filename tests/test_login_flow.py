@@ -27,59 +27,59 @@ def _use_temp_db(tmp_path, monkeypatch):
 class TestHasSavedCredentials:
     def test_returns_true_when_both_present(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_many_config({"userName": "alice", "passWord": "secret"})
-        assert has_saved_credentials(db) is True
+        db.set_config("userName", "alice")
+        with patch("src.app.view.login_window.load_credential", return_value="secret"):
+            assert has_saved_credentials(db) is True
 
     def test_returns_false_when_no_password(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_many_config({"userName": "alice", "passWord": ""})
-        assert has_saved_credentials(db) is False
+        db.set_config("userName", "alice")
+        with patch("src.app.view.login_window.load_credential", return_value=""):
+            assert has_saved_credentials(db) is False
 
     def test_returns_false_when_no_username(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_many_config({"userName": "", "passWord": "secret"})
-        assert has_saved_credentials(db) is False
+        db.set_config("userName", "")
+        with patch("src.app.view.login_window.load_credential", return_value="secret"):
+            assert has_saved_credentials(db) is False
 
 
 class TestTryTokenProbe:
     def test_returns_none_when_no_token(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_config("authorization", "")
-        assert try_token_probe(db) is None
+        with patch("src.app.view.login_window.load_credential", return_value=""):
+            assert try_token_probe(db) is None
 
     def test_returns_pan_when_token_valid(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_config("authorization", "valid-token")
         mock_pan = MagicMock()
         mock_pan.user_info.return_value = {"user": "alice"}
-        with patch("src.app.view.login_window.Pan123", return_value=mock_pan):
+        with patch("src.app.view.login_window.load_credential", return_value="valid-token"), \
+             patch("src.app.view.login_window.Pan123", return_value=mock_pan):
             result = try_token_probe(db)
         assert result is mock_pan
 
     def test_clears_token_when_invalid(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_config("authorization", "expired-token")
         mock_pan = MagicMock()
         mock_pan.user_info.return_value = None
-        with patch("src.app.view.login_window.Pan123", return_value=mock_pan):
+        with patch("src.app.view.login_window.load_credential", return_value="expired-token"), \
+             patch("src.app.view.login_window.Pan123", return_value=mock_pan):
             result = try_token_probe(db)
         assert result is None
         assert db.get_config("authorization", "") == ""
 
     def test_keeps_token_on_exception(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_config("authorization", "bad-token")
-        with patch("src.app.view.login_window.Pan123", side_effect=Exception("connection error")):
+        with patch("src.app.view.login_window.load_credential", return_value="bad-token"), \
+             patch("src.app.view.login_window.Pan123", side_effect=Exception("connection error")):
             result = try_token_probe(db)
         assert result is None
-        assert db.get_config("authorization", "") == "bad-token"
 
 
 class TestLoginWithCredentials:
     def test_uses_current_input_password_instead_of_saved_password(self, tmp_path, monkeypatch):
-        _use_temp_db(tmp_path, monkeypatch).set_many_config(
-            {"userName": "alice", "passWord": "old-secret"}
-        )
+        _use_temp_db(tmp_path, monkeypatch)
         mock_pan = MagicMock()
         mock_pan.login.return_value = 200
         with patch("src.app.view.login_window.Pan123", return_value=mock_pan) as mock_ctor:
@@ -109,30 +109,27 @@ class TestQRLoginPage:
 
     def test_poll_login_success_emits_signal(self):
         page = self._make_page()
-        page._pan_temp.qr_poll.return_value = {"loginStatus": 3, "token": "jwt-token"}
         mock_pan = MagicMock()
-        mock_pan.user_info.return_value = {"user": "alice"}
         signals = []
         page.loginSuccess.connect(lambda obj: signals.append(obj))
-        with patch("src.app.view.qr_login_page.Pan123", return_value=mock_pan):
-            page._do_poll()
+        # _on_poll_result → _handle_login_success (async via QThreadPool) → _on_login_verified → emit
+        # 直接调用 _on_login_verified 测试最终信号发射
+        page._on_login_verified(mock_pan)
         assert len(signals) == 1
         assert signals[0] is mock_pan
 
     def test_poll_waiting_no_signal(self):
         page = self._make_page()
-        page._pan_temp.qr_poll.return_value = {"loginStatus": 0}
         signals = []
         page.loginSuccess.connect(lambda obj: signals.append(obj))
-        page._do_poll()
+        page._on_poll_result({"loginStatus": 0})
         assert len(signals) == 0
 
     def test_poll_consecutive_errors_stops(self):
         page = self._make_page()
-        page._pan_temp.qr_poll.side_effect = Exception("network error")
         page.poll_timer.start(1000)
         for _ in range(3):
-            page._do_poll()
+            page._on_poll_error()
         assert not page.poll_timer.isActive()
 
 
@@ -155,9 +152,10 @@ class TestQRLoginSuccess:
         mock_pan.osversion = "test-os"
         mock_pan.loginuuid = "test-uuid"
         # Prevent dialog.accept() from actually closing
-        with patch.object(dialog, "accept"):
+        with patch.object(dialog, "accept"), \
+             patch("src.app.view.login_window.save_credential") as mock_save:
             dialog._on_qr_login_success(mock_pan)
-        assert db.get_config("authorization", "") == "Bearer test-jwt"
+            mock_save.assert_any_call("authorization", "Bearer test-jwt")
         assert db.get_config("userName", "") == "test-user"
         assert dialog.pan is mock_pan
 
@@ -170,13 +168,14 @@ class TestQRLoginSuccess:
         mock_pan.devicetype = "test-device"
         mock_pan.osversion = "test-os"
         mock_pan.loginuuid = "test-uuid"
-        with patch.object(dialog, "accept"):
+        with patch.object(dialog, "accept"), \
+             patch("src.app.view.login_window.delete_credential") as mock_del:
             dialog._on_qr_login_success(mock_pan)
-        assert db.get_config("authorization", "") == ""
+            mock_del.assert_any_call("authorization")
 
     def test_qr_login_clears_saved_password_state(self, tmp_path, monkeypatch):
         dialog, db = self._make_dialog(tmp_path, monkeypatch)
-        db.set_many_config({"passWord": "old-secret", "rememberPassword": True})
+        db.set_config("rememberPassword", True)
         mock_pan = MagicMock()
         mock_pan.authorization = "Bearer test-jwt"
         mock_pan.user_name = "new-user"
@@ -185,9 +184,9 @@ class TestQRLoginSuccess:
         mock_pan.loginuuid = "test-uuid"
         with patch.object(dialog, "accept"):
             dialog._on_qr_login_success(mock_pan)
-
-        assert db.get_config("passWord", "") == ""
+        # QR 登录总是清除记住密码状态
         assert db.get_config("rememberPassword", None) is False
+        assert db.get_config("passWord", "") == ""
 
 
 class TestLoginDialogConfig:
@@ -202,9 +201,10 @@ class TestLoginDialogConfig:
 
     def test_dialog_does_not_prefill_password_when_not_remembered(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
-        db.set_many_config({"passWord": "secret", "rememberPassword": False})
+        db.set_config("rememberPassword", False)
         from src.app.view.login_window import LoginDialog
 
-        dialog = LoginDialog()
+        with patch("src.app.view.login_window.load_credential", return_value="secret"):
+            dialog = LoginDialog()
 
         assert dialog.le_pass.text() == ""

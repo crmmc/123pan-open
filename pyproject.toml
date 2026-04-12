@@ -11,6 +11,7 @@ dependencies = [
     "zstandard>=0.25.0",
     "qrcode>=8.0",
     "Pillow>=11.0.0",
+    "keyring>=25.0.0",
 ]
 
 [project.optional-dependencies]
@@ -22,4 +23,6 @@ test = ["pytest>=8.0.0"]
 url = "https://mirrors.aliyun.com/pypi/simple/"
 
 [dependency-groups]
-dev = []
+dev = [
+    "pytest-cov>=7.1.0",
+]

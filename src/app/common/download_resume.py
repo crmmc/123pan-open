@@ -2,6 +2,7 @@ import errno
 import hashlib
 import io
 import math
+import os
 import queue
 import shutil
 import threading
@@ -10,6 +11,7 @@ import uuid
 from pathlib import Path
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from .config import CONFIG_DIR
 from .concurrency import (
@@ -26,9 +28,12 @@ IO_CHUNK_SIZE = 1024 * 1024
 MAX_PART_QUEUE_ATTEMPTS = 3
 DEFAULT_MAX_DOWNLOAD_THREADS = 1
 
+_dl_session = requests.Session()
+_dl_session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=1))
+
 
 def build_resume_id(account_name, file_id, save_path):
-    raw = f"{account_name}|{file_id}|{Path(save_path)}"
+    raw = f"{account_name}|{file_id}|{Path(save_path).resolve()}"
     return hashlib.md5(raw.encode("utf-8")).hexdigest()
 
 
@@ -68,7 +73,24 @@ def _replace_output_file(src_path: Path, out_path: Path) -> Path:
     except OSError as exc:
         if exc.errno != errno.EXDEV:
             raise
-        shutil.move(str(src_path), str(out_path))
+        # 跨盘：先写临时文件再 rename，避免直接覆盖目标
+        tmp_path = out_path.with_suffix(out_path.suffix + ".tmp")
+        try:
+            shutil.copy2(str(src_path), str(tmp_path))
+            src_size = src_path.stat().st_size
+            tmp_size = tmp_path.stat().st_size
+            if tmp_size != src_size:
+                tmp_path.unlink(missing_ok=True)
+                raise OSError(f"跨盘拷贝大小不匹配: 预期 {src_size}, 实际 {tmp_size}")
+            tmp_path.replace(out_path)
+            src_path.unlink(missing_ok=True)
+        except BaseException:
+            if tmp_path.exists():
+                try:
+                    tmp_path.unlink()
+                except OSError:
+                    pass
+            raise
     return out_path
 
 
@@ -182,7 +204,7 @@ def _validate_existing_parts(resume_id, part_plan):
             try:
                 p_path.unlink()
             except OSError:
-                pass
+                logger.warning("删除大小不匹配的分片失败: %s", p_path)
             db.remove_download_part(resume_id, index)
             continue
         actual_hash = _compute_md5(p_path)
@@ -190,7 +212,7 @@ def _validate_existing_parts(resume_id, part_plan):
             try:
                 p_path.unlink()
             except OSError:
-                pass
+                logger.warning("删除MD5不匹配的分片失败: %s", p_path)
             db.remove_download_part(resume_id, index)
             continue
         reusable_indexes.append(index)
@@ -206,7 +228,7 @@ def _validate_existing_parts(resume_id, part_plan):
                 try:
                     entry.unlink()
                 except OSError:
-                    pass
+                    logger.warning("删除合并残留文件失败: %s", entry)
                 continue
             if name.startswith("part"):
                 try:
@@ -217,7 +239,7 @@ def _validate_existing_parts(resume_id, part_plan):
                     try:
                         entry.unlink()
                     except OSError:
-                        pass
+                        logger.warning("删除孤立分片失败: %s", entry)
 
     return downloaded, reusable_indexes
 
@@ -253,30 +275,42 @@ def _probe_download(redirect_url):
     total = 0
     accept_ranges = False
     try:
-        head = requests.head(redirect_url, allow_redirects=True, timeout=30)
+        head = _dl_session.head(redirect_url, allow_redirects=True, timeout=30)
         if head.status_code in RATE_LIMIT_CODES:
-            return 0, False
+            logger.debug("下载探测 HEAD 被限流: %s", head.status_code)
+            return 0, False, False
         head.raise_for_status()
         total = int(head.headers.get("Content-Length", 0) or 0)
         accept_ranges = head.headers.get("Accept-Ranges", "").lower() == "bytes"
+    except requests.ConnectionError as exc:
+        logger.debug("下载探测连接失败: %s", exc)
+        return 0, False, True
+    except requests.Timeout:
+        logger.debug("下载探测超时")
+        return 0, False, True
     except requests.RequestException:
         try:
-            with requests.get(redirect_url, stream=True, timeout=30) as r:
+            with _dl_session.get(redirect_url, stream=True, timeout=30) as r:
                 if r.status_code in RATE_LIMIT_CODES:
-                    return 0, False
+                    logger.debug("下载探测 GET 被限流: %s", r.status_code)
+                    return 0, False, False
                 r.raise_for_status()
                 total = int(r.headers.get("Content-Length", 0) or 0)
                 accept_ranges = r.headers.get("Accept-Ranges", "").lower() == "bytes"
-        except requests.RequestException:
-            return 0, False
-    return total, accept_ranges
+        except requests.RequestException as exc:
+            logger.debug("下载探测 GET 失败: %s", exc)
+            return 0, False, True
+    except Exception as e:
+        logger.warning("下载探测失败: %s", e)
+        return 0, False, True
+    return total, accept_ranges, False
 
 
 # ---- download part ----
 
 def _download_part(
-    redirect_url, part, resume_id, aggregator, signals, total, task,
-    first_byte_callback=None,
+    url_holder, part, resume_id, aggregator, signals, total, task,
+    first_byte_callback=None, refresh_url_fn=None,
 ):
     index = int(part["index"])
     start = int(part["start"])
@@ -297,15 +331,23 @@ def _download_part(
         attempt_downloaded = 0
         stop_result = _get_stop_result(task)
         if stop_result:
-            # 丢弃内存 buffer，磁盘无半截文件
-            if attempt_downloaded:
-                aggregator.record(-attempt_downloaded)
             return stop_result
         try:
             md5 = hashlib.md5()
             buf.seek(0)
             buf.truncate()
-            with requests.get(redirect_url, headers=headers, stream=True, timeout=(5, 600)) as resp:
+            with _dl_session.get(url_holder[0], headers=headers, stream=True, timeout=(5, 600)) as resp:
+                if resp.status_code == 403:
+                    if refresh_url_fn:
+                        try:
+                            new_url = refresh_url_fn()
+                            if new_url and not isinstance(new_url, int):
+                                url_holder[0] = new_url
+                                logger.debug("分片 %d URL 已刷新，重试", index)
+                                continue
+                        except Exception as exc:
+                            logger.warning("分片 %d 刷新 URL 失败: %s", index, exc)
+                    return "url_expired"
                 if resp.status_code in RATE_LIMIT_CODES:
                     return "rate_limited"
                 resp.raise_for_status()
@@ -337,7 +379,7 @@ def _download_part(
                 "index": index, "start": start, "end": end,
                 "expected_size": int(part["expected_size"]),
                 "actual_size": actual_size, "md5": md5.hexdigest(),
-            })
+            }, commit=False)
             part["attempt"] = 0
             return "ok"
         except (requests.RequestException, RuntimeError, OSError) as exc:
@@ -351,6 +393,7 @@ def _download_part(
                     part_path.unlink()
                 except OSError:
                     logger.warning("删除失败的分片文件失败: %s", part_path)
+            logger.warning("分片 %d 下载失败 (attempt=%d/%d): %s", index, attempt, max_retries, exc)
             if attempt >= max_retries:
                 queue_attempt += 1
                 part["attempt"] = queue_attempt
@@ -364,7 +407,7 @@ def _download_part(
 
 # ---- multi-part download ----
 
-def _download_with_resume(redirect_url, out_path, total, signals, task, resume_task, speed_tracker):
+def _download_with_resume(redirect_url, out_path, total, signals, task, resume_task, speed_tracker, refresh_url_fn=None):
     resume_id = resume_task.resume_id
     part_plan = _build_parts(total)
     _prepare_resume_metadata(out_path, total, resume_task, True)
@@ -381,13 +424,16 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
             part_queue.put(part)
 
     max_workers = min(
-        max(1, int(Database.instance().get_config("maxDownloadThreads", DEFAULT_MAX_DOWNLOAD_THREADS))),
+        max(1, _safe_int(Database.instance().get_config("maxDownloadThreads", DEFAULT_MAX_DOWNLOAD_THREADS))),
         16,
     )
+    url_holder = [redirect_url]
     active_workers = [0]
     allowed_workers = [1]
     failed = [False]
     rate_limit_count = [0]
+    url_expired_count = [0]
+    parts_since_commit = [0]
     progress_lock = threading.Lock()
     worker_feedback = threading.Event()
     probe_thread_name = [None]
@@ -426,11 +472,17 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                     return
 
                 result = _download_part(
-                    redirect_url, part, resume_id, aggregator,
+                    url_holder, part, resume_id, aggregator,
                     signals, total, task,
                     first_byte_callback=_try_promote_probe,
+                    refresh_url_fn=refresh_url_fn,
                 )
                 if result == "ok":
+                    url_expired_count[0] = 0
+                    parts_since_commit[0] += 1
+                    if parts_since_commit[0] >= 10:
+                        Database.instance().flush()
+                        parts_since_commit[0] = 0
                     _save_download_status(resume_id, total, aggregator.cumulative, "下载中")
                     worker_feedback.set()
                     continue
@@ -461,6 +513,21 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
                             allowed_workers[0] = max(1, allowed_workers[0] - 1)
                     worker_feedback.set()
                     return  # worker 退出，调度器补充
+                if result == "url_expired":
+                    url_expired_count[0] += 1
+                    part_queue.put(part)
+                    if url_expired_count[0] >= 3:
+                        logger.error("连续 %d 次刷新 URL 失败，终止下载", url_expired_count[0])
+                        failed[0] = True
+                        return
+                    with progress_lock:
+                        if threading.current_thread().name == probe_thread_name[0]:
+                            probe_thread_name[0] = None
+                        else:
+                            allowed_workers[0] = max(1, allowed_workers[0] - 1)
+                    worker_feedback.set()
+                    time.sleep(2)
+                    return
                 failed[0] = True
                 worker_feedback.set()
                 return
@@ -494,6 +561,9 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
     aggregator.emit_final()
     _notify_conn_info(signals, 0, max_workers)
 
+    # 统一提交所有分片记录（配合 record_download_part(commit=False)）
+    Database.instance().flush()
+
     if _is_task_paused(task):
         _save_download_status(resume_id, total, aggregator.cumulative, "已暂停", "")
         _notify_status(signals, "已暂停")
@@ -522,10 +592,13 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         try:
             merged_path.unlink()
         except OSError:
-            pass
+            logger.warning("删除旧合并文件失败: %s", merged_path)
     try:
         with open(merged_path, "wb") as output:
             for part in part_plan:
+                stop_result = _get_stop_result(task)
+                if stop_result:
+                    break
                 pp = get_part_path(resume_id, int(part["index"]))
                 with open(pp, "rb") as pf:
                     while True:
@@ -542,7 +615,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
         try:
             merged_path.unlink()
         except OSError:
-            pass
+            logger.warning("暂停时删除合并文件失败: %s", merged_path)
         return "已暂停"
 
     if _is_task_cancelled(task):
@@ -562,13 +635,15 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
             raise RuntimeError("整文件校验失败，需要重新下载")
     elif total and merged_path.stat().st_size != total:
         # M13: etag 不可用时兜底大小校验
+        actual_size = merged_path.stat().st_size
         cleanup_temp_dir(resume_id)
         Database.instance().delete_download_task(resume_id)
-        raise RuntimeError(f"文件大小不匹配: 预期 {total}, 实际 {merged_path.stat().st_size}")
+        raise RuntimeError(f"文件大小不匹配: 预期 {total}, 实际 {actual_size}")
 
     # 移动到目标位置
     out_path.parent.mkdir(parents=True, exist_ok=True)
     _replace_output_file(merged_path, out_path)
+    Database.instance().update_download_task(resume_id, status="已完成")
     cleanup_temp_dir(resume_id)
     return out_path
 
@@ -581,9 +656,9 @@ def _download_single_stream(redirect_url, out_path, total, signals, task, speed_
     temp_path = temp_dir / f"{uuid.uuid4().hex}_{out_path.name}"
     _notify_status(signals, "下载中")
     try:
-        with requests.get(redirect_url, stream=True, timeout=30) as response:
+        with _dl_session.get(redirect_url, stream=True, timeout=(5, 600)) as response:
             if response.status_code in RATE_LIMIT_CODES:
-                return "rate_limited"
+                raise RuntimeError("下载被限流，请稍后重试")
             response.raise_for_status()
             done = 0
             last_t = 0.0
@@ -634,17 +709,49 @@ def _download_single_stream(redirect_url, out_path, total, signals, task, speed_
 
 # ---- entry point ----
 
+def _cleanup_stale_single_stream_files(max_age_hours=24):
+    """清理 single_stream 目录中超过 max_age_hours 小时的临时文件。"""
+    stale_dir = CONFIG_DIR / "tmp" / "single_stream"
+    if not stale_dir.exists():
+        return
+    try:
+        cutoff = time.time() - max_age_hours * 3600
+        for entry in stale_dir.iterdir():
+            try:
+                if entry.is_file() and entry.stat().st_mtime < cutoff:
+                    entry.unlink(missing_ok=True)
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
 def stream_download_from_url(
     redirect_url, out_path, signals=None, task=None,
     overwrite=False, resume_task=None, speed_tracker=None,
+    refresh_url_fn=None,
 ):
     out_path = Path(out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
+    if not os.access(str(out_path.parent), os.W_OK):
+        raise PermissionError(f"目标目录不可写: {out_path.parent}")
+
+    # 清理上次崩溃残留的 .tmp 文件
+    tmp_residual = out_path.with_suffix(out_path.suffix + ".tmp")
+    if tmp_residual.exists():
+        try:
+            tmp_residual.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    _cleanup_stale_single_stream_files()
 
     if out_path.exists() and not overwrite:
         raise FileExistsError(str(out_path))
 
-    total, accept_ranges = _probe_download(redirect_url)
+    total, accept_ranges, probe_connection_failed = _probe_download(redirect_url)
+    if probe_connection_failed:
+        raise ConnectionError("下载探测失败，无法连接服务器")
     multi_part_enabled = bool(accept_ranges and total and total > MIN_PARALLEL_SIZE)
 
     if resume_task:
@@ -654,7 +761,7 @@ def stream_download_from_url(
         if multi_part_enabled:
             return _download_with_resume(
                 redirect_url, out_path, total, signals, task,
-                resume_task, speed_tracker,
+                resume_task, speed_tracker, refresh_url_fn,
             )
         return _download_single_stream(
             redirect_url, out_path, total, signals, task, speed_tracker,

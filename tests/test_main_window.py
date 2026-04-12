@@ -29,7 +29,9 @@ def _make_transfer(
 
 def test_stop_all_transfers_uses_thread_lists():
     upload_thread = MagicMock()
+    upload_thread.isRunning.return_value = False
     download_thread = MagicMock()
+    download_thread.isRunning.return_value = False
     window = MainWindow.__new__(MainWindow)
     window.transfer_interface = _make_transfer(
         upload_threads=[upload_thread],
@@ -39,9 +41,9 @@ def test_stop_all_transfers_uses_thread_lists():
     MainWindow._stop_all_transfers(window)
 
     upload_thread.cancel.assert_called_once()
-    upload_thread.wait.assert_called_once()
     download_thread.cancel.assert_called_once()
-    download_thread.wait.assert_called_once()
+    upload_thread.wait.assert_called()
+    download_thread.wait.assert_called()
 
 
 def test_stop_all_transfers_save_progress_calls_pause():
@@ -67,7 +69,7 @@ def test_stop_all_transfers_default_calls_cancel():
 
 
 def test_save_active_progress_updates_upload_task():
-    task = SimpleNamespace(status="上传中", db_task_id="abc", resume_id=None)
+    task = SimpleNamespace(status="上传中", db_task_id="abc", resume_id=None, progress=42)
     db_mock = MagicMock()
     window = MainWindow.__new__(MainWindow)
     window.transfer_interface = _make_transfer(upload_tasks=[task])
@@ -78,11 +80,11 @@ def test_save_active_progress_updates_upload_task():
             MainWindow._save_active_progress(window)
 
     assert task.status == "已暂停"
-    db_mock.update_upload_task.assert_called_once_with("abc", status="已暂停")
+    db_mock.update_upload_task.assert_called_once_with("abc", status="已暂停", progress=42)
 
 
 def test_save_active_progress_updates_download_task():
-    task = SimpleNamespace(status="下载中", db_task_id=None, resume_id="xyz")
+    task = SimpleNamespace(status="下载中", db_task_id=None, resume_id="xyz", progress=67)
     db_mock = MagicMock()
     window = MainWindow.__new__(MainWindow)
     window.transfer_interface = _make_transfer(download_tasks=[task])
@@ -92,7 +94,7 @@ def test_save_active_progress_updates_download_task():
         MainWindow._save_active_progress(window)
 
     assert task.status == "已暂停"
-    db_mock.update_download_task.assert_called_once_with("xyz", status="已暂停", error="")
+    db_mock.update_download_task.assert_called_once_with("xyz", status="已暂停", progress=67)
 
 
 def test_save_active_progress_ignores_non_active_tasks():
@@ -126,7 +128,7 @@ def test_save_active_progress_swallows_db_exception():
 
 def test_stop_all_transfers_with_save_progress_calls_save_active_progress():
     thread = MagicMock()
-    task = SimpleNamespace(status="上传中", db_task_id="sid", resume_id=None, thread=thread)
+    task = SimpleNamespace(status="上传中", db_task_id="sid", resume_id=None, thread=thread, progress=55)
     db_mock = MagicMock()
     window = MainWindow.__new__(MainWindow)
     window.transfer_interface = _make_transfer(
@@ -138,7 +140,7 @@ def test_stop_all_transfers_with_save_progress_calls_save_active_progress():
         DbCls.instance.return_value = db_mock
         MainWindow._stop_all_transfers(window, save_progress=True)
 
-    db_mock.update_upload_task.assert_called_once_with("sid", status="已暂停")
+    db_mock.update_upload_task.assert_called_once_with("sid", status="已暂停", progress=55)
 
 
 def test_stop_all_transfers_deduplicates_threads_from_tasks():
@@ -171,6 +173,7 @@ def test_stop_all_transfers_skips_none_and_seen_threads():
 
 def test_stop_all_transfers_extracts_active_threads_from_tasks():
     task_thread = MagicMock()
+    task_thread.isRunning.return_value = False
     task = SimpleNamespace(status="上传中", thread=task_thread, db_task_id=None, resume_id=None)
     window = MainWindow.__new__(MainWindow)
     window.transfer_interface = _make_transfer(
@@ -181,4 +184,4 @@ def test_stop_all_transfers_extracts_active_threads_from_tasks():
     MainWindow._stop_all_transfers(window)
 
     task_thread.cancel.assert_called_once()
-    task_thread.wait.assert_called_once()
+    task_thread.wait.assert_called()

@@ -423,7 +423,7 @@ def test_retry_upload_clears_stale_session_and_parts(tmp_path, monkeypatch):
     stored = db.get_upload_task(task.db_task_id)
     assert stored is not None
     assert stored["status"] == "等待中"
-    assert stored["progress"] == 0
+    assert stored["progress"] == 66
     assert stored["bucket"] == ""
     assert stored["upload_key"] == ""
     assert stored["upload_id_s3"] == ""

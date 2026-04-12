@@ -295,7 +295,8 @@ class SettingInterface(ScrollArea):
 
     def __onDownloadFolderCardClicked(self):
         """download folder card clicked slot"""
-        folder = QFileDialog.getExistingDirectory(self, self.tr("Choose folder"), "./")
+        current = Database.instance().get_config("defaultDownloadPath", "")
+        folder = QFileDialog.getExistingDirectory(self, self.tr("Choose folder"), current or "./")
         if not folder or Database.instance().get_config("defaultDownloadPath") == folder:
             return
         self.downloadFolderCard.setContent(folder)
@@ -308,12 +309,14 @@ class SettingInterface(ScrollArea):
     def __onRememberPasswordChanged(self, checked):
         Database.instance().set_config("rememberPassword", checked)
         if not checked:
-            Database.instance().set_config("passWord", "")
+            from ..common.credential_store import delete_credential
+            delete_credential("passWord")
 
     def __onStayLoggedInChanged(self, checked):
         Database.instance().set_config("stayLoggedIn", checked)
         if not checked:
-            Database.instance().set_config("authorization", "")
+            from ..common.credential_store import delete_credential
+            delete_credential("authorization")
 
     def __onDownloadThreadsChanged(self, value):
         Database.instance().set_config("maxDownloadThreads", value)
@@ -328,7 +331,7 @@ class SettingInterface(ScrollArea):
         Database.instance().set_config("maxConcurrentUploads", value)
 
     def __onRetryAttemptsChanged(self, index):
-        Database.instance().set_config("retryMaxAttempts", index)
+        Database.instance().set_config("retryMaxAttempts", int(self.retryAttemptsComboBox.currentText()))
 
     def __onDownloadPartSizeChanged(self, value):
         Database.instance().set_config("downloadPartSizeMB", value)

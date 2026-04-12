@@ -24,8 +24,8 @@ class _FakePan:
         self.parent_file_id = 9
         self.calls = []
 
-    def get_dir_by_id(self, file_id, save=True, all=False, limit=100):
-        self.calls.append((file_id, save, all, limit))
+    def get_dir_by_id(self, file_id, all=False, limit=100):
+        self.calls.append((file_id, all, limit))
         return 0, self.directory_items.get(file_id, [])
 
 
@@ -60,7 +60,7 @@ def test_resolve_download_file_detail_restores_pan_state_after_lookup():
     result = resolve_download_file_detail(pan, 202, current_dir_id=5)
 
     assert result == file_detail
-    assert pan.calls == [(5, False, True, 1000)]
+    assert pan.calls == [(5, True, 1000)]
     assert pan.file_page == 7
     assert pan.all_file is True
     assert pan.total == 99

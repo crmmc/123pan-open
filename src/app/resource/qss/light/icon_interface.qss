@@ -10,7 +10,7 @@ IconCard > QLabel {
 }
 
 IconCard[isSelected=true] {
-    background-color: --ThemeColorPrimary;
+    background-color: #0078D4;
 }
 
 IconCard[isSelected=true] > QLabel {

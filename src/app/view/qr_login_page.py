@@ -3,16 +3,108 @@
 import qrcode
 from PIL.ImageQt import ImageQt
 
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QRunnable, QThreadPool
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QCheckBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
 
 from ..common.api import Pan123
+from ..common.database import Database
 from ..common.log import get_logger
 
 logger = get_logger(__name__)
 
 _MAX_POLL_ERRORS = 3
+
+
+class _QRGenerateTask(QRunnable):
+    """异步生成二维码。"""
+    class _Signals(QObject):
+        finished = Signal(dict)    # 成功，返回 data
+        error = Signal(str)        # 失败，返回错误信息
+
+    def __init__(self):
+        super().__init__()
+        self.signals = self._Signals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            pan_temp = Pan123(readfile=True, user_name="", password="")
+            data = pan_temp.qr_generate()
+            data["_pan_temp"] = pan_temp
+            self.signals.finished.emit(data)
+        except Exception as e:
+            self.signals.error.emit(str(e))
+
+
+class _QRPollTask(QRunnable):
+    """异步轮询扫码状态。"""
+    class _Signals(QObject):
+        result = Signal(dict)
+        error = Signal()
+
+    def __init__(self, pan_temp, uni_id):
+        super().__init__()
+        self.signals = self._Signals()
+        self._pan_temp = pan_temp
+        self._uni_id = uni_id
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            result = self._pan_temp.qr_poll(self._uni_id)
+            self.signals.result.emit(result)
+        except Exception:
+            self.signals.error.emit()
+
+
+class _QRLoginVerifyTask(QRunnable):
+    """异步验证登录并获取用户信息。"""
+    class _Signals(QObject):
+        success = Signal(object)   # Pan123 对象
+        error = Signal(str)        # 错误信息
+
+    def __init__(self, token, scan_platform, pan_temp, uni_id):
+        super().__init__()
+        self.signals = self._Signals()
+        self._token = token
+        self._scan_platform = scan_platform
+        self._pan_temp = pan_temp
+        self._uni_id = uni_id
+        self.setAutoDelete(True)
+
+    def run(self):
+        if self._scan_platform == 4 and not self._token:
+            try:
+                wx_code = self._pan_temp.qr_wx_code(self._uni_id)
+                logger.info("微信扫码登录获取 wxCode 成功")
+                self.signals.error.emit("微信登录暂不支持，请使用 123云盘 App 扫码")
+                return
+            except Exception as e:
+                self.signals.error.emit(str(e))
+                return
+
+        if not self._token:
+            self.signals.error.emit("登录失败：未获取到凭证")
+            return
+
+        try:
+            pan = Pan123(
+                readfile=False, user_name="", password="",
+                authorization="Bearer " + self._token,
+            )
+            db = Database.instance()
+            pan.devicetype = db.get_config("deviceType", "")
+            pan.osversion = db.get_config("osVersion", "")
+            pan.loginuuid = db.get_config("loginuuid", "")
+            user_data = pan.user_info()
+            if user_data is None:
+                self.signals.error.emit("登录验证失败，请重试")
+                return
+            pan.user_name = user_data.get("Nickname", "")
+            self.signals.success.emit(pan)
+        except Exception as e:
+            self.signals.error.emit(str(e))
 
 
 class QRLoginPage(QWidget):
@@ -80,21 +172,20 @@ class QRLoginPage(QWidget):
         self.expiry_timer.timeout.connect(self._on_expired)
 
     def start_qr_flow(self):
-        """生成二维码并开始轮询。"""
+        """异步生成二维码并开始轮询。"""
         self.stop_polling()
         self.overlay.hide()
         self.status_label.setStyleSheet("QLabel { font-size: 14px; }")
         self.status_label.setText("正在获取二维码...")
 
-        try:
-            pan_temp = Pan123(readfile=True, user_name="", password="")
-            data = pan_temp.qr_generate()
-        except Exception as e:
-            logger.error(f"获取二维码失败: {e}")
-            self.status_label.setText("获取二维码失败，请重试")
-            self._show_expired_overlay()
-            return
+        task = _QRGenerateTask()
+        task.signals.finished.connect(self._on_qr_generated)
+        task.signals.error.connect(self._on_qr_generate_error)
+        QThreadPool.globalInstance().start(task)
 
+    def _on_qr_generated(self, data):
+        """二维码生成成功回调。"""
+        pan_temp = data.pop("_pan_temp", None)
         self._uni_id = data["uniID"]
         self._pan_temp = pan_temp
 
@@ -120,25 +211,43 @@ class QRLoginPage(QWidget):
         self.poll_timer.start()
         self.expiry_timer.start(60000)
 
+    def _on_qr_generate_error(self, error_msg):
+        """二维码生成失败回调。"""
+        logger.error("获取二维码失败: %s", error_msg)
+        self.status_label.setText("获取二维码失败，请重试")
+        self._show_expired_overlay()
+
     def stop_polling(self):
         """停止所有定时器。"""
         self.poll_timer.stop()
         self.expiry_timer.stop()
+        if self._pan_temp:
+            self._pan_temp.close()
+            self._pan_temp = None
 
     def _do_poll(self):
-        """轮询一次扫码状态。"""
-        try:
-            result = self._pan_temp.qr_poll(self._uni_id)
-        except Exception as e:
-            self._consecutive_errors += 1
-            if self._consecutive_errors >= _MAX_POLL_ERRORS:
-                self.stop_polling()
-                self.status_label.setStyleSheet(
-                    "QLabel { font-size: 14px; color: #CF222E; }"
-                )
-                self.status_label.setText("网络异常，请检查后重试")
-                self._show_expired_overlay()
+        """异步轮询一次扫码状态。"""
+        if not self._pan_temp or not self._uni_id:
             return
+        task = _QRPollTask(self._pan_temp, self._uni_id)
+        task.signals.result.connect(self._on_poll_result)
+        task.signals.error.connect(self._on_poll_error)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_poll_error(self):
+        """轮询网络错误回调。"""
+        self._consecutive_errors += 1
+        if self._consecutive_errors >= _MAX_POLL_ERRORS:
+            self.stop_polling()
+            self.status_label.setStyleSheet(
+                "QLabel { font-size: 14px; color: #CF222E; }"
+            )
+            self.status_label.setText("网络异常，请检查后重试")
+            self._show_expired_overlay()
+
+    def _on_poll_result(self, result):
+        """轮询结果回调。"""
+        self._consecutive_errors = 0
 
         self._consecutive_errors = 0
         status = result.get("loginStatus", -1)
@@ -165,47 +274,36 @@ class QRLoginPage(QWidget):
         elif status == 4:
             # 二维码过期
             self.stop_polling()
+            self._qr_refresh_count = getattr(self, '_qr_refresh_count', 0) + 1
+            if self._qr_refresh_count > 5:
+                self.status_label.setText("二维码已过期，请关闭后重试")
+                self._show_expired_overlay()
+                return
             self.start_qr_flow()
+        else:
+            logger.warning("未知 QR 登录状态: %s", status)
 
     def _handle_login_success(self, scan_platform, token):
-        """处理登录成功，根据扫码平台获取 token。"""
-        if scan_platform == 4 and not token:
-            # 微信扫码：需要额外请求 wx_code 换取 token
-            try:
-                wx_code = self._pan_temp.qr_wx_code(self._uni_id)
-                # 当前 API 文档未提供 wxCode -> token 的完整接口
-                logger.warning(f"微信扫码登录获取 wxCode: {wx_code}")
-                self.status_label.setText("微信登录暂不支持，请使用 123云盘 App 扫码")
-                self._show_expired_overlay()
-                return
-            except Exception as e:
-                logger.error(f"获取 wxCode 失败: {e}")
-                self.status_label.setText("登录失败，请重试")
-                self._show_expired_overlay()
-                return
+        """异步处理登录成功，验证 token 并获取用户信息。"""
+        task = _QRLoginVerifyTask(token, scan_platform, self._pan_temp, self._uni_id)
+        task.signals.success.connect(self._on_login_verified)
+        task.signals.error.connect(self._on_login_verify_error)
+        QThreadPool.globalInstance().start(task)
 
-        # App 扫码（scanPlatform=7）或已有 token
-        if not token:
-            self.status_label.setText("登录失败：未获取到凭证")
-            self._show_expired_overlay()
-            return
+    def _on_login_verified(self, pan):
+        """登录验证成功回调。"""
+        self.loginSuccess.emit(pan)
 
-        try:
-            pan = Pan123(
-                readfile=True, user_name="", password="",
-                authorization="Bearer " + token,
-            )
-            user_data = pan.user_info()
-            if user_data is None:
-                self.status_label.setText("登录验证失败，请重试")
-                self._show_expired_overlay()
-                return
-            pan.user_name = user_data.get("Nickname", "")
-            self.loginSuccess.emit(pan)
-        except Exception as e:
-            logger.error(f"QR 登录验证失败: {e}")
+    def _on_login_verify_error(self, error_msg):
+        """登录验证失败回调。"""
+        if "暂不支持" in error_msg:
+            self.status_label.setText(error_msg)
+        elif "未获取到凭证" in error_msg:
+            self.status_label.setText(error_msg)
+        else:
+            logger.error("QR 登录验证失败: %s", error_msg)
             self.status_label.setText("登录验证失败，请重试")
-            self._show_expired_overlay()
+        self._show_expired_overlay()
 
     def _on_expired(self):
         """二维码过期，自动刷新。"""

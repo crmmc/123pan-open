@@ -1,6 +1,6 @@
 import traceback
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -21,6 +21,7 @@ from qfluentwidgets import (
 )
 
 from ..common.api import Pan123
+from ..common.credential_store import save_credential, load_credential, delete_credential
 from ..common.database import Database
 from ..common.log import get_logger
 from .qr_login_page import QRLoginPage
@@ -30,7 +31,7 @@ logger = get_logger(__name__)
 
 def has_saved_credentials(db):
     user_name = (db.get_config("userName", "") or "").strip()
-    pass_word = db.get_config("passWord", "") or ""
+    pass_word = load_credential("passWord")
     return bool(user_name and pass_word)
 
 
@@ -46,7 +47,7 @@ def try_token_probe(db):
     """用已有 token 调 user_info API 探测有效性。
     成功返回 Pan123 对象，失败返回 None。
     """
-    token = db.get_config("authorization", "")
+    token = load_credential("authorization")
     if not token:
         return None
     try:
@@ -59,8 +60,42 @@ def try_token_probe(db):
         db.set_config("authorization", "")
         return None
     except Exception as exc:
-        logger.warning(f"Token 探测异常: {exc}")
+        logger.warning("Token 探测异常: %s", exc)
     return None
+
+
+class _LoginSignals(QObject):
+    success = Signal(object)
+    error = Signal(str)
+
+
+class _LoginTask(QRunnable):
+    def __init__(self, user, pwd):
+        super().__init__()
+        self.user = user
+        self.pwd = pwd
+        self.signals = _LoginSignals()
+        self.setAutoDelete(True)
+
+    def run(self):
+        try:
+            pan = login_with_credentials(self.user, self.pwd)
+            self.signals.success.emit(pan)
+        except Exception as e:
+            if isinstance(e, requests.exceptions.ConnectTimeout):
+                msg = f"连接超时，服务器无响应: {e}"
+            elif isinstance(e, requests.exceptions.ReadTimeout):
+                msg = f"读取超时，服务器响应过慢: {e}"
+            elif isinstance(e, requests.exceptions.ConnectionError):
+                msg = f"网络连接失败，请检查网络: {e}"
+            elif isinstance(e, requests.exceptions.RequestException):
+                msg = f"请求异常: {e}"
+            elif isinstance(e, RuntimeError):
+                msg = str(e)
+            else:
+                msg = f"登录时发生未知异常: {type(e).__name__}: {e}"
+            logger.error("登录失败: %s", msg, exc_info=True)
+            self.signals.error.emit(msg)
 
 
 class LoginDialog(QDialog):
@@ -149,7 +184,7 @@ class LoginDialog(QDialog):
         # 信号连接
         self.segmented_widget.currentItemChanged.connect(self._on_tab_changed)
         self.btn_ok.clicked.connect(self.on_ok)
-        self.btn_cancel.clicked.connect(self.close)
+        self.btn_cancel.clicked.connect(self.reject)
 
         self.pan = None
         self.login_error = None
@@ -158,14 +193,22 @@ class LoginDialog(QDialog):
         db = Database.instance()
         remember_password = bool(db.get_config("rememberPassword", False))
         self.le_user.setText(db.get_config("userName", ""))
-        self.le_pass.setText(db.get_config("passWord", "") if remember_password else "")
+        self.le_pass.setText(load_credential("passWord") if remember_password else "")
         self.cb_remember_password.setChecked(remember_password)
         self.cb_stay_logged_in.setChecked(bool(db.get_config("stayLoggedIn", True)))
         self.cb_remember_password.stateChanged.connect(self._on_remember_password_changed)
 
     def _on_remember_password_changed(self, state):
         if not state:
-            Database.instance().set_config("passWord", "")
+            delete_credential("passWord")
+
+    def reject(self):
+        self.qr_page.stop_polling()
+        super().reject()
+
+    def closeEvent(self, event):
+        self.qr_page.stop_polling()
+        super().closeEvent(event)
 
     def _on_tab_changed(self, route_key):
         if route_key == "password":
@@ -186,79 +229,71 @@ class LoginDialog(QDialog):
                 "userName": pan_object.user_name,
                 "passWord": "",
                 "rememberPassword": False,
-                "authorization": pan_object.authorization if self.cb_stay_logged_in.isChecked() else "",
+                "authorization": "",
                 "stayLoggedIn": self.cb_stay_logged_in.isChecked(),
                 "deviceType": pan_object.devicetype,
                 "osVersion": pan_object.osversion,
                 "loginuuid": pan_object.loginuuid,
             })
+            if self.cb_stay_logged_in.isChecked():
+                save_credential("authorization", pan_object.authorization)
+            else:
+                delete_credential("authorization")
         except Exception as e:
-            logger.warning(f"保存配置失败: {e}")
+            logger.warning("保存配置失败: %s", e)
         self.accept()
 
     def on_ok(self):
-        """登录处理"""
-
+        """登录处理（异步）"""
         user = self.le_user.text().strip()
         pwd = self.le_pass.text()
         if not user or not pwd:
             MessageBox("提示", "请输入用户名和密码。", self).exec()
             return
+        self.btn_ok.setEnabled(False)
         QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            self.pan = login_with_credentials(user, pwd)
-        except requests.exceptions.ConnectTimeout as e:
-            self.login_error = f"连接超时，服务器无响应: {e}"
-            logger.error(self.login_error, exc_info=True)
-            MessageBox("登录失败", self.login_error, self).exec()
-            return
-        except requests.exceptions.ReadTimeout as e:
-            self.login_error = f"读取超时，服务器响应过慢: {e}"
-            logger.error(self.login_error, exc_info=True)
-            MessageBox("登录失败", self.login_error, self).exec()
-            return
-        except requests.exceptions.ConnectionError as e:
-            self.login_error = f"网络连接失败，请检查网络: {e}"
-            logger.error(self.login_error, exc_info=True)
-            MessageBox("登录失败", self.login_error, self).exec()
-            return
-        except requests.exceptions.RequestException as e:
-            self.login_error = f"请求异常: {e}"
-            logger.error(self.login_error, exc_info=True)
-            MessageBox("登录失败", self.login_error, self).exec()
-            return
-        except RuntimeError as e:
-            self.login_error = str(e)
-            logger.error(self.login_error)
-            MessageBox("登录失败", self.login_error, self).exec()
-            return
-        except Exception as e:
-            self.login_error = f"登录时发生未知异常: {type(e).__name__}: {e}"
-            logger.error(
-                "登录异常:\n%s", traceback.format_exc()
-            )
-            MessageBox("登录异常", self.login_error, self).exec()
-            return
-        finally:
-            QApplication.restoreOverrideCursor()
 
+        task = _LoginTask(user, pwd)
+        task.signals.success.connect(self._on_login_success)
+        task.signals.error.connect(self._on_login_error)
+        self._login_task_signals = task.signals  # prevent GC
+        QThreadPool.globalInstance().start(task)
+
+    def _on_login_success(self, pan):
+        self.pan = pan
+        QApplication.restoreOverrideCursor()
+        self.btn_ok.setEnabled(True)
         try:
             db = Database.instance()
             db.set_many_config({
-                "userName": user,
-                "deviceType": self.pan.devicetype,
-                "osVersion": self.pan.osversion,
-                "loginuuid": self.pan.loginuuid,
-                "passWord": pwd if self.cb_remember_password.isChecked() else "",
-                "authorization": self.pan.authorization if self.cb_stay_logged_in.isChecked() else "",
+                "userName": self.le_user.text().strip(),
+                "deviceType": pan.devicetype,
+                "osVersion": pan.osversion,
+                "loginuuid": pan.loginuuid,
+                "passWord": "",
+                "authorization": "",
                 "rememberPassword": self.cb_remember_password.isChecked(),
                 "stayLoggedIn": self.cb_stay_logged_in.isChecked(),
             })
+            if self.cb_remember_password.isChecked():
+                save_credential("passWord", self.le_pass.text())
+            else:
+                delete_credential("passWord")
+            if self.cb_stay_logged_in.isChecked():
+                save_credential("authorization", pan.authorization)
+            else:
+                delete_credential("authorization")
         except (IOError, OSError) as e:
-            logger.warning(f"保存配置失败: {e}")
+            logger.warning("保存配置失败: %s", e)
         except Exception as e:
-            logger.error(f"保存配置时发生未知错误: {e}")
+            logger.error("保存配置时发生未知错误: %s", e)
         self.accept()
+
+    def _on_login_error(self, msg):
+        QApplication.restoreOverrideCursor()
+        self.btn_ok.setEnabled(True)
+        self.login_error = msg
+        MessageBox("登录失败", msg, self).exec()
 
     def get_pan(self):
         """获取登录成功的Pan对象"""
