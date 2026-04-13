@@ -487,7 +487,7 @@ class Pan123:
         get_pages = 3
         page = 1
         length_now = 0
-        lists = []
+        lists: list = []
         total = -1
         times = 0
         while (length_now < total or total == -1) and (times < get_pages or all):
@@ -550,7 +550,7 @@ class Pan123:
 
         if type_detail == 1:
             down_request_url = "https://www.123pan.com/a/api/file/batch_download_info"
-            down_request_data = {"fileIdList": [{"fileId": int(file_detail.get("FileId", 0))}]}
+            down_request_data: dict[str, object] = {"fileIdList": [{"fileId": int(file_detail.get("FileId", 0))}]}
 
         else:
             down_request_url = "https://www.123pan.com/a/api/file/download_info"
@@ -1319,7 +1319,7 @@ class Pan123:
         logger.debug("[T-%s] S3 session 初始化完成", tid)
 
         # 构建分块任务队列（跳过已完成的块）
-        part_queue = queue.Queue()
+        part_queue: queue.Queue[dict] = queue.Queue()
         done_bytes = 0
         for part_num in range(1, total_parts + 1):
             offset = (part_num - 1) * block_size

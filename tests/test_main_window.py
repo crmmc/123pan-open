@@ -206,7 +206,7 @@ def test_show_relogin_dialog_stops_old_transfers_before_switching_pan():
     old_pan = MagicMock()
     old_pan.on_token_expired = object()
     new_pan = MagicMock()
-    events = []
+    events: list[tuple] = []
 
     message_box = MagicMock()
     login_dialog = MagicMock()
@@ -223,7 +223,7 @@ def test_show_relogin_dialog_stops_old_transfers_before_switching_pan():
     window.cloud_interface.set_pan.side_effect = lambda pan: events.append(("cloud", pan))
     window.file_interface = MagicMock()
     window.file_interface.reload.side_effect = lambda: events.append(("reload",))
-    window._stop_all_transfers = MagicMock(
+    window._stop_all_transfers = MagicMock(  # type: ignore[method-assign]
         side_effect=lambda save_progress=False: events.append(("stop", save_progress))
     )
 

@@ -21,7 +21,7 @@ class _FakePan:
         self.file_page = 7
         self.all_file = True
         self.total = 99
-        self.parent_file_id = 9
+        self.parent_file_id: int | None = 9
         self.calls = []
 
     def get_dir_by_id(self, file_id, all=False, limit=100):

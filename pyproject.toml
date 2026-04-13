@@ -16,7 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 build = ["nuitka>=4.0.5"]
-lint = ["pylint>=4.0.5", "mypy>=1.19.1"]
+lint = ["pylint>=4.0.5", "mypy>=1.19.1", "types-requests>=2.33.0", "types-qrcode>=8.0"]
 test = ["pytest>=8.0.0"]
 
 [[tool.uv.index]]
@@ -32,4 +32,12 @@ check_untyped_defs = true
 warn_unused_ignores = true
 follow_imports = "silent"
 explicit_package_bases = true
-disable_error_code = ["import-not-found"]
+disable_error_code = ["import-not-found", "import-untyped"]
+
+[[tool.mypy.overrides]]
+module = ["qfluentwidgets", "qfluentwidgets.*"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "tests.*"
+disable_error_code = ["attr-defined"]

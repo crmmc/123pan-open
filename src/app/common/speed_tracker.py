@@ -66,7 +66,7 @@ class SpeedTracker:
     def speed(self) -> float:
         return self._ema_speed
 
-    def eta(self, remaining_bytes: int) -> float:
+    def eta(self, remaining_bytes: int | float) -> float:
         if self._ema_speed <= 0 or remaining_bytes <= 0:
             return -1.0
         return remaining_bytes / self._ema_speed

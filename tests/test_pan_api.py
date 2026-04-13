@@ -1128,7 +1128,7 @@ class TestProgressFileIO:
         f = tmp_path / "test.bin"
         f.write_bytes(data)
 
-        reported = []
+        reported: list[int] = []
         pio = _ProgressFileIO(str(f), 0, len(data), reported.append)
         assert len(pio) == len(data)
 
@@ -1146,7 +1146,7 @@ class TestProgressFileIO:
         f = tmp_path / "test.bin"
         f.write_bytes(data)
 
-        reported = []
+        reported: list[int] = []
         pio = _ProgressFileIO(str(f), 0, len(data), reported.append)
         chunk_size = 64 * 1024
         total_read = 0

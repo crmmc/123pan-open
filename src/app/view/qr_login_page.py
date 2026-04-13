@@ -210,7 +210,7 @@ class QRLoginPage(QWidget):
             + "&source=123pan&type=login"
         )
         qr_img = qrcode.make(qr_content, box_size=5, border=2)
-        qt_image = ImageQt(qr_img.convert("RGB"))
+        qt_image = ImageQt(qr_img.convert("RGB"))  # type: ignore[union-attr]
         pixmap = QPixmap.fromImage(QImage(qt_image))
         self.qr_label.setPixmap(
             pixmap.scaled(
@@ -380,7 +380,7 @@ class QRLoginPage(QWidget):
         )
         self.overlay.setText("二维码已过期\n点击刷新")
         self.overlay.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.overlay.mousePressEvent = lambda e: self.start_qr_flow()
+        self.overlay.mousePressEvent = lambda e: self.start_qr_flow()  # type: ignore[method-assign]
         self.overlay.show()
 
     def hideEvent(self, event):

@@ -114,7 +114,7 @@ class MainWindow(FluentWindow):
         self.cloud_interface.set_pan(self.pan)
         self.file_interface.pan = self.pan
         self.file_interface.reload()
-        self.pan.on_token_expired = self._handle_token_expired
+        self.pan.on_token_expired = self._handle_token_expired  # type: ignore[union-attr]
         self.cloud_interface.logoutRequested.connect(self.handle_logout)
 
     def _handle_token_expired(self):

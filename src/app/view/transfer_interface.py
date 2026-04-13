@@ -1416,8 +1416,8 @@ class TransferInterface(QWidget):
             layout.addWidget(sb)
             w = QWidget()
             w.setLayout(layout)
-            w.primary_button = pb
-            w.secondary_button = sb
+            w.primary_button = pb  # type: ignore[attr-defined]
+            w.secondary_button = sb  # type: ignore[attr-defined]
             table.setCellWidget(row, col, w)
         return w
 

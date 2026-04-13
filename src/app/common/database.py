@@ -84,7 +84,7 @@ class Database:
         self._lock = threading.RLock()
         self._closed = False
         # P2-21: 显式设置 isolation_level 确保与 Python 3.12+ 兼容
-        self._conn = sqlite3.connect(
+        self._conn: sqlite3.Connection = sqlite3.connect(
             str(db_path), check_same_thread=False, isolation_level="DEFERRED"
         )
         self._conn.row_factory = sqlite3.Row
@@ -124,7 +124,7 @@ class Database:
                         except Exception:
                             pass  # P1-10: commit 失败也继续清除单例
                     inst._closed = True
-                    inst._conn = None  # 解除引用，防止旧引用访问
+                    inst._conn = None  # type: ignore[assignment]  # 解除引用，防止旧引用访问
                 _db_instance = None
         # 锁外关闭连接，减少锁持有时间
         if conn is not None:

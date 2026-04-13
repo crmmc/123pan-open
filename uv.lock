@@ -23,6 +23,8 @@ build = [
 lint = [
     { name = "mypy" },
     { name = "pylint" },
+    { name = "types-qrcode" },
+    { name = "types-requests" },
 ]
 test = [
     { name = "pytest" },
@@ -45,6 +47,8 @@ requires-dist = [
     { name = "pytest", marker = "extra == 'test'", specifier = ">=8.0.0" },
     { name = "qrcode", specifier = ">=8.0" },
     { name = "requests", specifier = ">=2.32.5" },
+    { name = "types-qrcode", marker = "extra == 'lint'", specifier = ">=8.0" },
+    { name = "types-requests", marker = "extra == 'lint'", specifier = ">=2.33.0" },
     { name = "zstandard", specifier = ">=0.25.0" },
 ]
 provides-extras = ["build", "lint", "test"]
@@ -3704,6 +3708,30 @@ source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
 sdist = { url = "https://mirrors.aliyun.com/pypi/packages/c3/af/14b24e41977adb296d6bd1fb59402cf7d60ce364f90c890bd2ec65c43b5a/tomlkit-0.14.0.tar.gz", hash = "sha256:cf00efca415dbd57575befb1f6634c4f42d2d87dbba376128adb42c121b87064" }
 wheels = [
     { url = "https://mirrors.aliyun.com/pypi/packages/b5/11/87d6d29fb5d237229d67973a6c9e06e048f01cf4994dee194ab0ea841814/tomlkit-0.14.0-py3-none-any.whl", hash = "sha256:592064ed85b40fa213469f81ac584f67a4f2992509a7c3ea2d632208623a3680" },
+]
+
+[[package]]
+name = "types-qrcode"
+version = "8.2.0.20260408"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "pillow" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/04/46/d1334f341c658adca57e66af7b699fd5dbb801556e78303bfd5146729813/types_qrcode-8.2.0.20260408.tar.gz", hash = "sha256:074478558852fd327728008a08ff1ef2b7bada29f6ec94df5fa91e1f2c1d2df5" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/36/05/d9bab35be450b2c93bb288d5d4fdc849f8a812fb829c4b3c4ae99c4ef473/types_qrcode-8.2.0.20260408-py3-none-any.whl", hash = "sha256:19027b5db4bb9b46731ab91588f6ca5a8c0eeaaf794c3269a4b0643a9611bc25" },
+]
+
+[[package]]
+name = "types-requests"
+version = "2.33.0.20260408"
+source = { registry = "https://mirrors.aliyun.com/pypi/simple/" }
+dependencies = [
+    { name = "urllib3" },
+]
+sdist = { url = "https://mirrors.aliyun.com/pypi/packages/69/6a/749dc53a54a3f35842c1f8197b3ca6b54af6d7458a1bfc75f6629b6da666/types_requests-2.33.0.20260408.tar.gz", hash = "sha256:95b9a86376807a216b2fb412b47617b202091c3ea7c078f47cc358d5528ccb7b" }
+wheels = [
+    { url = "https://mirrors.aliyun.com/pypi/packages/90/b8/78fd6c037de4788c040fdd323b3369804400351b7827473920f6c1d03c10/types_requests-2.33.0.20260408-py3-none-any.whl", hash = "sha256:81f31d5ea4acb39f03be7bc8bed569ba6d5a9c5d97e89f45ac43d819b68ca50f" },
 ]
 
 [[package]]

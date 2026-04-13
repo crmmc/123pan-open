@@ -6,7 +6,7 @@ from src.app.common.concurrency import _ProgressAggregator, slow_start_scheduler
 
 
 def test_slow_start_scheduler_returns_immediately_when_queue_is_empty():
-    part_queue = queue.Queue()
+    part_queue: queue.Queue[dict] = queue.Queue()
     progress_lock = threading.Lock()
     active_workers = [0]
     allowed_workers = [1]
@@ -100,7 +100,7 @@ def test_aggregator_speed_tracker_called():
 
 
 def test_slow_start_scheduler_exits_on_failed_flag():
-    part_queue = queue.Queue()
+    part_queue: queue.Queue[dict] = queue.Queue()
     part_queue.put({"index": 0})
     progress_lock = threading.Lock()
     active_workers = [0]
@@ -125,7 +125,7 @@ def test_slow_start_scheduler_exits_on_failed_flag():
 
 
 def test_slow_start_scheduler_exits_on_is_stopped():
-    part_queue = queue.Queue()
+    part_queue: queue.Queue[dict] = queue.Queue()
     part_queue.put({"index": 0})
     progress_lock = threading.Lock()
     active_workers = [0]

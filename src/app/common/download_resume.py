@@ -490,7 +490,7 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
     _notify_status(signals, "校验中")
     _notify_progress(signals, total, reused_bytes)
 
-    part_queue = queue.Queue()
+    part_queue: queue.Queue[dict] = queue.Queue()
     for part in part_plan:
         if int(part["index"]) not in reusable:
             part_queue.put(part)

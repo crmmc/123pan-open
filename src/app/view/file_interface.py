@@ -1262,7 +1262,7 @@ class FileInterface(QWidget):
                 reserved_names,
                 force_rename=upload["file_name"] in reserved_names,
             )
-            self.transfer_interface.add_upload_task(
+            self.transfer_interface.add_upload_task(  # type: ignore[union-attr]
                 assigned_name,
                 upload["file_size"],
                 upload["local_path"],
@@ -1320,7 +1320,7 @@ class FileInterface(QWidget):
         # 先添加单文件任务
         added_count = 0
         for upload in uploads:
-            self.transfer_interface.add_upload_task(
+            self.transfer_interface.add_upload_task(  # type: ignore[union-attr]
                 upload["file_name"],
                 upload["file_size"],
                 upload["local_path"],
