@@ -41,8 +41,10 @@ class SpeedTracker:
 
             delta_bytes = cumulative_bytes - self._last_cumulative
             if delta_bytes < 0:
-                # 进度回退（如下载重试），更新基准但不影响速度
+                # 进度回退（如下载重试），重置基准和速度
                 self._last_cumulative = cumulative_bytes
+                self._last_time = now
+                self._ema_speed = 0.0
                 return
             self._last_time = now
             self._last_cumulative = cumulative_bytes

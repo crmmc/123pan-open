@@ -136,6 +136,10 @@ class SearchDialog(QDialog):
         self.searchBar.returnPressed.connect(self.searchBar.search)
         self.resultList.itemDoubleClicked.connect(self.__onItemDoubleClicked)
 
+    def accept(self):
+        self._closed = True
+        super().accept()
+
     def reject(self):
         self._closed = True
         super().reject()

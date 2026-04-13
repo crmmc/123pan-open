@@ -90,8 +90,11 @@ def slow_start_scheduler(
                     daemon=True,
                 )
                 threads.append(t)
+                # 安全网 worker 作为 probe 启动，恢复并发扩展能力
+                if probe_thread_name[0] is None and allowed_workers[0] < max_workers:
+                    probe_thread_name[0] = t.name
                 t.start()
-                logger.debug("[调度器] 安全网触发: 无活跃 worker 但队列非空")
+                logger.debug("[调度器] 安全网触发: 无活跃 worker 但队列非空, probe=%s", probe_thread_name[0])
 
     for t in threads:
         t.join()

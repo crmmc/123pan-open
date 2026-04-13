@@ -118,19 +118,28 @@ class MainWindow(FluentWindow):
         QTimer.singleShot(0, self._show_relogin_dialog)
 
     def _show_relogin_dialog(self):
-        msg = MessageBox("登录过期", "登录凭证已过期，请重新登录。", self)
-        msg.exec()
-        msg.deleteLater()
-        dlg = LoginDialog(self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            self.pan = dlg.get_pan()
-            self.pan.on_token_expired = self._handle_token_expired
-            self.transfer_interface.set_pan(self.pan, force=True)
-            self.cloud_interface.set_pan(self.pan)
-            self.file_interface.pan = self.pan
-            self.file_interface.reload()
-        else:
-            self.close()
+        if getattr(self, "_relogin_pending", False):
+            return
+        self._relogin_pending = True
+        try:
+            msg = MessageBox("登录过期", "登录凭证已过期，请重新登录。", self)
+            msg.exec()
+            msg.deleteLater()
+            dlg = LoginDialog(self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                old_pan = self.pan
+                self.pan = dlg.get_pan()
+                self.pan.on_token_expired = self._handle_token_expired
+                self.transfer_interface.set_pan(self.pan, force=True)
+                self.cloud_interface.set_pan(self.pan)
+                self.file_interface.pan = self.pan
+                self.file_interface.reload()
+                if old_pan is not None:
+                    old_pan.close()
+            else:
+                self.close()
+        finally:
+            self._relogin_pending = False
 
     def _stop_all_transfers(self, save_progress=False):
         """停止所有正在进行的传输任务并等待线程退出。
@@ -211,7 +220,7 @@ class MainWindow(FluentWindow):
         self._stop_all_transfers(save_progress=True)
         if self.pan:
             self.pan.close()
-        Database.instance().close()
+        Database.reset()
         event.accept()
 
     def clear_login_config(self):

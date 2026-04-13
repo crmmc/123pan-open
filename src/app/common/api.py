@@ -204,7 +204,7 @@ class Pan123:
         retry = Retry(
             total=3,
             backoff_factor=_safe_float(db.get_config("retryBackoffFactor", 0.5), 0.5, 0.1, 10.0),
-            allowed_methods=["GET", "POST", "PUT", "HEAD"],
+            allowed_methods=["GET", "PUT", "HEAD"],
             raise_on_status=False,
             status_forcelist=[500, 502, 504],
         )
@@ -215,7 +215,7 @@ class Pan123:
         if readfile:
             self.read_ini(user_name, password, input_pwd, authorization)
         else:
-            if user_name == "" or password == "":
+            if not authorization and (user_name == "" or password == ""):
                 raise Exception("用户名或密码为空")
             self.user_name = user_name
             self.password = password
@@ -249,10 +249,13 @@ class Pan123:
             return self._login_without_lock()
 
     def _login_without_lock(self):
-        """登录123云盘账户并获取授权令牌"""
+        """登录123云盘账户并获取授权令牌。
+        注意：直接使用 session.post 而非 _raw_request，
+        因为调用方 _refresh_token_for_request 已持有 wlock，
+        _raw_request 会尝试获取 rlock 导致死锁（_RWLock 不可重入）。
+        """
         data = {"type": 1, "passport": self.user_name, "password": self.password}
-        login_res = self._raw_request(
-            self.session.post,
+        login_res = self.session.post(
             "https://www.123pan.com/b/api/user/sign_in",
             headers=self.header_logined,
             data=json.dumps(data),
@@ -903,7 +906,7 @@ class Pan123:
                     existing_child_dirs = self._get_child_directory_map(remote_parent_id)
                     for item in self._get_dir_items_by_id(remote_parent_id):
                         if int(item.get("Type", 0) or 0) == 0:
-                            existing_file_names.add(item.get("FileName", ""))
+                            existing_file_names.add(sanitize_filename(item.get("FileName", "")))
 
                 for dir_name in dir_names:
                     sanitized_dir = sanitize_filename(dir_name)
@@ -921,7 +924,7 @@ class Pan123:
                     created_dir_count += 1
 
                 for file_name in file_names:
-                    if merge and file_name in existing_file_names:
+                    if merge and sanitize_filename(file_name) in existing_file_names:
                         continue
                     file_targets.append({
                         "file_name": file_name,

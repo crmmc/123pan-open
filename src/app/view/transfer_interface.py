@@ -2,7 +2,7 @@ from pathlib import Path
 import time
 import uuid
 
-from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, QUrl, Signal, QItemSelectionModel
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -825,6 +825,9 @@ class TransferInterface(QWidget):
         else:
             self.__update_download_table()
         if terminal:
+            # 直接内联 __task_finished 逻辑，避免依赖 finished 信号
+            # （disconnect 可能吞掉已排队的 finished 信号）
+            self.__task_finished(task, "upload" if isinstance(task, UploadTask) else "download")
             if isinstance(task, UploadTask):
                 self.__try_start_pending_uploads()
             else:
@@ -961,9 +964,14 @@ class TransferInterface(QWidget):
         if task_type == "upload":
             if task.delete_requested:
                 return
-            InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
+            if task.status == "失败":
+                return
+            if task.status == "已完成":
+                InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
             return
         # ---- 以下为下载逻辑 ----
+        if task.status != "已完成":
+            return
         task.active_workers = 0
         task.max_workers = 0
         task.speed_bps = 0.0
@@ -983,6 +991,7 @@ class TransferInterface(QWidget):
             return
         task.last_error = error
         task.status = "失败"
+        InfoBar.error(title="上传失败", content=f"{task.file_name}: {error}", parent=self)
         if task.db_task_id:
             Database.instance().update_upload_task(
                 task.db_task_id,
@@ -1008,7 +1017,9 @@ class TransferInterface(QWidget):
     # ---- pause/resume/retry ----
 
     def __toggle_pause_upload(self, task):
-        if task.status == "已暂停" and task.thread is None:
+        if task.status == "已暂停":
+            if task.thread is not None:
+                return
             task.status = "等待中"
             self.__update_upload_table()
             self.__try_start_pending_uploads()
@@ -1045,7 +1056,10 @@ class TransferInterface(QWidget):
         self.__try_start_pending_uploads()
 
     def __toggle_pause(self, task):
-        if task.status == "已暂停" and task.thread is None:
+        if task.status == "已暂停":
+            if task.thread is not None:
+                # 线程仍在退出中，等待 finished 信号后自动变为 thread=None
+                return
             task.status = "等待中"
             self.__update_download_table()
             self.__try_start_pending_downloads()
@@ -1137,9 +1151,11 @@ class TransferInterface(QWidget):
         current = {idx.row() for idx in table.selectionModel().selectedRows()}
         table.blockSignals(True)
         table.clearSelection()
+        sel_model = table.selectionModel()
         for i in range(len(tasks)):
             if i not in current:
-                table.selectRow(i)
+                idx = table.model().index(i, 0)
+                sel_model.select(idx, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         table.blockSignals(False)
         table.itemSelectionChanged.emit()
 
@@ -1376,10 +1392,12 @@ class TransferInterface(QWidget):
         if not saved:
             return
         table.blockSignals(True)
+        sel_model = table.selectionModel()
         for row, task in enumerate(tasks):
             tid = getattr(task, 'db_task_id', None) or getattr(task, 'resume_id', None)
             if tid and tid in saved:
-                table.selectRow(row)
+                idx = table.model().index(row, 0)
+                sel_model.select(idx, QItemSelectionModel.SelectionFlag.Select | QItemSelectionModel.SelectionFlag.Rows)
         table.blockSignals(False)
 
     @staticmethod

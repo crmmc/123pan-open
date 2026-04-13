@@ -635,7 +635,7 @@ def test_download_part_memory_buffer_no_partial_file_on_pause(tmp_path, monkeypa
     monkeypatch.setattr(download_resume.time, "sleep", lambda *_a, **_kw: None)
 
     result = _download_part(
-        "https://example.test/file",
+        ["https://example.test/file"],
         part, resume_id, aggregator, None, part_size, task,
     )
 
@@ -694,7 +694,7 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
     assert not part_path.exists()
 
     result = _download_part(
-        "https://example.test/file",
+        ["https://example.test/file"],
         part, resume_id, aggregator, None, part_size, task,
     )
 

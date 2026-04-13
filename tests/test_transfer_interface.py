@@ -318,6 +318,7 @@ def test_start_download_task_clears_pause_and_cancel_flags(tmp_path, monkeypatch
 
 
 def test_upload_task_error_persists_error_message(tmp_path, monkeypatch):
+    monkeypatch.setattr("src.app.view.transfer_interface.InfoBar.error", lambda **_kwargs: None)
     interface, db = _make_interface(tmp_path, monkeypatch)
     task = interface.add_upload_task(
         "demo.bin",
@@ -514,6 +515,7 @@ def test_upload_task_terminal_cleanup_calls_deleteLater(tmp_path, monkeypatch):
     task.thread = thread
     interface.upload_threads.append(thread)
     monkeypatch.setattr("src.app.view.transfer_interface.InfoBar.error", lambda **_kwargs: None)
+    monkeypatch.setattr("src.app.view.transfer_interface.InfoBar.success", lambda **_kwargs: None)
 
     interface._TransferInterface__update_task_status(task, "已完成")
 

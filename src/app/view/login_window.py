@@ -203,10 +203,12 @@ class LoginDialog(QDialog):
             delete_credential("passWord")
 
     def reject(self):
+        QApplication.restoreOverrideCursor()
         self.qr_page.stop_polling()
         super().reject()
 
     def closeEvent(self, event):
+        QApplication.restoreOverrideCursor()
         self.qr_page.stop_polling()
         super().closeEvent(event)
 

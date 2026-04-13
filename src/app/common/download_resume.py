@@ -186,6 +186,11 @@ def _build_parts(total, part_size=None):
 def _validate_existing_parts(resume_id, part_plan):
     db = Database.instance()
     stored = {p["part_index"]: p for p in db.get_download_parts(resume_id)}
+    logger.info(
+        "断点续传校验: resume_id=%s, DB分片数=%d, 新分片计划数=%d, part_size=%dMB",
+        resume_id[:8], len(stored), len(part_plan),
+        (part_plan[0]["expected_size"] // 1024 // 1024) if part_plan else 0,
+    )
     reusable_indexes = []
     downloaded = 0
     for part in part_plan:
@@ -197,10 +202,12 @@ def _validate_existing_parts(resume_id, part_plan):
         expected_size = int(part["expected_size"])
         expected_hash = sp.get("md5")
         if not expected_hash or not p_path.exists():
+            logger.debug("分片 %d 跳过: hash=%s file_exists=%s", index, bool(expected_hash), p_path.exists())
             db.remove_download_part(resume_id, index)
             continue
         actual_size = p_path.stat().st_size
         if actual_size != expected_size:
+            logger.info("分片 %d 大小不匹配: disk=%d plan=%d", index, actual_size, expected_size)
             try:
                 p_path.unlink()
             except OSError:
@@ -209,6 +216,7 @@ def _validate_existing_parts(resume_id, part_plan):
             continue
         actual_hash = _compute_md5(p_path)
         if actual_hash != expected_hash:
+            logger.info("分片 %d MD5不匹配", index)
             try:
                 p_path.unlink()
             except OSError:
@@ -326,6 +334,8 @@ def _download_part(
 
     first_byte_signaled = False
     attempt = 0
+    refresh_403_count = 0
+    max_refresh_403 = 3
     buf = io.BytesIO()
     while True:
         attempt_downloaded = 0
@@ -343,7 +353,11 @@ def _download_part(
                             new_url = refresh_url_fn()
                             if new_url and not isinstance(new_url, int):
                                 url_holder[0] = new_url
-                                logger.debug("分片 %d URL 已刷新，重试", index)
+                                refresh_403_count += 1
+                                if refresh_403_count > max_refresh_403:
+                                    logger.warning("分片 %d 连续 %d 次 403 refresh 仍失败", index, refresh_403_count)
+                                    return "url_expired"
+                                logger.debug("分片 %d URL 已刷新，重试 (%d/%d)", index, refresh_403_count, max_refresh_403)
                                 continue
                         except Exception as exc:
                             logger.warning("分片 %d 刷新 URL 失败: %s", index, exc)
@@ -409,11 +423,26 @@ def _download_part(
 
 def _download_with_resume(redirect_url, out_path, total, signals, task, resume_task, speed_tracker, refresh_url_fn=None):
     resume_id = resume_task.resume_id
-    part_plan = _build_parts(total)
+    # 恢复时使用已有分片的 part_size，避免用户修改配置后分片计划不匹配导致全部重下
+    stored_parts = Database.instance().get_download_parts(resume_id)
+    stored_part_size = None
+    if stored_parts:
+        # 取第一个非末尾分片的 expected_size（末尾分片可能不足一个完整 part）
+        for sp in stored_parts:
+            if sp["expected_size"] > 0 and sp["part_index"] < len(stored_parts) - 1:
+                stored_part_size = sp["expected_size"]
+                break
+        if stored_part_size is None and stored_parts:
+            stored_part_size = stored_parts[0]["expected_size"]
+    part_plan = _build_parts(total, part_size=stored_part_size)
     _prepare_resume_metadata(out_path, total, resume_task, True)
 
     reused_bytes, reusable_indexes = _validate_existing_parts(resume_id, part_plan)
     reusable = set(reusable_indexes)
+    logger.info(
+        "断点续传结果: resume_id=%s total=%d reused=%d reusable_parts=%d/%d",
+        resume_id[:8], total, reused_bytes, len(reusable), len(part_plan),
+    )
     _save_download_status(resume_id, total, reused_bytes, "校验中")
     _notify_status(signals, "校验中")
     _notify_progress(signals, total, reused_bytes)

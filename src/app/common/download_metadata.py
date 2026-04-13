@@ -47,8 +47,7 @@ def _snapshot_pan_state(pan):
 
 def _restore_pan_state(pan, state):
     for key, value in state.items():
-        if value is not None:
-            setattr(pan, key, value)
+        setattr(pan, key, value)
 
 
 def _load_directory_items(pan, directory_id):
@@ -78,10 +77,6 @@ def _candidate_directory_ids(pan, current_dir_id):
 
 
 def resolve_download_file_detail(pan, file_id, current_dir_id=0):
-    file_detail = _match_file_detail(getattr(pan, "list", []), file_id)
-    if file_detail:
-        return file_detail
-
     for directory_id in _candidate_directory_ids(pan, current_dir_id):
         items = _load_directory_items(pan, directory_id)
         file_detail = _match_file_detail(items, file_id)

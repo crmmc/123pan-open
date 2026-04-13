@@ -29,7 +29,8 @@ class _FakePan:
         return 0, self.directory_items.get(file_id, [])
 
 
-def test_resolve_download_file_detail_prefers_current_pan_list():
+def test_resolve_download_file_detail_finds_in_directory():
+    """删除了无效的 pan.list 缓存查找后，直接从目录 API 获取。"""
     file_detail = {
         "FileId": 101,
         "FileName": "demo.bin",
@@ -38,12 +39,13 @@ def test_resolve_download_file_detail_prefers_current_pan_list():
         "Etag": "etag-1",
         "S3KeyFlag": True,
     }
-    pan = _FakePan(items=[file_detail])
+    pan = _FakePan(directory_items={3: [file_detail]})
+    pan.parent_file_id = 3
 
     result = resolve_download_file_detail(pan, 101, current_dir_id=3)
 
     assert result == file_detail
-    assert pan.calls == []
+    assert len(pan.calls) >= 1
 
 
 def test_resolve_download_file_detail_restores_pan_state_after_lookup():

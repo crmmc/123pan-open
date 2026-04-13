@@ -388,7 +388,7 @@ class Database:
     def get_download_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
             self._check_closed()
-            if account_name:
+            if account_name is not None:
                 rows = self._conn.execute(
                     "SELECT * FROM download_tasks WHERE account_name = ?",
                     (account_name,),
@@ -524,7 +524,7 @@ class Database:
     def get_upload_tasks(self, account_name: str | None = None) -> list[dict]:
         with self._lock:
             self._check_closed()
-            if account_name:
+            if account_name is not None:
                 rows = self._conn.execute(
                     "SELECT * FROM upload_tasks WHERE account_name = ?",
                     (account_name,),

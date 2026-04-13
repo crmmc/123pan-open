@@ -67,8 +67,10 @@ class TestSessionRetryConfig:
         p = self._create_pan_with_config()
         adapter = p.session.get_adapter("https://www.123pan.com")
         methods = adapter.max_retries.allowed_methods
-        for m in ("GET", "POST", "PUT", "HEAD"):
+        for m in ("GET", "PUT", "HEAD"):
             assert m in methods
+        # POST 不应被自动重试（非幂等操作）
+        assert "POST" not in methods
 
     def test_session_retry_raise_on_status_false(self):
         p = self._create_pan_with_config()

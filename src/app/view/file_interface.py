@@ -573,7 +573,7 @@ class FileInterface(QWidget):
             return []
         try:
             code, items = self.pan.get_dir_by_id(
-                dir_id, save=False, all=True, limit=100, search_data=search_data
+                dir_id, all=True, limit=100, search_data=search_data
             )
             if code != 0:
                 raise RuntimeError(f"获取文件列表失败，返回码: {code}")
@@ -796,7 +796,7 @@ class FileInterface(QWidget):
 
                         if result:
                             code, items = self.pan.get_dir_by_id(
-                                self.current_dir_id, save=False, all=True, limit=100
+                                self.current_dir_id, all=True, limit=100
                             )
                             folder_items = []
                             if code == 0:
@@ -1153,7 +1153,7 @@ class FileInterface(QWidget):
             self.pan = pan
             self.folder_entries = folder_entries
             self.target_dir_id = target_dir_id
-            self.signals = _FolderUploadPrepareTask._Signals()
+            self.signals = type(self)._Signals()
 
         def run(self):
             uploads = []
@@ -1548,9 +1548,10 @@ class FileInterface(QWidget):
         if count:
             selected_size = 0
             for row in self.__getSelectedRows():
-                size_item = self.fileTable.item(row, 0)
-                if size_item:
-                    selected_size += int(size_item.data(Qt.ItemDataRole.UserRole) or 0)
+                name_item = self.fileTable.item(row, 0)
+                if name_item:
+                    file_meta = name_item.data(Qt.ItemDataRole.UserRole + 2) or {}
+                    selected_size += int(file_meta.get("Size", 0))
             size_text = f"，总大小 {format_file_size(selected_size)}" if selected_size else ""
             self.statusLabel.setText(f"已选中 {count} 个，共 {total} 个{size_text}")
         else:
@@ -1607,7 +1608,7 @@ class FileInterface(QWidget):
             def run(self):
                 try:
                     code, items = self.pan.get_dir_by_id(
-                        self.current_dir_id, save=False, all=True, limit=1000,
+                        self.current_dir_id, all=True, limit=1000,
                     )
                     if code != 0:
                         self.signals.finished.emit(0, len(self.delete_list), "获取目录失败", [], [])
@@ -1626,7 +1627,7 @@ class FileInterface(QWidget):
                                 errors.append(f"{fname}: {e}")
 
                     code, items = self.pan.get_dir_by_id(
-                        self.current_dir_id, save=False, all=True, limit=100,
+                        self.current_dir_id, all=True, limit=100,
                     )
                     error_msg = "; ".join(errors) if errors else ""
                     if code == 0:
@@ -1758,7 +1759,6 @@ class FileInterface(QWidget):
                     if success:
                         code, items = self.pan.get_dir_by_id(
                             self.current_dir_id,
-                            save=False,
                             all=True,
                             limit=100,
                         )

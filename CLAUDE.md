@@ -107,6 +107,21 @@ file_interface.py (用户选文件)
 - 弹窗：`QDialog`
 - qfluentwidgets 组件作为成员使用，不继承
 
+## 重构 / 签名变更纪律
+
+修改 `api.py`（Pan123 类）、`database.py`（Database 类）等核心模块的公开方法签名时，**必须同步完成以下步骤**：
+
+1. **Grep 全局搜索调用点**：`Grep pattern="method_name("` 搜索所有 `.py` 文件，逐一确认调用与新签名匹配
+2. **运行 mypy 类型检查**：`bash script/mypy.sh` — 已配置 `check_untyped_defs = true`，能捕获过期参数、不存在的方法调用
+3. **运行全量测试**：`uv run pytest tests/ -v`
+4. **注意 Python 缩进**：插入新方法时确保不会截断 `__init__` 等方法的后续初始化代码
+
+### 教训记录
+
+- `save=False` 过期参数（6 处调用未同步）：`api.py` 删除了 `save` 参数但调用方仍传参
+- `Database.instance().close()` 调用不存在的方法：Database 只有 `reset()` 类方法，没有实例 `close()`
+- `__init__` 初始化代码被新方法截断：在 `__init__` 中间插入方法定义，导致后续代码被吞入方法体
+
 ## 设置页面原则
 
 所有 `database.py` `_init_defaults` 中的用户可调配置项，都必须在设置页面（`setting_interface.py`）提供对应的 UI 控件。新增配置项时同步添加设置界面入口。

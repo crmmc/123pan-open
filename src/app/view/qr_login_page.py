@@ -181,6 +181,7 @@ class QRLoginPage(QWidget):
         task = _QRGenerateTask()
         task.signals.finished.connect(self._on_qr_generated)
         task.signals.error.connect(self._on_qr_generate_error)
+        self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
     def _on_qr_generated(self, data):
@@ -232,6 +233,7 @@ class QRLoginPage(QWidget):
         task = _QRPollTask(self._pan_temp, self._uni_id)
         task.signals.result.connect(self._on_poll_result)
         task.signals.error.connect(self._on_poll_error)
+        self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
     def _on_poll_error(self):
@@ -266,11 +268,12 @@ class QRLoginPage(QWidget):
             self._show_expired_overlay()
         elif status == 3:
             # 用户确认登录
+            pan_temp = self._pan_temp  # 在 stop_polling 置空前保存引用
             self.stop_polling()
             self.status_label.setText("登录成功")
             scan_platform = result.get("scanPlatform", 0)
             token = result.get("token", "")
-            self._handle_login_success(scan_platform, token)
+            self._handle_login_success(scan_platform, token, pan_temp)
         elif status == 4:
             # 二维码过期
             self.stop_polling()
@@ -283,11 +286,13 @@ class QRLoginPage(QWidget):
         else:
             logger.warning("未知 QR 登录状态: %s", status)
 
-    def _handle_login_success(self, scan_platform, token):
+    def _handle_login_success(self, scan_platform, token, pan_temp=None):
         """异步处理登录成功，验证 token 并获取用户信息。"""
-        task = _QRLoginVerifyTask(token, scan_platform, self._pan_temp, self._uni_id)
+        pan_temp = pan_temp or self._pan_temp
+        task = _QRLoginVerifyTask(token, scan_platform, pan_temp, self._uni_id)
         task.signals.success.connect(self._on_login_verified)
         task.signals.error.connect(self._on_login_verify_error)
+        self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
     def _on_login_verified(self, pan):

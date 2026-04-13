@@ -28,7 +28,7 @@ class MoveDialog(QDialog):
         def run(self):
             try:
                 code, items = self.pan.get_dir_by_id(
-                    self.dir_id, save=False, all=True, limit=100
+                    self.dir_id, all=True, limit=100
                 )
                 if code == 0:
                     self.signals.finished.emit(self.dir_id, items, "")
@@ -87,6 +87,10 @@ class MoveDialog(QDialog):
         layout.addLayout(button_layout)
 
         self.__initTree()
+
+    def accept(self):
+        self._closed = True
+        super().accept()
 
     def reject(self):
         self._closed = True

@@ -26,3 +26,10 @@ url = "https://mirrors.aliyun.com/pypi/simple/"
 dev = [
     "pytest-cov>=7.1.0",
 ]
+
+[tool.mypy]
+check_untyped_defs = true
+warn_unused_ignores = true
+follow_imports = "silent"
+explicit_package_bases = true
+disable_error_code = ["import-not-found"]
