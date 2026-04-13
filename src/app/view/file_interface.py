@@ -65,6 +65,14 @@ def _generate_keep_both_name(file_name: str, existing_names: set[str]) -> str:
         index += 1
 
 
+def _assign_reserved_file_name(file_name: str, reserved_names: set[str], *, force_rename: bool) -> str:
+    assigned_name = file_name
+    if force_rename or assigned_name in reserved_names:
+        assigned_name = _generate_keep_both_name(assigned_name, reserved_names)
+    reserved_names.add(assigned_name)
+    return assigned_name
+
+
 class FileInterface(QWidget):
     """文件页面（仅浏览）"""
 
@@ -471,26 +479,57 @@ class FileInterface(QWidget):
         if loaded or dir_id is None:
             return
 
+        # P0-3: 异步加载树节点子目录，避免阻塞 UI
         self.is_loading_tree = True
-        try:
-            item.takeChildren()
-            folder_list = self.__fetchDirList(dir_id)
-            for folder in folder_list:
+        item.takeChildren()
+        placeholder = QTreeWidgetItem(["加载中..."])
+        placeholder.setData(0, Qt.ItemDataRole.UserRole, None)
+        item.addChild(placeholder)
+
+        class _TreeLoadSignals(QObject):
+            finished = Signal(list, str)
+
+        class _TreeLoadTask(QRunnable):
+            def __init__(self, fetch_fn, dir_id, signals):
+                super().__init__()
+                self._fetch_fn = fetch_fn
+                self._dir_id = dir_id
+                self.signals = signals
+
+            def run(self):
+                try:
+                    items = self._fetch_fn(self._dir_id)
+                    self.signals.finished.emit(items, "")
+                except Exception as e:
+                    self.signals.finished.emit([], str(e))
+
+        signals = _TreeLoadSignals()
+        self._pending_signals.append(signals)
+
+        def _on_tree_loaded(items, error, _item=item, sig=signals):
+            if sig in self._pending_signals:
+                self._pending_signals.remove(sig)
+            self.is_loading_tree = False
+            _item.takeChildren()
+            if error:
+                logger.warning("异步加载树节点失败: %s", error)
+                _item.setData(0, Qt.ItemDataRole.UserRole + 1, False)
+                return
+            for folder in items:
                 if int(folder.get("Type", 0)) != 1:
                     continue
-
                 child = QTreeWidgetItem([folder.get("FileName", "")])
                 child.setIcon(0, FIF.FOLDER.icon())
                 child_id = int(folder.get("FileId", 0))
                 child.setData(0, Qt.ItemDataRole.UserRole, child_id)
                 child.setData(0, Qt.ItemDataRole.UserRole + 1, False)
-                item.addChild(child)
-
+                _item.addChild(child)
                 self.__addPlaceholder(child)
+            _item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
 
-            item.setData(0, Qt.ItemDataRole.UserRole + 1, True)
-        finally:
-            self.is_loading_tree = False
+        signals.finished.connect(_on_tree_loaded)
+        task = _TreeLoadTask(self.__fetchDirList, dir_id, signals)
+        QThreadPool.globalInstance().start(task)
 
     def __onTreeItemClicked(self, item):
         dir_id = item.data(0, Qt.ItemDataRole.UserRole)
@@ -878,6 +917,7 @@ class FileInterface(QWidget):
 
     def __updateFileListUI(self, file_items):
         """更新文件列表UI - 轻量级操作"""
+        self._cached_file_list = list(file_items)
         self.fileTable.setRowCount(len(file_items))
 
         for row, file_item in enumerate(file_items):
@@ -1188,6 +1228,61 @@ class FileInterface(QWidget):
                 "；".join(error_parts),
             )
 
+    def __onFolderPrepareDone(
+        self,
+        folder_uploads,
+        folder_items,
+        created_dir_count,
+        folder_error,
+        context,
+        added_count,
+        error,
+        should_refresh_current_dir,
+    ):
+        if self.__isAsyncContextStale(context):
+            return
+        refresh_current_dir = should_refresh_current_dir and not self.__isAsyncContextStale(
+            context, require_same_dir=True,
+        )
+
+        reserved_names_by_dir: dict[int, set[str]] = {}
+        total_count = added_count
+        for upload in folder_uploads:
+            target_dir_id = int(upload["target_dir_id"])
+            reserved_names = reserved_names_by_dir.setdefault(target_dir_id, set())
+            assigned_name = _assign_reserved_file_name(
+                upload["file_name"],
+                reserved_names,
+                force_rename=upload["file_name"] in reserved_names,
+            )
+            self.transfer_interface.add_upload_task(
+                assigned_name,
+                upload["file_size"],
+                upload["local_path"],
+                target_dir_id,
+            )
+            total_count += 1
+
+        if folder_items and refresh_current_dir:
+            self.__updateTreeUI(folder_items, remove_missing=False)
+        if (folder_uploads or folder_items) and refresh_current_dir:
+            self.__refreshFileList()
+
+        if total_count or created_dir_count:
+            InfoBar.success(
+                title="上传文件",
+                content=self.__buildUploadSummary(total_count, created_dir_count),
+                parent=self,
+            )
+        if error:
+            InfoBar.warning(title="部分文件已跳过", content=error, parent=self)
+        if folder_error:
+            for part in folder_error.split("；"):
+                if part:
+                    InfoBar.warning(
+                        title="文件夹上传失败", content=part, parent=self,
+                    )
+
     def __executeUploadEntries(
         self, entries, existing_file_names, error, context, should_refresh_current_dir
     ):
@@ -1195,6 +1290,7 @@ class FileInterface(QWidget):
         target_dir_id = context["target_dir_id"] if context else self.current_dir_id
         uploads = []
         folder_entries = []
+        reserved_file_names = set(existing_file_names)
 
         # 单文件直接在主线程处理（无 I/O），文件夹收集后交给后台线程
         for entry in entries:
@@ -1202,12 +1298,14 @@ class FileInterface(QWidget):
             if entry["is_dir"]:
                 folder_entries.append(entry)
             else:
-                file_name = path.name
-                if entry.get("rename"):
-                    file_name = _generate_keep_both_name(file_name, existing_file_names)
+                file_name = _assign_reserved_file_name(
+                    path.name,
+                    reserved_file_names,
+                    force_rename=bool(entry.get("rename")),
+                )
                 uploads.append({
                     "file_name": file_name,
-                    "file_size": entry.get("file_size", path.stat().st_size),
+                    "file_size": entry["file_size"] if "file_size" in entry else path.stat().st_size,
                     "local_path": str(path),
                     "target_dir_id": target_dir_id,
                 })
@@ -1246,48 +1344,28 @@ class FileInterface(QWidget):
         signals = task.signals
         self._cleanup_stale_signals()
         self._pending_signals.append(signals)
+        callback_context = self.__buildAsyncContext(dir_id=target_dir_id)
 
         def _on_folder_prepare_done(
             folder_uploads, folder_items, created_dir_count, folder_error,
             sig=signals,
+            _context=callback_context,
             _added_count=added_count,
             _error=error,
             _should_refresh=should_refresh_current_dir,
         ):
             if sig in self._pending_signals:
                 self._pending_signals.remove(sig)
-
-            # 添加文件夹内的文件上传任务
-            for upload in folder_uploads:
-                self.transfer_interface.add_upload_task(
-                    upload["file_name"],
-                    upload["file_size"],
-                    upload["local_path"],
-                    upload["target_dir_id"],
-                )
-                _added_count += 1
-
-            if folder_items and _should_refresh:
-                self.__updateTreeUI(folder_items, remove_missing=False)
-            if (folder_uploads or folder_items) and _should_refresh:
-                self.__refreshFileList()
-
-            total_count = _added_count
-            total_dirs = created_dir_count
-            if total_count or total_dirs:
-                InfoBar.success(
-                    title="上传文件",
-                    content=self.__buildUploadSummary(total_count, total_dirs),
-                    parent=self,
-                )
-            if _error:
-                InfoBar.warning(title="部分文件已跳过", content=_error, parent=self)
-            if folder_error:
-                for part in folder_error.split("；"):
-                    if part:
-                        InfoBar.warning(
-                            title="文件夹上传失败", content=part, parent=self,
-                        )
+            self.__onFolderPrepareDone(
+                folder_uploads,
+                folder_items,
+                created_dir_count,
+                folder_error,
+                _context,
+                _added_count,
+                _error,
+                _should_refresh,
+            )
 
         signals.finished.connect(_on_folder_prepare_done)
         QThreadPool.globalInstance().start(task)
@@ -1466,6 +1544,7 @@ class FileInterface(QWidget):
                     self.signals.finished.emit([], self.target_dir_id, None, str(e), "")
 
         self._jump_signals = JumpSignals()
+        self._pending_signals.append(self._jump_signals)  # P2-17: 纳入统一管理防 GC
         self._jump_signals.finished.connect(
             lambda detail_paths, target_dir_id, selected_file_id, error, target_name, rid=current_request_id:
             self.__onJumpFinished(

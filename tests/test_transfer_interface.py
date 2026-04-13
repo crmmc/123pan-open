@@ -3,7 +3,8 @@ from unittest.mock import MagicMock
 
 from src.app.common import database as database_module
 from src.app.common.database import Database
-from src.app.view.transfer_interface import DownloadTask, TransferInterface, UploadTask
+from src.app.common.download_resume import get_merged_path, get_part_path
+from src.app.view.transfer_interface import DownloadTask, DownloadThread, TransferInterface, UploadTask
 
 
 class _FakeSignal:
@@ -279,6 +280,55 @@ def test_remove_active_upload_defers_delete_until_terminal_status(tmp_path, monk
     assert db.get_upload_task(task_id) is None
 
 
+def test_remove_active_download_defers_delete_until_terminal_status(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_download_task(
+        "demo.bin",
+        12,
+        99,
+        str(tmp_path / "demo.bin"),
+    )
+    task.status = "下载中"
+    thread = MagicMock()
+    task.thread = thread
+    interface.download_threads.append(thread)
+    resume_id = task.resume_id
+
+    interface._TransferInterface__remove_task(task, "download")
+
+    assert task in interface.download_tasks
+    assert task.delete_requested is True
+    assert task.cleanup_on_cancel is True
+    assert thread.cancel.call_count == 1
+    assert interface._TransferInterface__active_download_count() == 1
+    assert db.get_download_task(resume_id) is not None
+
+    interface._TransferInterface__update_task_status(task, "已取消")
+
+    assert task not in interface.download_tasks
+    assert interface._TransferInterface__active_download_count() == 0
+    assert db.get_download_task(resume_id) is None
+
+
+def test_remove_active_download_persists_cancelled_status_before_thread_exit(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_download_task(
+        "demo.bin",
+        12,
+        99,
+        str(tmp_path / "demo.bin"),
+    )
+    task.status = "下载中"
+    task.thread = MagicMock()
+
+    interface._TransferInterface__remove_task(task, "download")
+
+    stored = db.get_download_task(task.resume_id)
+    assert stored is not None
+    assert stored["status"] == "已取消"
+    assert stored["error"] == "用户删除任务"
+
+
 def test_start_download_task_clears_pause_and_cancel_flags(tmp_path, monkeypatch):
     interface, db = _make_interface(tmp_path, monkeypatch)
     interface.pan = object()
@@ -315,6 +365,191 @@ def test_start_download_task_clears_pause_and_cancel_flags(tmp_path, monkeypatch
     assert task.is_cancelled is False
     assert created_threads == [(False, False, interface.pan)]
     assert task.thread is not None
+
+
+def test_download_thread_cancel_closes_active_response(tmp_path):
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        account_name="alice",
+    )
+    active_response = MagicMock()
+    task._active_response = active_response
+    thread = DownloadThread(task, pan=MagicMock())
+
+    thread.cancel()
+
+    assert task.is_cancelled is True
+    assert task.pause_requested is False
+    active_response.close.assert_called_once()
+
+
+def test_pause_non_resumable_download_resets_progress(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        account_name="alice",
+    )
+    task.status = "下载中"
+    task.progress = 67
+    task.supports_resume = False
+    task.thread = MagicMock()
+    db.save_download_task({
+        "resume_id": task.resume_id,
+        "account_name": "alice",
+        "file_name": task.file_name,
+        "file_id": task.file_id,
+        "save_path": task.save_path,
+        "status": "下载中",
+        "progress": 67,
+        "supports_resume": 0,
+    })
+
+    interface._TransferInterface__toggle_pause(task)
+
+    assert task.progress == 0
+    stored = db.get_download_task(task.resume_id)
+    assert stored is not None
+    assert stored["progress"] == 0
+
+
+def test_retry_non_resumable_download_resets_progress(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        account_name="alice",
+    )
+    task.status = "已暂停"
+    task.progress = 67
+    task.supports_resume = False
+    db.save_download_task({
+        "resume_id": task.resume_id,
+        "account_name": "alice",
+        "file_name": task.file_name,
+        "file_id": task.file_id,
+        "save_path": task.save_path,
+        "status": "已暂停",
+        "progress": 67,
+        "supports_resume": 0,
+    })
+
+    interface._TransferInterface__retry_download(task)
+
+    assert task.progress == 0
+    stored = db.get_download_task(task.resume_id)
+    assert stored is not None
+    assert stored["progress"] == 0
+
+
+def test_try_start_pending_downloads_respects_auto_start_suppression(tmp_path, monkeypatch):
+    interface, _db = _make_interface(tmp_path, monkeypatch)
+    interface._auto_start_suppressed = True
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        account_name="alice",
+    )
+    task.status = "等待中"
+    interface.download_tasks = [task]
+    interface._TransferInterface__start_download_task = MagicMock()
+
+    TransferInterface._TransferInterface__try_start_pending_downloads(interface)
+
+    interface._TransferInterface__start_download_task.assert_not_called()
+
+
+def test_resolve_download_detail_clears_old_parts_when_remote_version_changes(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        current_dir_id=7,
+        etag="old-etag-2",
+        s3key_flag=False,
+        account_name="alice",
+    )
+    db.save_download_task({
+        "resume_id": task.resume_id,
+        "account_name": "alice",
+        "file_name": task.file_name,
+        "file_size": 12,
+        "file_id": task.file_id,
+        "file_type": 0,
+        "save_path": task.save_path,
+        "current_dir_id": task.current_dir_id,
+        "etag": "old-etag-2",
+        "s3key_flag": 0,
+        "status": "已暂停",
+        "progress": 66,
+    })
+    db.record_download_part(task.resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": 11,
+        "expected_size": 12,
+        "actual_size": 12,
+        "md5": "part-md5",
+    })
+    part_path = get_part_path(task.resume_id, 0)
+    part_path.parent.mkdir(parents=True, exist_ok=True)
+    part_path.write_bytes(b"old-part-data")
+    merged_path = get_merged_path(task.resume_id)
+    merged_path.write_bytes(b"old-merged-data")
+
+    current_detail = {
+        "FileId": task.file_id,
+        "FileName": task.file_name,
+        "Type": 0,
+        "Size": 12,
+        "Etag": "new-etag-2",
+        "S3KeyFlag": False,
+    }
+    monkeypatch.setattr(
+        "src.app.view.transfer_interface.resolve_download_file_detail",
+        lambda *_args, **_kwargs: current_detail,
+    )
+
+    thread = DownloadThread(task, pan=MagicMock())
+    resolved = thread._resolve_download_detail()
+
+    assert resolved == current_detail
+    assert task.progress == 0
+    assert db.get_download_parts(task.resume_id) == []
+    assert not part_path.exists()
+    assert not merged_path.exists()
+    stored = db.get_download_task(task.resume_id)
+    assert stored is not None
+    assert stored["progress"] == 0
+    assert stored["etag"] == "new-etag-2"
+
+
+def test_reload_download_tasks_drops_cancelled_records(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    db.save_download_task({
+        "resume_id": "resume-cancelled",
+        "account_name": "alice",
+        "file_name": "demo.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "demo.bin"),
+        "status": "已取消",
+    })
+
+    TransferInterface._TransferInterface__reload_download_tasks(interface)
+
+    assert interface.download_tasks == []
+    assert db.get_download_task("resume-cancelled") is None
 
 
 def test_upload_task_error_persists_error_message(tmp_path, monkeypatch):
@@ -425,12 +660,11 @@ def test_retry_upload_clears_stale_session_and_parts(tmp_path, monkeypatch):
     assert stored is not None
     assert stored["status"] == "等待中"
     assert stored["progress"] == 66
-    assert stored["bucket"] == ""
-    assert stored["upload_key"] == ""
-    assert stored["upload_id_s3"] == ""
-    assert stored["etag"] == ""
+    # P1-7: S3 session 有效时保留，复用已上传分片
+    assert stored["bucket"] == "bucket"
+    assert stored["upload_key"] == "key"
+    assert stored["upload_id_s3"] == "upload-id"
     assert stored["error"] == ""
-    assert db.get_upload_parts(task.db_task_id) == []
 
 
 def test_reload_upload_tasks_drops_persisted_delete_requested_items(tmp_path, monkeypatch):

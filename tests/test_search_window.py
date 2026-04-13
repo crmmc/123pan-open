@@ -38,6 +38,9 @@ class _FakeResultList:
         self.items = []
         self._viewport = _FakeViewport()
 
+    def clear(self):
+        self.items.clear()
+
     def addItem(self, item):
         self.items.append(item)
 
@@ -100,3 +103,27 @@ def test_paths_finished_ignores_stale_result():
 
     assert item.data(Qt.ItemDataRole.UserRole)["paths"] is None
     assert dialog.resultList.viewport().updated is False
+
+
+def test_do_search_reports_business_error_instead_of_zero_results(monkeypatch):
+    dialog = SearchDialog.__new__(SearchDialog)
+    dialog.pan = MagicMock()
+    dialog.pan.get_dir_by_id.return_value = (5001, [])
+    dialog._search_request_id = 0
+    dialog._closed = False
+    dialog._pending_signals = []
+    dialog.statusLabel = _FakeLabel()
+    dialog.resultList = _FakeResultList()
+    dialog._SearchDialog__fetchPaths = MagicMock()
+
+    class _FakeThreadPool:
+        def start(self, task):
+            task.run()
+
+    monkeypatch.setattr(search_module.QThreadPool, "globalInstance", lambda: _FakeThreadPool())
+
+    SearchDialog._SearchDialog__doSearch(dialog, "demo")
+
+    assert dialog.statusLabel.text == "搜索失败: 搜索失败，返回码: 5001"
+    assert dialog.resultList.items == []
+    dialog._SearchDialog__fetchPaths.assert_not_called()

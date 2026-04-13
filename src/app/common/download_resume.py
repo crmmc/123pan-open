@@ -27,6 +27,7 @@ MIN_PARALLEL_SIZE = 2 * 1024 * 1024
 IO_CHUNK_SIZE = 1024 * 1024
 MAX_PART_QUEUE_ATTEMPTS = 3
 DEFAULT_MAX_DOWNLOAD_THREADS = 1
+SINGLE_STREAM_READ_TIMEOUT = 60
 
 _dl_session = requests.Session()
 _dl_session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=1))
@@ -144,6 +145,13 @@ def _save_download_status(resume_id, total, downloaded, status, error=None):
     )
 
 
+def _delete_download_resume_state(resume_task):
+    if not resume_task:
+        return
+    Database.instance().delete_download_task(resume_task.resume_id)
+    cleanup_temp_dir(resume_task.resume_id)
+
+
 def _reset_partial_download(part_path, aggregator, byte_count, resume_id, index):
     if byte_count:
         aggregator.record(-byte_count)
@@ -163,6 +171,20 @@ def _cleanup_parts(resume_id, part_indexes):
                 p.unlink()
             except OSError:
                 logger.warning("删除分片失败: %s", p)
+
+
+def _verify_completed_download(file_path, total, resume_task):
+    expected_etag = (resume_task.etag or "").strip().strip('"').lower()
+    if expected_etag and "-" not in expected_etag:
+        actual_etag = _compute_md5(file_path).lower()
+        if actual_etag != expected_etag:
+            raise RuntimeError("整文件校验失败，需要重新下载")
+        return
+    actual_size = file_path.stat().st_size
+    if total and actual_size != total:
+        raise RuntimeError(f"文件大小不匹配: 预期 {total}, 实际 {actual_size}")
+    if expected_etag:
+        logger.info("ETag 无法作为整文件 MD5，仅执行大小校验: %s", expected_etag)
 
 
 # ---- part plan ----
@@ -256,6 +278,13 @@ def _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled):
     if not resume_task:
         return None
     db = Database.instance()
+    # P0-4: 如果 DB 中已有 supports_resume=1 且有已完成分片，保留旧值不覆盖
+    effective_supports_resume = int(multi_part_enabled)
+    existing = db.get_download_task(resume_task.resume_id)
+    if existing and existing.get("supports_resume", 0) == 1:
+        stored_parts = db.get_download_parts(resume_task.resume_id)
+        if stored_parts:
+            effective_supports_resume = 1
     task_data = {
         "resume_id": resume_task.resume_id,
         "account_name": resume_task.account_name,
@@ -270,8 +299,9 @@ def _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled):
         "status": resume_task.status,
         "progress": resume_task.progress,
         "error": resume_task.last_error,
-        "supports_resume": int(multi_part_enabled),
+        "supports_resume": effective_supports_resume,
         "metadata_version": getattr(resume_task, "metadata_version", 2),
+        "part_size": get_download_part_size(),  # P1-9: 持久化分片大小
     }
     db.save_download_task(task_data)
     return task_data
@@ -346,42 +376,50 @@ def _download_part(
             md5 = hashlib.md5()
             buf.seek(0)
             buf.truncate()
-            with _dl_session.get(url_holder[0], headers=headers, stream=True, timeout=(5, 600)) as resp:
-                if resp.status_code == 403:
-                    if refresh_url_fn:
-                        try:
-                            new_url = refresh_url_fn()
-                            if new_url and not isinstance(new_url, int):
-                                url_holder[0] = new_url
-                                refresh_403_count += 1
-                                if refresh_403_count > max_refresh_403:
-                                    logger.warning("分片 %d 连续 %d 次 403 refresh 仍失败", index, refresh_403_count)
-                                    return "url_expired"
-                                logger.debug("分片 %d URL 已刷新，重试 (%d/%d)", index, refresh_403_count, max_refresh_403)
-                                continue
-                        except Exception as exc:
-                            logger.warning("分片 %d 刷新 URL 失败: %s", index, exc)
-                    return "url_expired"
-                if resp.status_code in RATE_LIMIT_CODES:
-                    return "rate_limited"
-                resp.raise_for_status()
-                for chunk in resp.iter_content(chunk_size=io_chunk_size):
-                    stop_result = _get_stop_result(task)
-                    if stop_result:
-                        # 丢弃内存 buffer，回滚 aggregator 进度
-                        if attempt_downloaded:
-                            aggregator.record(-attempt_downloaded)
-                        Database.instance().remove_download_part(resume_id, index)
-                        return stop_result
-                    if not chunk:
-                        continue
-                    if not first_byte_signaled and first_byte_callback:
-                        first_byte_callback()
-                        first_byte_signaled = True
-                    buf.write(chunk)
-                    md5.update(chunk)
-                    attempt_downloaded += len(chunk)
-                    aggregator.record(len(chunk))
+            try:
+                with _dl_session.get(url_holder[0], headers=headers, stream=True, timeout=(5, 600)) as resp:
+                    if task is not None:
+                        with task._response_lock:
+                            task._active_response = resp
+                    if resp.status_code == 403:
+                        if refresh_url_fn:
+                            try:
+                                new_url = refresh_url_fn()
+                                if new_url and not isinstance(new_url, int):
+                                    url_holder[0] = new_url
+                                    refresh_403_count += 1
+                                    if refresh_403_count > max_refresh_403:
+                                        logger.warning("分片 %d 连续 %d 次 403 refresh 仍失败", index, refresh_403_count)
+                                        return "url_expired"
+                                    logger.debug("分片 %d URL 已刷新，重试 (%d/%d)", index, refresh_403_count, max_refresh_403)
+                                    continue
+                            except Exception as exc:
+                                logger.warning("分片 %d 刷新 URL 失败: %s", index, exc)
+                        return "url_expired"
+                    if resp.status_code in RATE_LIMIT_CODES:
+                        return "rate_limited"
+                    resp.raise_for_status()
+                    for chunk in resp.iter_content(chunk_size=io_chunk_size):
+                        stop_result = _get_stop_result(task)
+                        if stop_result:
+                            # 丢弃内存 buffer，回滚 aggregator 进度
+                            if attempt_downloaded:
+                                aggregator.record(-attempt_downloaded)
+                            Database.instance().remove_download_part(resume_id, index)
+                            return stop_result
+                        if not chunk:
+                            continue
+                        if not first_byte_signaled and first_byte_callback:
+                            first_byte_callback()
+                            first_byte_signaled = True
+                        buf.write(chunk)
+                        md5.update(chunk)
+                        attempt_downloaded += len(chunk)
+                        aggregator.record(len(chunk))
+            finally:
+                if task is not None:
+                    with task._response_lock:
+                        task._active_response = None
             # 校验 + 一次性写磁盘
             data = buf.getvalue()
             actual_size = len(data)
@@ -423,17 +461,22 @@ def _download_part(
 
 def _download_with_resume(redirect_url, out_path, total, signals, task, resume_task, speed_tracker, refresh_url_fn=None):
     resume_id = resume_task.resume_id
-    # 恢复时使用已有分片的 part_size，避免用户修改配置后分片计划不匹配导致全部重下
-    stored_parts = Database.instance().get_download_parts(resume_id)
+    db = Database.instance()
+    # P1-9: 优先从 DB 读取持久化的 part_size，避免用户修改配置后分片计划不匹配
+    stored_task = db.get_download_task(resume_id)
     stored_part_size = None
-    if stored_parts:
-        # 取第一个非末尾分片的 expected_size（末尾分片可能不足一个完整 part）
-        for sp in stored_parts:
-            if sp["expected_size"] > 0 and sp["part_index"] < len(stored_parts) - 1:
-                stored_part_size = sp["expected_size"]
-                break
-        if stored_part_size is None and stored_parts:
-            stored_part_size = stored_parts[0]["expected_size"]
+    if stored_task and stored_task.get("part_size", 0) > 0:
+        stored_part_size = stored_task["part_size"]
+    else:
+        # 兼容旧数据：从已有分片推断
+        stored_parts = db.get_download_parts(resume_id)
+        if stored_parts:
+            for sp in stored_parts:
+                if sp["expected_size"] > 0 and sp["part_index"] < len(stored_parts) - 1:
+                    stored_part_size = sp["expected_size"]
+                    break
+            if stored_part_size is None and stored_parts:
+                stored_part_size = stored_parts[0]["expected_size"]
     part_plan = _build_parts(total, part_size=stored_part_size)
     _prepare_resume_metadata(out_path, total, resume_task, True)
 
@@ -654,20 +697,12 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
             cleanup_temp_dir(resume_id)
         return "已取消"
 
-    # etag 校验（去引号；分片格式如 md5-3 跳过校验）
-    expected_etag = (resume_task.etag or "").strip().strip('"').lower()
-    if expected_etag and "-" not in expected_etag:
-        actual_etag = _compute_md5(merged_path).lower()
-        if actual_etag != expected_etag:
-            cleanup_temp_dir(resume_id)
-            Database.instance().delete_download_task(resume_id)
-            raise RuntimeError("整文件校验失败，需要重新下载")
-    elif total and merged_path.stat().st_size != total:
-        # M13: etag 不可用时兜底大小校验
-        actual_size = merged_path.stat().st_size
+    try:
+        _verify_completed_download(merged_path, total, resume_task)
+    except RuntimeError:
         cleanup_temp_dir(resume_id)
         Database.instance().delete_download_task(resume_id)
-        raise RuntimeError(f"文件大小不匹配: 预期 {total}, 实际 {actual_size}")
+        raise
 
     # 移动到目标位置
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -679,53 +714,82 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
 
 # ---- single stream download ----
 
-def _download_single_stream(redirect_url, out_path, total, signals, task, speed_tracker):
+def _download_single_stream(
+    redirect_url, out_path, total, signals, task, resume_task, speed_tracker, refresh_url_fn=None,
+):
     temp_dir = CONFIG_DIR / "tmp" / "single_stream"
     temp_dir.mkdir(parents=True, exist_ok=True)
     temp_path = temp_dir / f"{uuid.uuid4().hex}_{out_path.name}"
+    current_url = redirect_url
+    refresh_403_count = 0
+    max_refresh_403 = 3
     _notify_status(signals, "下载中")
     try:
-        with _dl_session.get(redirect_url, stream=True, timeout=(5, 600)) as response:
-            if response.status_code in RATE_LIMIT_CODES:
-                raise RuntimeError("下载被限流，请稍后重试")
-            response.raise_for_status()
-            done = 0
-            last_t = 0.0
-            with open(temp_path, "wb") as f:
-                for chunk in response.iter_content(chunk_size=256 * 1024):
-                    stop_result = _get_stop_result(task)
-                    if stop_result:
-                        f.close()
-                        if temp_path.exists():
-                            temp_path.unlink()
-                        status = "已暂停" if stop_result == "paused" else "已取消"
-                        _notify_status(signals, status)
-                        return status
-                    if not chunk:
-                        continue
-                    f.write(chunk)
-                    done += len(chunk)
-                    if speed_tracker:
-                        speed_tracker.record(done)
-                    now = time.time()
-                    if now - last_t > PROGRESS_INTERVAL:
-                        _notify_progress(signals, total, done)
-                        last_t = now
+        while True:
+            with _dl_session.get(current_url, stream=True, timeout=(5, SINGLE_STREAM_READ_TIMEOUT)) as response:
+                if task is not None:
+                    with task._response_lock:
+                        task._active_response = response
+                if response.status_code == 403:
+                    if refresh_url_fn:
+                        new_url = refresh_url_fn()
+                        if new_url and not isinstance(new_url, int):
+                            refresh_403_count += 1
+                            if refresh_403_count > max_refresh_403:
+                                raise RuntimeError("下载链接已过期或刷新失败")
+                            current_url = new_url
+                            continue
+                    raise RuntimeError("下载链接已过期或刷新失败")
+                if response.status_code in RATE_LIMIT_CODES:
+                    raise RuntimeError("下载被限流，请稍后重试")
+                response.raise_for_status()
+                done = 0
+                last_t = 0.0
+                with open(temp_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=256 * 1024):
+                        stop_result = _get_stop_result(task)
+                        if stop_result:
+                            f.close()
+                            # P2-19: 暂停时保留临时文件，取消时才删除
+                            if stop_result == "cancelled" and temp_path.exists():
+                                temp_path.unlink()
+                            status = "已暂停" if stop_result == "paused" else "已取消"
+                            if stop_result == "cancelled" and getattr(task, "cleanup_on_cancel", False):
+                                _delete_download_resume_state(resume_task)
+                            _notify_status(signals, status)
+                            return status
+                        if not chunk:
+                            continue
+                        f.write(chunk)
+                        done += len(chunk)
+                        if speed_tracker:
+                            speed_tracker.record(done)
+                        now = time.time()
+                        if now - last_t > PROGRESS_INTERVAL:
+                            _notify_progress(signals, total, done)
+                            last_t = now
+            break
         _notify_progress(signals, total, done)
         if _is_task_paused(task):
-            if temp_path.exists():
-                temp_path.unlink()
+            # P2-19: 暂停时保留临时文件以便恢复
             _notify_status(signals, "已暂停")
             return "已暂停"
         if _is_task_cancelled(task):
             if temp_path.exists():
                 temp_path.unlink()
+            if getattr(task, "cleanup_on_cancel", False):
+                _delete_download_resume_state(resume_task)
             _notify_status(signals, "已取消")
             return "已取消"
         # H3: 大小校验
         if total and done != total:
             temp_path.unlink(missing_ok=True)
             raise RuntimeError(f"下载大小不匹配: 预期 {total}, 实际 {done}")
+        try:
+            _verify_completed_download(temp_path, total, resume_task)
+        except RuntimeError:
+            temp_path.unlink(missing_ok=True)
+            raise
         out_path.parent.mkdir(parents=True, exist_ok=True)
         _replace_output_file(temp_path, out_path)
         return out_path
@@ -734,6 +798,10 @@ def _download_single_stream(redirect_url, out_path, total, signals, task, speed_
         if temp_path.exists():
             temp_path.unlink(missing_ok=True)
         raise
+    finally:
+        if task is not None:
+            with task._response_lock:
+                task._active_response = None
 
 
 # ---- entry point ----
@@ -793,7 +861,7 @@ def stream_download_from_url(
                 resume_task, speed_tracker, refresh_url_fn,
             )
         return _download_single_stream(
-            redirect_url, out_path, total, signals, task, speed_tracker,
+            redirect_url, out_path, total, signals, task, resume_task, speed_tracker, refresh_url_fn,
         )
     except Exception as exc:
         _notify_status(signals, "失败")

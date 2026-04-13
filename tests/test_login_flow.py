@@ -64,17 +64,22 @@ class TestTryTokenProbe:
         mock_pan = MagicMock()
         mock_pan.user_info.return_value = None
         with patch("src.app.view.login_window.load_credential", return_value="expired-token"), \
-             patch("src.app.view.login_window.Pan123", return_value=mock_pan):
+             patch("src.app.view.login_window.Pan123", return_value=mock_pan), \
+             patch("src.app.view.login_window.delete_credential") as mock_delete:
             result = try_token_probe(db)
         assert result is None
         assert db.get_config("authorization", "") == ""
+        mock_delete.assert_called_once_with("authorization")
 
-    def test_keeps_token_on_exception(self, tmp_path, monkeypatch):
+    def test_clears_token_on_exception(self, tmp_path, monkeypatch):
         db = _use_temp_db(tmp_path, monkeypatch)
         with patch("src.app.view.login_window.load_credential", return_value="bad-token"), \
-             patch("src.app.view.login_window.Pan123", side_effect=Exception("connection error")):
+             patch("src.app.view.login_window.Pan123", side_effect=Exception("connection error")), \
+             patch("src.app.view.login_window.delete_credential") as mock_delete:
             result = try_token_probe(db)
         assert result is None
+        assert db.get_config("authorization", "") == ""
+        mock_delete.assert_called_once_with("authorization")
 
 
 class TestLoginWithCredentials:
@@ -114,7 +119,7 @@ class TestQRLoginPage:
         page.loginSuccess.connect(lambda obj: signals.append(obj))
         # _on_poll_result → _handle_login_success (async via QThreadPool) → _on_login_verified → emit
         # 直接调用 _on_login_verified 测试最终信号发射
-        page._on_login_verified(mock_pan)
+        page._on_login_verified(page._qr_flow_id, mock_pan)
         assert len(signals) == 1
         assert signals[0] is mock_pan
 
@@ -122,15 +127,45 @@ class TestQRLoginPage:
         page = self._make_page()
         signals = []
         page.loginSuccess.connect(lambda obj: signals.append(obj))
-        page._on_poll_result({"loginStatus": 0})
+        page._on_poll_result(page._qr_flow_id, {"loginStatus": 0})
         assert len(signals) == 0
 
     def test_poll_consecutive_errors_stops(self):
         page = self._make_page()
         page.poll_timer.start(1000)
         for _ in range(3):
-            page._on_poll_error()
+            page._on_poll_error(page._qr_flow_id)
         assert not page.poll_timer.isActive()
+
+    def test_do_poll_skips_when_poll_already_in_flight(self):
+        page = self._make_page()
+        page._poll_in_flight = True
+
+        with patch("src.app.view.qr_login_page.QThreadPool.globalInstance") as mock_pool:
+            page._do_poll()
+
+        mock_pool.return_value.start.assert_not_called()
+
+    def test_login_verified_drops_stale_flow_result(self):
+        page = self._make_page()
+        signals = []
+        page.loginSuccess.connect(lambda obj: signals.append(obj))
+
+        page._on_login_verified(page._qr_flow_id + 1, MagicMock())
+
+        assert signals == []
+
+    def test_qr_generated_closes_pan_temp_for_stale_flow(self):
+        page = self._make_page()
+        stale_pan = MagicMock()
+
+        page._on_qr_generated(page._qr_flow_id + 1, {
+            "_pan_temp": stale_pan,
+            "uniID": "stale-uni",
+            "url": "https://example.test/qr",
+        })
+
+        stale_pan.close.assert_called_once()
 
 
 class TestQRLoginSuccess:
@@ -187,6 +222,21 @@ class TestQRLoginSuccess:
         # QR 登录总是清除记住密码状态
         assert db.get_config("rememberPassword", None) is False
         assert db.get_config("passWord", "") == ""
+
+    def test_qr_login_deletes_saved_password_credential(self, tmp_path, monkeypatch):
+        dialog, _db = self._make_dialog(tmp_path, monkeypatch)
+        mock_pan = MagicMock()
+        mock_pan.authorization = "Bearer test-jwt"
+        mock_pan.user_name = "new-user"
+        mock_pan.devicetype = "test-device"
+        mock_pan.osversion = "test-os"
+        mock_pan.loginuuid = "test-uuid"
+
+        with patch.object(dialog, "accept"), \
+             patch("src.app.view.login_window.delete_credential") as mock_delete:
+            dialog._on_qr_login_success(mock_pan)
+
+        mock_delete.assert_any_call("passWord")
 
 
 class TestLoginDialogConfig:

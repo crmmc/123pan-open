@@ -42,6 +42,8 @@ def slow_start_scheduler(
     # 事件驱动监控循环
     while True:
         worker_feedback.wait(timeout=5)
+        # P2-18: 先 clear 再处理，避免吞掉并发 set() 通知
+        # （最坏情况下延迟一个 timeout 周期，不会丢失）
         worker_feedback.clear()
 
         if failed[0] or is_stopped_fn():
@@ -82,8 +84,9 @@ def slow_start_scheduler(
         # 3. 完成 / 安全网
         with progress_lock:
             if active_workers[0] == 0 and part_queue.empty():
-                break
-            if active_workers[0] == 0 and not part_queue.empty() and allowed_workers[0] >= 1:
+                # P0-1: 释放锁后 join 所有线程，再检查队列是否为空
+                pass  # fall through to join-and-recheck below
+            elif active_workers[0] == 0 and not part_queue.empty() and allowed_workers[0] >= 1:
                 t = threading.Thread(
                     target=worker_fn,
                     name=f"{thread_prefix}_{len(threads)}",
@@ -95,6 +98,19 @@ def slow_start_scheduler(
                     probe_thread_name[0] = t.name
                 t.start()
                 logger.debug("[调度器] 安全网触发: 无活跃 worker 但队列非空, probe=%s", probe_thread_name[0])
+
+        # P0-1: 疑似完成时，join 所有线程后再检查队列
+        with progress_lock:
+            maybe_done = active_workers[0] == 0 and part_queue.empty()
+        if maybe_done:
+            for t in threads:
+                t.join(timeout=5)
+            # worker finally 中可能将失败的 part 放回队列
+            with progress_lock:
+                if part_queue.empty():
+                    break
+                # 队列非空，继续循环
+                logger.debug("[调度器] join 后队列非空，继续调度")
 
     for t in threads:
         t.join()

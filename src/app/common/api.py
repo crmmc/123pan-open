@@ -132,6 +132,46 @@ class TokenExpiredError(RuntimeError):
     """token 过期且无法自动刷新（QR 登录无密码）。"""
 
 
+class _PrefetchResultSlot:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._prefetch_id = None
+        self._part_number = None
+        self._result = None
+
+    def reserve(self, prefetch_id, part_number):
+        with self._lock:
+            self._prefetch_id = prefetch_id
+            self._part_number = part_number
+            self._result = None
+
+    def clear(self):
+        with self._lock:
+            self._prefetch_id = None
+            self._part_number = None
+            self._result = None
+
+    def publish(self, prefetch_id, part_number, *, url=None, error=None):
+        with self._lock:
+            if self._prefetch_id != prefetch_id or self._part_number != part_number:
+                return
+            self._result = {
+                "part_number": part_number,
+                "url": url,
+                "error": error,
+            }
+
+    def consume(self, prefetch_id, part_number):
+        with self._lock:
+            if self._prefetch_id != prefetch_id or self._part_number != part_number:
+                return None
+            result = self._result
+            self._prefetch_id = None
+            self._part_number = None
+            self._result = None
+            return result
+
+
 def _parse_json_response(response):
     """统一解析 JSON 响应，避免裸 .json() 崩溃。"""
     try:
@@ -173,6 +213,43 @@ def _calculate_file_md5(
     return None, md5.hexdigest()
 
 
+def _normalize_etag(etag):
+    return str(etag or "").strip().strip('"').lower()
+
+
+def _calculate_file_part_md5(file_path, offset, size, task=None):
+    md5 = hashlib.md5()
+    remaining = size
+    with open(file_path, "rb") as file_obj:
+        file_obj.seek(offset)
+        while remaining > 0:
+            if task and getattr(task, "is_cancelled", False):
+                return "已取消", ""
+            if task and getattr(task, "pause_requested", False):
+                return "已暂停", ""
+            chunk = file_obj.read(min(1024 * 1024, remaining))
+            if not chunk:
+                raise RuntimeError(f"读取上传分块失败: offset={offset}, remaining={remaining}")
+            md5.update(chunk)
+            remaining -= len(chunk)
+    return None, md5.hexdigest()
+
+
+def _normalize_uploaded_part(part):
+    return {
+        "ETag": str(part.get("ETag", "")),
+        "PartNumber": int(part.get("PartNumber", 0)),
+    }
+
+
+def _merge_uploaded_parts(*part_maps):
+    merged = {}
+    for part_map in part_maps:
+        for part_number, part in part_map.items():
+            merged[int(part_number)] = _normalize_uploaded_part(part)
+    return sorted(merged.values(), key=lambda item: item["PartNumber"])
+
+
 def _reset_transient_failure_count(counter):
     counter[0] = 0
 
@@ -195,7 +272,6 @@ class Pan123:
         self.loginuuid = uuid.uuid4().hex
 
         self.on_token_expired = None  # callback: 通知 UI token 过期需重新登录
-        self.recycle_list = None
         self.parent_file_name_list = []
         self.all_file = False
         self.file_page = 0
@@ -244,6 +320,55 @@ class Pan123:
         except Exception:
             pass
 
+    def _list_uploaded_parts(self, headers, bucket, upload_key, upload_id, storage_node):
+        list_data = {
+            "bucket": bucket,
+            "key": upload_key,
+            "uploadId": upload_id,
+            "storageNode": storage_node,
+        }
+        list_res = self._api_request(
+            self.session.post,
+            "https://www.123pan.com/b/api/file/s3_list_upload_parts",
+            headers=headers,
+            data=json.dumps(list_data),
+            timeout=30,
+        )
+        list_json = _parse_json_response(list_res)
+        if list_json.get("code", -1) != 0:
+            raise RuntimeError("列出上传分块失败: " + json.dumps(list_json, ensure_ascii=False))
+        server_parts = {}
+        for raw_part in list_json.get("data", {}).get("parts") or []:
+            normalized_part = _normalize_uploaded_part(raw_part)
+            if normalized_part["PartNumber"] <= 0:
+                raise RuntimeError(f"服务端返回了无效分块编号: {raw_part}")
+            server_parts[normalized_part["PartNumber"]] = normalized_part
+        return server_parts
+
+    def _validate_resume_server_parts(
+        self, file_path, fsize, block_size, total_parts, server_parts, task=None,
+    ):
+        for part_number, server_part in sorted(server_parts.items()):
+            if part_number > total_parts:
+                raise RuntimeError(
+                    f"服务端分块编号越界: part={part_number}, total={total_parts}"
+                )
+            offset = (part_number - 1) * block_size
+            part_size = min(block_size, fsize - offset)
+            if part_size <= 0:
+                raise RuntimeError(
+                    f"服务端分块大小无效: part={part_number}, offset={offset}, size={part_size}"
+                )
+            stop_state, local_part_md5 = _calculate_file_part_md5(
+                file_path, offset, part_size, task=task,
+            )
+            if stop_state:
+                return stop_state, False
+            if _normalize_etag(local_part_md5) != _normalize_etag(server_part["ETag"]):
+                logger.warning("服务端分块 %s 与当前本地文件不一致", part_number)
+                return None, False
+        return None, True
+
     def login(self):
         with self._login_lock:
             return self._login_without_lock()
@@ -265,8 +390,8 @@ class Pan123:
         res_sign = _parse_json_response(login_res)
         res_code_login = res_sign.get("code", -1)
         if res_code_login != 200:
-            logger.error("code = 1 Error: %s", res_code_login)
-            logger.error(res_sign.get("message", ""))
+            self._login_message = res_sign.get("message", "")
+            logger.error("登录失败 code=%s: %s", res_code_login, self._login_message)
             return res_code_login
 
         token = res_sign.get("data", {}).get("token", "")
@@ -326,6 +451,7 @@ class Pan123:
                 return response
             if response_json.get("code") != 2 or token_refreshes >= max_token_refreshes:
                 return response
+            response.close()
             self._refresh_token_for_request(request_authorization)
             token_refreshes += 1
 
@@ -461,37 +587,20 @@ class Pan123:
         with self._raw_request(
             self.session.get, down_load_url, timeout=10, allow_redirects=False
         ) as next_resp:
+            redirect_url = next_resp.headers.get("Location", "")
             next_to_get = next_resp.text
-        url_pattern = re.compile(r"""href=["'](https?://[^"']+)["']""")
-        matches = url_pattern.findall(next_to_get)
-        if not matches:
-            logger.error("未找到重定向链接，响应内容: %s", next_to_get[:200])
-            return -1
-        redirect_url = matches[0]
+        if not redirect_url:
+            url_pattern = re.compile(r"""href=["'](https?://[^"']+)["']""")
+            matches = url_pattern.findall(next_to_get)
+            if not matches:
+                logger.error("未找到重定向链接，响应内容: %s", next_to_get[:200])
+                return -1
+            redirect_url = matches[0]
         if showlink:
             parsed = urlparse(redirect_url)
             logger.info("获取下载链接成功: %s", parsed.hostname)
 
         return redirect_url
-
-    def recycle(self):
-        """获取回收站列表"""
-        recycle_id = 0
-        url = (
-            "https://www.123pan.com/a/api/file/list/new?driveId=0&limit=100&next=0"
-            "&orderBy=fileId&orderDirection=desc&parentFileId="
-            + str(recycle_id)
-            + "&trashed=true&Page=1"
-        )
-        recycle_res = self._api_request(
-            self.session.get,
-            url,
-            headers=self.header_logined,
-            timeout=10,
-        )
-        json_recycle = _parse_json_response(recycle_res)
-        recycle_list = json_recycle.get("data", {}).get("InfoList", [])
-        self.recycle_list = recycle_list
 
     def delete_file(self, file_detail, operation=True):
         """删除或恢复文件"""
@@ -781,17 +890,18 @@ class Pan123:
             data=json.dumps(data_mk),
             timeout=10,
         )
-        try:
-            res_json = res_mk.json()
-        except json.decoder.JSONDecodeError:
-            logger.error("创建失败")
-            logger.error(res_mk.text)
-            raise RuntimeError(f"创建目录 '{dirname}' 响应解析失败")
+        res_json = _parse_json_response(res_mk)
         code_mkdir = res_json.get("code", -1)
 
         if code_mkdir == 0:
-            logger.info("创建成功: %s", res_json.get('data', {}).get('FileId'))
-            return res_json.get("data", {}).get("Info", {}).get("FileId")
+            file_id = res_json.get("data", {}).get("Info", {}).get("FileId")
+            # P2-24: 检查 FileId 是否为 None
+            if file_id is None:
+                raise RuntimeError(
+                    f"创建目录 '{dirname}' 成功但未返回 FileId: {res_json}"
+                )
+            logger.info("创建成功: %s", file_id)
+            return file_id
         logger.error("创建失败: %s", res_json)
         raise RuntimeError(
             f"创建目录 '{dirname}' 失败: code={code_mkdir}, "
@@ -825,13 +935,15 @@ class Pan123:
             raise RuntimeError(f"获取目录失败，返回码: {code}")
         return items
 
-    def _get_child_directory_map(self, parent_id):
+    def _get_child_directory_map(self, parent_id, *, normalize_names=False):
         """返回指定目录下子目录名到目录 ID 的映射。"""
         child_dirs = {}
         for item in self._get_dir_items_by_id(parent_id):
             if int(item.get("Type", 0) or 0) != 1:
                 continue
-            child_dirs[item.get("FileName", "")] = int(item.get("FileId", 0) or 0)
+            dir_name = item.get("FileName", "")
+            key = sanitize_filename(dir_name) if normalize_names else dir_name
+            child_dirs[key] = int(item.get("FileId", 0) or 0)
         return child_dirs
 
     @staticmethod
@@ -872,7 +984,7 @@ class Pan123:
         if not local_dir_path.is_dir():
             raise NotADirectoryError(f"不是文件夹: {local_dir_path}")
 
-        top_level_dirs = self._get_child_directory_map(target_parent_id)
+        top_level_dirs = self._get_child_directory_map(target_parent_id, normalize_names=True)
 
         if merge and sanitize_filename(local_dir_path.name) in top_level_dirs:
             # 合并模式：复用已有顶层目录
@@ -897,20 +1009,27 @@ class Pan123:
                 file_names.sort()
                 current_path = Path(current_root)
                 relative_root = current_path.relative_to(local_dir_path)
-                remote_parent_id = dir_id_map[relative_root or Path(".")]
+                normalized_relative_root = (
+                    Path(".")
+                    if not relative_root.parts
+                    else Path(*[sanitize_filename(part) for part in relative_root.parts])
+                )
+                remote_parent_id = dir_id_map[normalized_relative_root]
 
                 # merge 模式下获取远端子目录映射和文件名集合
                 existing_child_dirs: dict[str, int] = {}
                 existing_file_names: set[str] = set()
                 if merge:
-                    existing_child_dirs = self._get_child_directory_map(remote_parent_id)
+                    existing_child_dirs = self._get_child_directory_map(
+                        remote_parent_id, normalize_names=True,
+                    )
                     for item in self._get_dir_items_by_id(remote_parent_id):
                         if int(item.get("Type", 0) or 0) == 0:
                             existing_file_names.add(sanitize_filename(item.get("FileName", "")))
 
                 for dir_name in dir_names:
                     sanitized_dir = sanitize_filename(dir_name)
-                    child_relative = relative_root / sanitized_dir
+                    child_relative = normalized_relative_root / sanitized_dir
                     if merge and sanitized_dir in existing_child_dirs:
                         dir_id_map[child_relative] = existing_child_dirs[sanitized_dir]
                         continue
@@ -969,6 +1088,7 @@ class Pan123:
         logger.debug("[T-%s] 开始上传: file=%s, size=%s", tid, file_name, fsize)
         headers = self.header_logined.copy()
         readable_hash = None
+        server_uploaded_parts = {}
 
         if resume_info and resume_info.get("upload_id"):
             stored_hash = resume_info.get("etag", "")
@@ -1003,6 +1123,44 @@ class Pan123:
                         resume_info = None
 
         if resume_info and resume_info.get("upload_id"):
+            bucket = resume_info["bucket"]
+            storage_node = resume_info["storage_node"]
+            upload_key = resume_info["upload_key"]
+            upload_id = resume_info["upload_id"]
+            block_size = resume_info.get("block_size", UPLOAD_PART_SIZE)
+            total_parts = resume_info.get("total_parts") or (
+                math.ceil(fsize / block_size) if fsize > 0 else 1
+            )
+            try:
+                server_uploaded_parts = self._list_uploaded_parts(
+                    headers, bucket, upload_key, upload_id, storage_node,
+                )
+                stop_state, parts_match = self._validate_resume_server_parts(
+                    file_path,
+                    fsize,
+                    block_size,
+                    total_parts,
+                    server_uploaded_parts,
+                    task=task,
+                )
+                if stop_state:
+                    return stop_state
+                if not parts_match:
+                    logger.warning("检测到本地文件已变更，放弃旧续传会话并重新上传")
+                    if signals:
+                        signals.progress.emit(0)
+                    if speed_tracker:
+                        speed_tracker.reset()
+                    resume_info = None
+            except Exception as exc:
+                logger.warning("验证服务端已上传分块失败，放弃旧续传会话并重新上传: %s", exc)
+                if signals:
+                    signals.progress.emit(0)
+                if speed_tracker:
+                    speed_tracker.reset()
+                resume_info = None
+
+        if resume_info and resume_info.get("upload_id"):
             # ---- 断点续传：复用已有 S3 session ----
             bucket = resume_info["bucket"]
             storage_node = resume_info["storage_node"]
@@ -1013,41 +1171,8 @@ class Pan123:
             total_parts = resume_info.get("total_parts") or (
                 math.ceil(fsize / block_size) if fsize > 0 else 1
             )
-            done_parts = resume_info.get("done_parts", set())
-
-            # C4: 用服务端实际存在的 parts 与本地记录做交集
-            try:
-                list_data = {
-                    "bucket": bucket,
-                    "key": upload_key,
-                    "uploadId": upload_id,
-                    "storageNode": storage_node,
-                }
-                list_res = self._api_request(
-                    self.session.post,
-                    "https://www.123pan.com/b/api/file/s3_list_upload_parts",
-                    headers=headers,
-                    data=json.dumps(list_data),
-                    timeout=30,
-                )
-                list_json = _parse_json_response(list_res)
-                if list_json.get("code", -1) == 0:
-                    server_parts_data = list_json.get("data", {}).get("parts") or []
-                    server_part_numbers = {int(p.get("PartNumber", 0)) for p in server_parts_data}
-                    done_parts = done_parts & server_part_numbers
-                else:
-                    logger.warning(
-                        "验证服务端已上传分块返回异常，将重新上传所有分块: %s",
-                        json.dumps(list_json, ensure_ascii=False),
-                    )
-                    done_parts = set()
-            except Exception as exc:
-                logger.warning("验证服务端已上传分块失败，将重新上传所有分块: %s", exc)
-                done_parts = set()
-
-            logger.info(
-                "[T-%s] 断点续传: done=%s/%s", tid, len(done_parts), total_parts
-            )
+            done_parts = set(server_uploaded_parts)
+            logger.info("[T-%s] 断点续传: done=%s/%s", tid, len(done_parts), total_parts)
             if signals and hasattr(signals, "status"):
                 signals.status.emit("上传中")
         else:
@@ -1285,17 +1410,19 @@ class Pan123:
             logger.debug("[T-%s W-%s] 启动: active=%s", tid, wid, active_workers[0])
 
             prefetched_part = None
-            prefetched_result = [None, None]  # [url, exception]
+            prefetched_request_id = None
+            prefetched_result = _PrefetchResultSlot()
             prefetch_thread = None
             _current_part = None  # 追踪当前 part，用于 finally 回队
 
             def _requeue_prefetch():
                 """将预取的 part 放回队列并清理预取状态。"""
-                nonlocal prefetched_part, prefetched_result, prefetch_thread
+                nonlocal prefetched_part, prefetched_request_id, prefetch_thread
                 if prefetched_part is not None:
                     part_queue.put(prefetched_part)
                     prefetched_part = None
-                    prefetched_result = [None, None]
+                    prefetched_request_id = None
+                    prefetched_result.clear()
                     if prefetch_thread is not None:
                         prefetch_thread.join(timeout=5)
                         prefetch_thread = None
@@ -1319,12 +1446,16 @@ class Pan123:
                     # 1. 获取当前 part 和 URL
                     if prefetched_part is not None:
                         part = prefetched_part
+                        expected_prefetch_id = prefetched_request_id
                         if prefetch_thread is not None:
                             prefetch_thread.join(timeout=10)
                             prefetch_thread = None
-                        url = prefetched_result[0]
+                        result = prefetched_result.consume(
+                            expected_prefetch_id, part["part_number"],
+                        )
+                        url = result["url"] if result else None
                         prefetched_part = None
-                        prefetched_result = [None, None]
+                        prefetched_request_id = None
                     else:
                         try:
                             part = part_queue.get_nowait()
@@ -1352,15 +1483,29 @@ class Pan123:
 
                     if next_part is not None:
                         prefetched_part = next_part
+                        prefetched_request_id = uuid.uuid4().hex
+                        prefetched_result.reserve(
+                            prefetched_request_id, next_part["part_number"],
+                        )
 
-                        def _prefetch(target_part):
+                        def _prefetch(target_part, request_id):
                             try:
-                                prefetched_result[0] = _fetch_presigned_url(target_part)
+                                prefetched_result.publish(
+                                    request_id,
+                                    target_part["part_number"],
+                                    url=_fetch_presigned_url(target_part),
+                                )
                             except Exception as exc:
-                                prefetched_result[1] = exc
+                                prefetched_result.publish(
+                                    request_id,
+                                    target_part["part_number"],
+                                    error=exc,
+                                )
 
                         prefetch_thread = threading.Thread(
-                            target=_prefetch, args=(next_part,), daemon=True,
+                            target=_prefetch,
+                            args=(next_part, prefetched_request_id),
+                            daemon=True,
                         )
                         prefetch_thread.start()
 
@@ -1568,26 +1713,24 @@ class Pan123:
 
         # ---- 合并分块 ----
         logger.debug("[T-%s] 合并分块...", tid)
+        latest_server_parts = self._list_uploaded_parts(
+            headers, bucket, upload_key, upload_id, storage_node,
+        )
+        complete_parts = _merge_uploaded_parts(
+            latest_server_parts,
+            uploaded_parts_map,
+        )
+        if len(complete_parts) != total_parts:
+            raise RuntimeError(
+                f"上传分块不完整，无法合并: expected={total_parts}, actual={len(complete_parts)}"
+            )
         uploaded_comp_data = {
             "bucket": bucket,
             "key": upload_key,
             "uploadId": upload_id,
             "storageNode": storage_node,
-            "parts": sorted(uploaded_parts_map.values(), key=lambda p: p["PartNumber"]),
+            "parts": complete_parts,
         }
-        # C2: 检查 s3_list_upload_parts 和 s3_complete_multipart_upload 返回值
-        list_res = self._api_request(
-            self.session.post,
-            "https://www.123pan.com/b/api/file/s3_list_upload_parts",
-            headers=headers,
-            data=json.dumps(uploaded_comp_data),
-            timeout=30,
-        )
-        list_json = _parse_json_response(list_res)
-        if list_json.get("code", -1) != 0:
-            raise RuntimeError(
-                "列出上传分块失败: " + json.dumps(list_json, ensure_ascii=False)
-            )
 
         complete_res = self._api_request(
             self.session.post,

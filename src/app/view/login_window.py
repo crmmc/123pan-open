@@ -39,7 +39,8 @@ def login_with_credentials(user, pwd):
     pan = Pan123(readfile=False, user_name=user, password=pwd)
     code = pan.login()
     if code not in {0, 200}:
-        raise RuntimeError(f"登录失败，返回码: {code}")
+        msg = getattr(pan, "_login_message", "") or f"返回码: {code}"
+        raise RuntimeError(f"登录失败: {msg}")
     return pan
 
 
@@ -47,6 +48,10 @@ def try_token_probe(db):
     """用已有 token 调 user_info API 探测有效性。
     成功返回 Pan123 对象，失败返回 None。
     """
+    def _clear_saved_token():
+        delete_credential("authorization")
+        db.set_config("authorization", "")
+
     token = load_credential("authorization")
     if not token:
         return None
@@ -54,13 +59,16 @@ def try_token_probe(db):
         pan = Pan123(readfile=True, user_name="", password="", authorization=token)
         user_data = pan.user_info()
         if user_data is not None:
+            # P1-12: 从 user_info 返回数据中提取 nickname
+            pan.user_name = user_data.get("Nickname", "") or ""
             logger.info("Token 探测成功，跳过登录")
             return pan
         logger.warning("Token 探测失败：user_info 未返回有效用户数据")
-        db.set_config("authorization", "")
+        _clear_saved_token()
         return None
     except Exception as exc:
         logger.warning("Token 探测异常: %s", exc)
+        _clear_saved_token()
     return None
 
 
@@ -237,6 +245,7 @@ class LoginDialog(QDialog):
                 "osVersion": pan_object.osversion,
                 "loginuuid": pan_object.loginuuid,
             })
+            delete_credential("passWord")
             if self.cb_stay_logged_in.isChecked():
                 save_credential("authorization", pan_object.authorization)
             else:

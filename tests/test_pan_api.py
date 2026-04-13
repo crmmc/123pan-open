@@ -13,7 +13,8 @@ from src.app.common import database as database_module
 from src.app.common.database import Database
 from src.app.common.api import (
     Pan123, RateLimitError, UPLOAD_PART_SIZE, _RWLock, _ProgressFileIO,
-    _calculate_file_md5, _parse_json_response, _reset_transient_failure_count, format_file_size,
+    _PrefetchResultSlot, _calculate_file_md5, _parse_json_response,
+    _reset_transient_failure_count, format_file_size,
 )
 from src.app.view.transfer_interface import UploadThread
 
@@ -24,6 +25,13 @@ def _mock_response(status_code=200, json_data=None, headers=None):
     resp.json.return_value = json_data or {"code": 0, "message": "success"}
     resp.headers = headers or {}
     return resp
+
+
+def _find_api_payload(mock_api, url_suffix):
+    for call_ in mock_api.call_args_list:
+        if call_.args[1].endswith(url_suffix):
+            return json.loads(call_.kwargs.get("data", "{}"))
+    raise AssertionError(f"未找到接口调用: {url_suffix}")
 
 
 def _use_temp_db(tmp_path, monkeypatch):
@@ -45,7 +53,6 @@ def pan():
         p.osversion = "Android_12"
         p.loginuuid = "abc123"
         p.cookies = None
-        p.recycle_list = None
         p.list = []
         p.total = 0
         p.parent_file_name_list = []
@@ -218,6 +225,7 @@ class TestTokenRefresh:
         assert response is success
         assert mock_login.call_count == 1
         assert mock_get.call_args_list[1].kwargs["headers"]["authorization"] == "Bearer refreshed"
+        expired.close.assert_called_once()
 
     def test_max_one_refresh(self, pan):
         expired = _mock_response(200, {"code": 2, "message": "expired"})
@@ -309,6 +317,18 @@ class TestTokenRefresh:
         assert response is success
         mock_login.assert_not_called()
 
+    def test_create_directory_parses_response_with_close(self, pan):
+        response = _mock_response(
+            200,
+            {"code": 0, "data": {"Info": {"FileId": 321}}},
+        )
+
+        with patch.object(pan, "_api_request", return_value=response):
+            result = pan._create_directory(7, "docs")
+
+        assert result == 321
+        response.close.assert_called_once()
+
 
 class TestRename:
     def test_rename_success(self, pan):
@@ -327,6 +347,59 @@ class TestRename:
         with patch.object(pan.session, "post", return_value=resp):
             result = pan.rename_file(123, "dup.txt")
             assert result is False
+
+
+class TestDownloadLink:
+    def test_link_by_file_detail_prefers_location_header(self, pan):
+        api_resp = _mock_response(
+            200,
+            {"code": 0, "data": {"DownloadUrl": "https://example.com/jump"}},
+        )
+        redirect_resp = MagicMock()
+        redirect_resp.__enter__.return_value = redirect_resp
+        redirect_resp.__exit__.return_value = False
+        redirect_resp.headers = {"Location": "https://download.example/file.bin"}
+        redirect_resp.text = '<a href="https://download.example/old.bin">old</a>'
+
+        with patch.object(pan, "_api_request", return_value=api_resp), \
+             patch.object(pan, "_raw_request", return_value=redirect_resp):
+            result = pan.link_by_fileDetail({"Type": 0, "FileId": 1}, showlink=False)
+
+        assert result == "https://download.example/file.bin"
+
+    def test_link_by_file_detail_falls_back_to_html_href(self, pan):
+        api_resp = _mock_response(
+            200,
+            {"code": 0, "data": {"DownloadUrl": "https://example.com/jump"}},
+        )
+        redirect_resp = MagicMock()
+        redirect_resp.__enter__.return_value = redirect_resp
+        redirect_resp.__exit__.return_value = False
+        redirect_resp.headers = {}
+        redirect_resp.text = '<a href="https://download.example/file.bin">download</a>'
+
+        with patch.object(pan, "_api_request", return_value=api_resp), \
+             patch.object(pan, "_raw_request", return_value=redirect_resp):
+            result = pan.link_by_fileDetail({"Type": 0, "FileId": 1}, showlink=False)
+
+        assert result == "https://download.example/file.bin"
+
+    def test_link_by_file_detail_returns_error_when_no_location_or_href(self, pan):
+        api_resp = _mock_response(
+            200,
+            {"code": 0, "data": {"DownloadUrl": "https://example.com/jump"}},
+        )
+        redirect_resp = MagicMock()
+        redirect_resp.__enter__.return_value = redirect_resp
+        redirect_resp.__exit__.return_value = False
+        redirect_resp.headers = {}
+        redirect_resp.text = "no redirect here"
+
+        with patch.object(pan, "_api_request", return_value=api_resp), \
+             patch.object(pan, "_raw_request", return_value=redirect_resp):
+            result = pan.link_by_fileDetail({"Type": 0, "FileId": 1}, showlink=False)
+
+        assert result == -1
 
 
 class TestShare:
@@ -432,7 +505,7 @@ class TestFolderUploadPlan:
             created.append((parent_id, dirname))
             return next_id
 
-        def fake_dir_map(parent_id):
+        def fake_dir_map(parent_id, *, normalize_names=False):
             if parent_id == 0:
                 return {"资料": 7}
             return {}
@@ -552,6 +625,45 @@ class TestCreateDirectory:
         assert plan["root_dir_id"] == 101
         mock_create.assert_called_once_with(0, "资料")
 
+    def test_prepare_folder_upload_merge_uses_normalized_remote_directory_names(self, pan, tmp_path, monkeypatch):
+        root = tmp_path / "docs."
+        child = root / "sub."
+        child.mkdir(parents=True)
+        (child / "a.txt").write_text("a", encoding="utf-8")
+
+        monkeypatch.setattr("src.app.common.filename_utils.sys.platform", "win32")
+
+        def fake_dir_map(parent_id, *, normalize_names=False):
+            if parent_id == 0:
+                return {"docs": 7}
+            if parent_id == 7:
+                return {"sub": 8}
+            return {}
+
+        def fake_items(parent_id):
+            if parent_id == 7:
+                return [{"Type": 1, "FileName": "sub.", "FileId": 8}]
+            if parent_id == 8:
+                return []
+            return [{"Type": 1, "FileName": "docs.", "FileId": 7}]
+
+        with patch.object(pan, "_get_child_directory_map", side_effect=fake_dir_map), \
+             patch.object(pan, "_get_dir_items_by_id", side_effect=fake_items), \
+             patch.object(pan, "_create_directory_with_backoff") as mock_create:
+            plan = pan.prepare_folder_upload(root, 0, merge=True)
+
+        assert plan["root_dir_id"] == 7
+        assert plan["created_dir_count"] == 0
+        assert plan["file_targets"] == [
+            {
+                "file_name": "a.txt",
+                "file_size": 1,
+                "local_path": str(child / "a.txt"),
+                "target_dir_id": 8,
+            },
+        ]
+        mock_create.assert_not_called()
+
 
 class TestUploadFileStream:
     def test_parent_id_parameter(self, pan, tmp_path):
@@ -669,7 +781,7 @@ class TestUploadFileStream:
 
         mock_put.assert_called_once()
 
-    def test_resume_with_nonzero_server_code_reuploads_local_parts(self, pan, tmp_path):
+    def test_resume_with_nonzero_server_code_starts_new_upload_session(self, pan, tmp_path):
         local_file = tmp_path / "resume.txt"
         local_file.write_text("demo", encoding="utf-8")
         resume_info = {
@@ -685,29 +797,21 @@ class TestUploadFileStream:
         }
 
         server_parts_res = _mock_response(200, {"code": 2, "message": "expired"})
-        init_res = _mock_response(200, {"code": 0, "message": "ok"})
-        get_link_res = _mock_response(
-            200,
-            {"code": 0, "data": {"presignedUrls": {"1": "https://upload.example/1"}}},
-        )
-        ok_res = _mock_response(200, {"code": 0, "message": "ok"})
-        put_res = MagicMock()
-        put_res.status_code = 200
-        put_res.headers = {"ETag": '"etag-1"'}
-        put_res.raise_for_status.return_value = None
+        upload_res = _mock_response(200, {"code": 0, "data": {"Reuse": True}})
 
         with patch.object(
             pan,
             "_api_request",
-            side_effect=[server_parts_res, init_res, get_link_res, ok_res, ok_res, ok_res],
-        ), \
-             patch.object(pan.session, "put", return_value=put_res) as mock_put, \
-             patch("src.app.common.api.Database.instance") as mock_db:
-            mock_db.return_value.get_config.return_value = 1
+            side_effect=[server_parts_res, upload_res],
+        ) as mock_api:
+            result = pan.upload_file_stream(str(local_file), resume_info=resume_info)
 
-            pan.upload_file_stream(str(local_file), resume_info=resume_info)
-
-        mock_put.assert_called_once()
+        assert result == "复用上传成功"
+        urls = [call.args[1] for call in mock_api.call_args_list]
+        assert urls == [
+            "https://www.123pan.com/b/api/file/s3_list_upload_parts",
+            "https://www.123pan.com/b/api/file/upload_request",
+        ]
 
     def test_resume_with_changed_local_file_starts_new_upload(self, pan, tmp_path):
         local_file = tmp_path / "changed.txt"
@@ -732,6 +836,102 @@ class TestUploadFileStream:
         payload = json.loads(mock_api.call_args.kwargs["data"])
         assert payload["fileName"] == "changed.txt"
         assert payload["parentFileId"] == 0
+
+    def test_resume_reuses_server_parts_and_completes_with_history(self, pan, tmp_path):
+        content = b"abcdefgh"
+        local_file = tmp_path / "resume-two-parts.txt"
+        local_file.write_bytes(content)
+        resume_info = {
+            "bucket": "bucket",
+            "storage_node": "node",
+            "upload_key": "key",
+            "upload_id": "upload-id",
+            "up_file_id": 123,
+            "total_parts": 2,
+            "block_size": 4,
+            "done_parts": set(),
+            "etag": hashlib.md5(content).hexdigest(),
+        }
+        part1_etag = f'"{hashlib.md5(content[:4]).hexdigest()}"'
+        server_parts_res = _mock_response(
+            200,
+            {"code": 0, "data": {"parts": [{"PartNumber": 1, "ETag": part1_etag}]}},
+        )
+        init_res = _mock_response(200, {"code": 0, "message": "ok"})
+        get_link_res = _mock_response(
+            200,
+            {"code": 0, "data": {"presignedUrls": {"2": "https://upload.example/2"}}},
+        )
+        complete_ready_res = _mock_response(
+            200,
+            {"code": 0, "data": {"parts": [{"PartNumber": 1, "ETag": part1_etag}]}},
+        )
+        ok_res = _mock_response(200, {"code": 0, "message": "ok"})
+        put_res = MagicMock()
+        put_res.status_code = 200
+        put_res.headers = {"ETag": '"etag-2"'}
+        put_res.raise_for_status.return_value = None
+        put_res.__enter__.return_value = put_res
+
+        with patch.object(
+            pan,
+            "_api_request",
+            side_effect=[
+                server_parts_res,
+                init_res,
+                get_link_res,
+                complete_ready_res,
+                ok_res,
+                ok_res,
+            ],
+        ) as mock_api, patch.object(pan.session, "put", return_value=put_res) as mock_put, \
+             patch("src.app.common.api.Database.instance") as mock_db:
+            mock_db.return_value.get_config.return_value = 1
+            result = pan.upload_file_stream(str(local_file), resume_info=resume_info)
+
+        assert result == 123
+        mock_put.assert_called_once()
+        complete_payload = _find_api_payload(mock_api, "s3_complete_multipart_upload")
+        assert complete_payload["parts"] == [
+            {"ETag": part1_etag, "PartNumber": 1},
+            {"ETag": '"etag-2"', "PartNumber": 2},
+        ]
+
+    def test_resume_with_mismatched_server_part_starts_new_upload(self, pan, tmp_path):
+        content = b"abcdefgh"
+        local_file = tmp_path / "mismatch.txt"
+        local_file.write_bytes(content)
+        resume_info = {
+            "bucket": "bucket",
+            "storage_node": "node",
+            "upload_key": "key",
+            "upload_id": "upload-id",
+            "up_file_id": 123,
+            "total_parts": 2,
+            "block_size": 4,
+            "done_parts": {1},
+            "etag": hashlib.md5(content).hexdigest(),
+        }
+        stale_part_etag = f'"{hashlib.md5(b"WXYZ").hexdigest()}"'
+        server_parts_res = _mock_response(
+            200,
+            {"code": 0, "data": {"parts": [{"PartNumber": 1, "ETag": stale_part_etag}]}},
+        )
+        upload_res = _mock_response(200, {"code": 0, "data": {"Reuse": True}})
+
+        with patch.object(
+            pan,
+            "_api_request",
+            side_effect=[server_parts_res, upload_res],
+        ) as mock_api:
+            result = pan.upload_file_stream(str(local_file), resume_info=resume_info)
+
+        assert result == "复用上传成功"
+        urls = [call.args[1] for call in mock_api.call_args_list]
+        assert urls == [
+            "https://www.123pan.com/b/api/file/s3_list_upload_parts",
+            "https://www.123pan.com/b/api/file/upload_request",
+        ]
 
     def test_rate_limit_error_when_fetching_presigned_url_requeues_part(self, pan, tmp_path):
         local_file = tmp_path / "retry.txt"
@@ -828,17 +1028,6 @@ class TestThreadSafety:
 
         assert pan.parent_file_id == 123
         assert pan.upload_file_stream.call_args.kwargs["parent_id"] == 456
-
-
-class TestRecycle:
-    def test_recycle_success(self, pan):
-        resp = _mock_response(200, {
-            "code": 0, "data": {"InfoList": [{"FileId": 1}, {"FileId": 2}]}, "message": "ok"
-        })
-
-        with patch.object(pan.session, "get", return_value=resp):
-            pan.recycle()
-            assert len(pan.recycle_list) == 2
 
 
 class TestQrGenerate:
@@ -1108,6 +1297,30 @@ class TestCalculateFileMd5:
 
         _calculate_file_md5(str(f), len(content), signals=signals)
         signals.progress.emit.assert_called()
+
+
+class TestPrefetchResultSlot:
+    def test_publish_drops_stale_prefetch_result(self):
+        slot = _PrefetchResultSlot()
+        slot.reserve("new-prefetch", 2)
+
+        slot.publish("old-prefetch", 1, url="https://upload.example/old")
+
+        assert slot.consume("new-prefetch", 2) is None
+
+    def test_consume_only_returns_matching_part_result(self):
+        slot = _PrefetchResultSlot()
+        slot.reserve("prefetch-1", 3)
+        slot.publish("prefetch-1", 3, url="https://upload.example/3")
+
+        assert slot.consume("prefetch-1", 2) is None
+        result = slot.consume("prefetch-1", 3)
+
+        assert result == {
+            "part_number": 3,
+            "url": "https://upload.example/3",
+            "error": None,
+        }
 
 
 # ── _RWLock 单元测试 ──

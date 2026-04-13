@@ -329,6 +329,151 @@ def test_async_context_helper_marks_stale_storage_result():
     assert stale is True
 
 
+def test_folder_prepare_done_drops_stale_account_result(monkeypatch):
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.success", lambda **_kwargs: None)
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.warning", lambda **_kwargs: None)
+    fi = FileInterface.__new__(FileInterface)
+    fi.pan = object()
+    fi.current_dir_id = 7
+    fi.transfer_interface = MagicMock(current_account_name="current")
+    fi._FileInterface__updateTreeUI = MagicMock()
+    fi._FileInterface__refreshFileList = MagicMock()
+    fi._FileInterface__buildUploadSummary = MagicMock(return_value="summary")
+
+    FileInterface._FileInterface__onFolderPrepareDone(
+        fi,
+        folder_uploads=[{
+            "file_name": "a.txt",
+            "file_size": 1,
+            "local_path": "/tmp/a.txt",
+            "target_dir_id": 7,
+        }],
+        folder_items=[{"FileId": 1, "FileName": "docs"}],
+        created_dir_count=1,
+        folder_error="",
+        context={
+            "pan": fi.pan,
+            "account_name": "old",
+            "dir_id": 7,
+            "request_id": None,
+        },
+        added_count=0,
+        error="",
+        should_refresh_current_dir=True,
+    )
+
+    fi.transfer_interface.add_upload_task.assert_not_called()
+    fi._FileInterface__updateTreeUI.assert_not_called()
+    fi._FileInterface__refreshFileList.assert_not_called()
+
+
+def test_folder_prepare_done_keeps_enqueue_when_only_directory_changes(monkeypatch):
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.success", lambda **_kwargs: None)
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.warning", lambda **_kwargs: None)
+    fi = FileInterface.__new__(FileInterface)
+    fi.pan = object()
+    fi.current_dir_id = 9
+    fi.transfer_interface = MagicMock(current_account_name="alice")
+    fi._FileInterface__updateTreeUI = MagicMock()
+    fi._FileInterface__refreshFileList = MagicMock()
+    fi._FileInterface__buildUploadSummary = MagicMock(return_value="summary")
+
+    FileInterface._FileInterface__onFolderPrepareDone(
+        fi,
+        folder_uploads=[{
+            "file_name": "a.txt",
+            "file_size": 1,
+            "local_path": "/tmp/a.txt",
+            "target_dir_id": 7,
+        }],
+        folder_items=[{"FileId": 1, "FileName": "docs"}],
+        created_dir_count=1,
+        folder_error="",
+        context={
+            "pan": fi.pan,
+            "account_name": "alice",
+            "dir_id": 7,
+            "request_id": None,
+        },
+        added_count=0,
+        error="",
+        should_refresh_current_dir=True,
+    )
+
+    fi.transfer_interface.add_upload_task.assert_called_once_with(
+        "a.txt", 1, "/tmp/a.txt", 7,
+    )
+    fi._FileInterface__updateTreeUI.assert_not_called()
+    fi._FileInterface__refreshFileList.assert_not_called()
+
+
+def test_execute_upload_entries_reserves_names_across_batch():
+    with patch("src.app.view.file_interface.InfoBar.success", lambda **_kwargs: None):
+        fi = FileInterface.__new__(FileInterface)
+        fi.current_dir_id = 7
+        fi.transfer_interface = MagicMock()
+        fi._FileInterface__refreshFileList = MagicMock()
+        fi._FileInterface__buildUploadSummary = MagicMock(return_value="summary")
+
+        FileInterface._FileInterface__executeUploadEntries(
+            fi,
+            entries=[
+                {"path": Path("/tmp/a.txt"), "is_dir": False, "rename": False, "file_size": 1},
+                {"path": Path("/tmp/a.txt"), "is_dir": False, "rename": False, "file_size": 1},
+            ],
+            existing_file_names=set(),
+            error="",
+            context={"target_dir_id": 7},
+            should_refresh_current_dir=False,
+        )
+
+        calls = fi.transfer_interface.add_upload_task.call_args_list
+        assert calls[0].args == ("a.txt", 1, "/tmp/a.txt", 7)
+        assert calls[1].args == ("a(1).txt", 1, "/tmp/a.txt", 7)
+
+
+def test_folder_prepare_done_reserves_names_within_same_target_dir(monkeypatch):
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.success", lambda **_kwargs: None)
+    monkeypatch.setattr("src.app.view.file_interface.InfoBar.warning", lambda **_kwargs: None)
+    fi = FileInterface.__new__(FileInterface)
+    fi.pan = object()
+    fi.current_dir_id = 7
+    fi.transfer_interface = MagicMock(current_account_name="alice")
+    fi._FileInterface__updateTreeUI = MagicMock()
+    fi._FileInterface__refreshFileList = MagicMock()
+    fi._FileInterface__buildUploadSummary = MagicMock(return_value="summary")
+
+    FileInterface._FileInterface__onFolderPrepareDone(
+        fi,
+        folder_uploads=[
+            {"file_name": "a.txt", "file_size": 1, "local_path": "/tmp/a1.txt", "target_dir_id": 7},
+            {"file_name": "a.txt", "file_size": 2, "local_path": "/tmp/a2.txt", "target_dir_id": 7},
+        ],
+        folder_items=[],
+        created_dir_count=0,
+        folder_error="",
+        context={"pan": fi.pan, "account_name": "alice", "dir_id": 7, "request_id": None},
+        added_count=0,
+        error="",
+        should_refresh_current_dir=False,
+    )
+
+    calls = fi.transfer_interface.add_upload_task.call_args_list
+    assert calls[0].args == ("a.txt", 1, "/tmp/a1.txt", 7)
+    assert calls[1].args == ("a(1).txt", 2, "/tmp/a2.txt", 7)
+
+
+def test_update_file_list_ui_refreshes_cached_file_list():
+    fi = FileInterface.__new__(FileInterface)
+    fi._cached_file_list = []
+    fi.fileTable = MagicMock()
+    file_items = [{"FileId": 1, "FileName": "a.txt", "Type": 0, "Size": 1}]
+
+    FileInterface._FileInterface__updateFileListUI(fi, file_items)
+
+    assert fi._cached_file_list == file_items
+
+
 def test_create_upload_button_group_uses_split_push_button(monkeypatch):
     created_actions = []
 

@@ -6,7 +6,7 @@ import pytest
 
 sys.modules.setdefault("qrcode", MagicMock())
 
-from src.app.view.main_window import MainWindow
+from src.app.view.main_window import MainWindow, QDialog
 
 
 def _make_transfer(
@@ -66,6 +66,21 @@ def test_stop_all_transfers_default_calls_cancel():
 
     thread.cancel.assert_called_once()
     thread.pause.assert_not_called()
+
+
+def test_stop_all_transfers_suspends_auto_start_during_wait():
+    thread = MagicMock()
+    thread.isRunning.return_value = False
+    transfer = _make_transfer(upload_threads=[thread])
+    transfer.suspend_auto_start = MagicMock()
+    transfer.resume_auto_start = MagicMock()
+    window = MainWindow.__new__(MainWindow)
+    window.transfer_interface = transfer
+
+    MainWindow._stop_all_transfers(window, save_progress=True)
+
+    transfer.suspend_auto_start.assert_called_once_with()
+    transfer.resume_auto_start.assert_called_once_with()
 
 
 def test_save_active_progress_updates_upload_task():
@@ -185,3 +200,67 @@ def test_stop_all_transfers_extracts_active_threads_from_tasks():
 
     task_thread.cancel.assert_called_once()
     task_thread.wait.assert_called()
+
+
+def test_show_relogin_dialog_stops_old_transfers_before_switching_pan():
+    old_pan = MagicMock()
+    old_pan.on_token_expired = object()
+    new_pan = MagicMock()
+    events = []
+
+    message_box = MagicMock()
+    login_dialog = MagicMock()
+    login_dialog.exec.return_value = QDialog.DialogCode.Accepted
+    login_dialog.get_pan.return_value = new_pan
+
+    window = MainWindow.__new__(MainWindow)
+    window.pan = old_pan
+    window.transfer_interface = MagicMock()
+    window.transfer_interface.set_pan.side_effect = lambda pan, force=False: events.append(
+        ("set_pan", pan, force)
+    )
+    window.cloud_interface = MagicMock()
+    window.cloud_interface.set_pan.side_effect = lambda pan: events.append(("cloud", pan))
+    window.file_interface = MagicMock()
+    window.file_interface.reload.side_effect = lambda: events.append(("reload",))
+    window._stop_all_transfers = MagicMock(
+        side_effect=lambda save_progress=False: events.append(("stop", save_progress))
+    )
+
+    with patch("src.app.view.main_window.MessageBox", return_value=message_box), \
+         patch("src.app.view.main_window.LoginDialog", return_value=login_dialog):
+        MainWindow._show_relogin_dialog(window)
+
+    assert events[0] == ("stop", True)
+    assert events[1] == ("set_pan", new_pan, True)
+    assert old_pan.on_token_expired is None
+    assert old_pan.close.call_count == 1
+    assert new_pan.on_token_expired == window._handle_token_expired
+    login_dialog.deleteLater.assert_called_once()
+
+
+def test_force_cleanup_tasks_deletes_active_download_records(tmp_path):
+    active_download = SimpleNamespace(
+        status="下载中",
+        thread=MagicMock(),
+        resume_id="resume-active",
+    )
+    paused_download = SimpleNamespace(
+        status="已暂停",
+        thread=None,
+        resume_id="resume-paused",
+    )
+    window = MainWindow.__new__(MainWindow)
+    window.transfer_interface = _make_transfer(
+        download_tasks=[active_download, paused_download],
+    )
+
+    with patch("src.app.view.main_window.Database") as db_cls, \
+         patch("src.app.view.main_window.cleanup_temp_dir") as mock_cleanup:
+        db_cls.instance.return_value = MagicMock()
+        MainWindow._force_cleanup_tasks(window)
+
+    db_cls.instance.return_value.delete_download_task.assert_called_once_with("resume-active")
+    mock_cleanup.assert_called_once_with("resume-active")
+    assert active_download.status == "已取消"
+    assert paused_download.status == "已取消"

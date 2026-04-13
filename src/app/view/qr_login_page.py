@@ -117,6 +117,9 @@ class QRLoginPage(QWidget):
         self._uni_id = ""
         self._pan_temp = None
         self._consecutive_errors = 0
+        self._qr_flow_id = 0
+        self._poll_in_flight = False
+        self._pending_task = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -174,19 +177,28 @@ class QRLoginPage(QWidget):
     def start_qr_flow(self):
         """异步生成二维码并开始轮询。"""
         self.stop_polling()
+        flow_id = self._qr_flow_id
         self.overlay.hide()
         self.status_label.setStyleSheet("QLabel { font-size: 14px; }")
         self.status_label.setText("正在获取二维码...")
 
         task = _QRGenerateTask()
-        task.signals.finished.connect(self._on_qr_generated)
-        task.signals.error.connect(self._on_qr_generate_error)
+        task.signals.finished.connect(
+            lambda data, fid=flow_id: self._on_qr_generated(fid, data)
+        )
+        task.signals.error.connect(
+            lambda error_msg, fid=flow_id: self._on_qr_generate_error(fid, error_msg)
+        )
         self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
-    def _on_qr_generated(self, data):
+    def _on_qr_generated(self, flow_id, data):
         """二维码生成成功回调。"""
         pan_temp = data.pop("_pan_temp", None)
+        if flow_id != self._qr_flow_id:
+            if pan_temp is not None:
+                pan_temp.close()
+            return
         self._uni_id = data["uniID"]
         self._pan_temp = pan_temp
 
@@ -212,32 +224,49 @@ class QRLoginPage(QWidget):
         self.poll_timer.start()
         self.expiry_timer.start(60000)
 
-    def _on_qr_generate_error(self, error_msg):
+    def _on_qr_generate_error(self, flow_id, error_msg):
         """二维码生成失败回调。"""
+        if flow_id != self._qr_flow_id:
+            return
         logger.error("获取二维码失败: %s", error_msg)
         self.status_label.setText("获取二维码失败，请重试")
         self._show_expired_overlay()
 
-    def stop_polling(self):
-        """停止所有定时器。"""
+    def _stop_polling_timers(self, *, close_pan_temp, invalidate):
         self.poll_timer.stop()
         self.expiry_timer.stop()
-        if self._pan_temp:
+        self._poll_in_flight = False
+        if close_pan_temp and self._pan_temp:
             self._pan_temp.close()
             self._pan_temp = None
+        if invalidate:
+            self._qr_flow_id += 1
+
+    def stop_polling(self):
+        """停止所有定时器。"""
+        self._stop_polling_timers(close_pan_temp=True, invalidate=True)
 
     def _do_poll(self):
         """异步轮询一次扫码状态。"""
-        if not self._pan_temp or not self._uni_id:
+        if not self._pan_temp or not self._uni_id or self._poll_in_flight:
             return
+        self._poll_in_flight = True
+        flow_id = self._qr_flow_id
         task = _QRPollTask(self._pan_temp, self._uni_id)
-        task.signals.result.connect(self._on_poll_result)
-        task.signals.error.connect(self._on_poll_error)
+        task.signals.result.connect(
+            lambda result, fid=flow_id: self._on_poll_result(fid, result)
+        )
+        task.signals.error.connect(
+            lambda fid=flow_id: self._on_poll_error(fid)
+        )
         self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
-    def _on_poll_error(self):
+    def _on_poll_error(self, flow_id):
         """轮询网络错误回调。"""
+        if flow_id != self._qr_flow_id:
+            return
+        self._poll_in_flight = False
         self._consecutive_errors += 1
         if self._consecutive_errors >= _MAX_POLL_ERRORS:
             self.stop_polling()
@@ -247,11 +276,13 @@ class QRLoginPage(QWidget):
             self.status_label.setText("网络异常，请检查后重试")
             self._show_expired_overlay()
 
-    def _on_poll_result(self, result):
+    def _on_poll_result(self, flow_id, result):
         """轮询结果回调。"""
+        if flow_id != self._qr_flow_id:
+            return
+        self._poll_in_flight = False
         self._consecutive_errors = 0
 
-        self._consecutive_errors = 0
         status = result.get("loginStatus", -1)
 
         if status == 0:
@@ -269,11 +300,12 @@ class QRLoginPage(QWidget):
         elif status == 3:
             # 用户确认登录
             pan_temp = self._pan_temp  # 在 stop_polling 置空前保存引用
-            self.stop_polling()
+            self._stop_polling_timers(close_pan_temp=False, invalidate=False)
+            self._pan_temp = None
             self.status_label.setText("登录成功")
             scan_platform = result.get("scanPlatform", 0)
             token = result.get("token", "")
-            self._handle_login_success(scan_platform, token, pan_temp)
+            self._handle_login_success(flow_id, scan_platform, token, pan_temp)
         elif status == 4:
             # 二维码过期
             self.stop_polling()
@@ -286,21 +318,29 @@ class QRLoginPage(QWidget):
         else:
             logger.warning("未知 QR 登录状态: %s", status)
 
-    def _handle_login_success(self, scan_platform, token, pan_temp=None):
+    def _handle_login_success(self, flow_id, scan_platform, token, pan_temp=None):
         """异步处理登录成功，验证 token 并获取用户信息。"""
         pan_temp = pan_temp or self._pan_temp
         task = _QRLoginVerifyTask(token, scan_platform, pan_temp, self._uni_id)
-        task.signals.success.connect(self._on_login_verified)
-        task.signals.error.connect(self._on_login_verify_error)
+        task.signals.success.connect(
+            lambda pan, fid=flow_id: self._on_login_verified(fid, pan)
+        )
+        task.signals.error.connect(
+            lambda error_msg, fid=flow_id: self._on_login_verify_error(fid, error_msg)
+        )
         self._pending_task = task  # 防止 GC 回收 signals
         QThreadPool.globalInstance().start(task)
 
-    def _on_login_verified(self, pan):
+    def _on_login_verified(self, flow_id, pan):
         """登录验证成功回调。"""
+        if flow_id != self._qr_flow_id:
+            return
         self.loginSuccess.emit(pan)
 
-    def _on_login_verify_error(self, error_msg):
+    def _on_login_verify_error(self, flow_id, error_msg):
         """登录验证失败回调。"""
+        if flow_id != self._qr_flow_id:
+            return
         if "暂不支持" in error_msg:
             self.status_label.setText(error_msg)
         elif "未获取到凭证" in error_msg:
@@ -311,8 +351,14 @@ class QRLoginPage(QWidget):
         self._show_expired_overlay()
 
     def _on_expired(self):
-        """二维码过期，自动刷新。"""
+        """二维码过期，自动刷新（受 _qr_refresh_count 限制）。"""
         self.poll_timer.stop()
+        # P1-15: 经过 _qr_refresh_count 计数，超过上限后停止刷新
+        self._qr_refresh_count = getattr(self, '_qr_refresh_count', 0) + 1
+        if self._qr_refresh_count > 5:
+            self.status_label.setText("二维码已过期，请手动刷新")
+            self._show_expired_overlay()
+            return
         self.start_qr_flow()
 
     def _show_scanned_overlay(self):

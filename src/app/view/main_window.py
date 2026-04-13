@@ -22,6 +22,9 @@ from .login_window import LoginDialog, try_token_probe
 
 from ..common import resource  # noqa: F401 -- 触发 qInitResources()
 from ..common.database import Database
+from ..common.download_resume import cleanup_temp_dir
+
+from PySide6.QtCore import QRunnable, QThreadPool, QObject, Signal as QSignal
 
 
 class MainWindow(FluentWindow):
@@ -77,40 +80,67 @@ class MainWindow(FluentWindow):
                 if now - self._last_file_refresh_time > 30:
                     self.file_interface.refresh()
                     self._last_file_refresh_time = now
+        elif widget is self.setting_interface:
+            # P1-13: 切换到设置页面时刷新配置值
+            self.setting_interface.refresh_from_db()
 
     def _startup_login_flow(self):
         db = Database.instance()
         self.pan = None
 
-        # 尝试 token 探测
+        # P1-16: 异步执行 token 探测，避免阻塞窗口创建
         stay_logged_in = bool(db.get_config("stayLoggedIn", True))
         if stay_logged_in:
-            self.pan = try_token_probe(db)
+            self._try_async_token_probe(db)
+        else:
+            self._show_login_dialog()
 
-        # token 无效或未开启保持登录，弹出登录对话框
-        if self.pan is None:
-            dlg = LoginDialog(self)
-            if dlg.exec() != QDialog.DialogCode.Accepted:
-                dlg.deleteLater()
-                self.close()
-                return
-            self.pan = dlg.get_pan()
+    def _try_async_token_probe(self, db):
+        """P1-16: 异步 token 探测，成功后进入主界面。"""
+        class _ProbeSignals(QObject):
+            success = QSignal(object)
+            failed = QSignal()
+
+        class _ProbeTask(QRunnable):
+            def __init__(self, db, signals):
+                super().__init__()
+                self.db = db
+                self.signals = signals
+            def run(self):
+                pan = try_token_probe(self.db)
+                if pan is not None:
+                    self.signals.success.emit(pan)
+                else:
+                    self.signals.failed.emit()
+
+        signals = _ProbeSignals()
+        self._probe_signals = signals  # prevent GC
+        signals.success.connect(self._on_probe_success)
+        signals.failed.connect(self._show_login_dialog)
+        task = _ProbeTask(db, signals)
+        QThreadPool.globalInstance().start(task)
+
+    def _on_probe_success(self, pan):
+        self.pan = pan
+        self._finish_login()
+
+    def _show_login_dialog(self):
+        dlg = LoginDialog(self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
             dlg.deleteLater()
+            self.close()
+            return
+        self.pan = dlg.get_pan()
+        dlg.deleteLater()
+        self._finish_login()
 
+    def _finish_login(self):
         self.login_success = True
-
-        # 先设置各子页面的 pan（含 account_name），再 reload
-        # 避免 reload 中异步任务的 context 捕获到空 account_name
         self.transfer_interface.set_pan(self.pan)
         self.cloud_interface.set_pan(self.pan)
-
         self.file_interface.pan = self.pan
         self.file_interface.reload()
-
-        # H1: 注册 token 过期回调
         self.pan.on_token_expired = self._handle_token_expired
-
-        # 连接退出登录信号
         self.cloud_interface.logoutRequested.connect(self.handle_logout)
 
     def _handle_token_expired(self):
@@ -128,7 +158,12 @@ class MainWindow(FluentWindow):
             dlg = LoginDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 old_pan = self.pan
-                self.pan = dlg.get_pan()
+                new_pan = dlg.get_pan()
+                if old_pan is not None:
+                    old_pan.on_token_expired = None
+                self._stop_all_transfers(save_progress=True)
+                self._force_cleanup_tasks()  # P1-8: 清理旧线程引用
+                self.pan = new_pan
                 self.pan.on_token_expired = self._handle_token_expired
                 self.transfer_interface.set_pan(self.pan, force=True)
                 self.cloud_interface.set_pan(self.pan)
@@ -138,6 +173,7 @@ class MainWindow(FluentWindow):
                     old_pan.close()
             else:
                 self.close()
+            dlg.deleteLater()
         finally:
             self._relogin_pending = False
 
@@ -147,53 +183,62 @@ class MainWindow(FluentWindow):
         Args:
             save_progress: True 时 pause 线程（保留进度），False 时 cancel（丢弃进度）。
         """
-        threads_to_wait = []
-        seen = set()
-        stop_fn = "pause" if save_progress else "cancel"
-        for thread in list(self.transfer_interface.upload_threads):
-            if thread is None or id(thread) in seen:
-                continue
-            getattr(thread, stop_fn)()
-            threads_to_wait.append(thread)
-            seen.add(id(thread))
-        for thread in list(self.transfer_interface.download_threads):
-            if thread is None or id(thread) in seen:
-                continue
-            getattr(thread, stop_fn)()
-            threads_to_wait.append(thread)
-            seen.add(id(thread))
-        for task in self.transfer_interface.upload_tasks:
-            if task.thread and id(task.thread) not in seen and task.status in UPLOAD_ACTIVE_STATUSES:
-                getattr(task.thread, stop_fn)()
-                threads_to_wait.append(task.thread)
-                seen.add(id(task.thread))
-        for task in self.transfer_interface.download_tasks:
-            if task.thread and id(task.thread) not in seen and task.status in DOWNLOAD_ACTIVE_STATUSES:
-                getattr(task.thread, stop_fn)()
-                threads_to_wait.append(task.thread)
-                seen.add(id(task.thread))
-        # M11: 总超时模式，避免串行等待阻塞 UI
-        deadline = time.monotonic() + 10
-        for thread in threads_to_wait:
-            remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
-            if remaining_ms <= 0:
-                break
-            thread.wait(remaining_ms)
+        transfer = self.transfer_interface
+        suspend_auto_start = getattr(transfer, "suspend_auto_start", None)
+        resume_auto_start = getattr(transfer, "resume_auto_start", None)
+        if callable(suspend_auto_start):
+            suspend_auto_start()
+        try:
+            threads_to_wait = []
+            seen = set()
+            stop_fn = "pause" if save_progress else "cancel"
+            for thread in list(transfer.upload_threads):
+                if thread is None or id(thread) in seen:
+                    continue
+                getattr(thread, stop_fn)()
+                threads_to_wait.append(thread)
+                seen.add(id(thread))
+            for thread in list(transfer.download_threads):
+                if thread is None or id(thread) in seen:
+                    continue
+                getattr(thread, stop_fn)()
+                threads_to_wait.append(thread)
+                seen.add(id(thread))
+            for task in transfer.upload_tasks:
+                if task.thread and id(task.thread) not in seen and task.status in UPLOAD_ACTIVE_STATUSES:
+                    getattr(task.thread, stop_fn)()
+                    threads_to_wait.append(task.thread)
+                    seen.add(id(task.thread))
+            for task in transfer.download_tasks:
+                if task.thread and id(task.thread) not in seen and task.status in DOWNLOAD_ACTIVE_STATUSES:
+                    getattr(task.thread, stop_fn)()
+                    threads_to_wait.append(task.thread)
+                    seen.add(id(task.thread))
+            # M11: 总超时模式，避免串行等待阻塞 UI
+            deadline = time.monotonic() + 10
+            for thread in threads_to_wait:
+                remaining_ms = max(0, int((deadline - time.monotonic()) * 1000))
+                if remaining_ms <= 0:
+                    break
+                thread.wait(remaining_ms)
 
-        # P1-21: 超时后强制终止仍在运行的线程，防止 crash
-        for thread in threads_to_wait:
-            if thread.isRunning():
-                from ..common.log import get_logger as _get_logger
-                _get_logger(__name__).warning("强制终止残留线程: %s", thread)
-                thread.terminate()
-                thread.wait(2000)
+            # P1-21: 超时后强制终止仍在运行的线程，防止 crash
+            for thread in threads_to_wait:
+                if thread.isRunning():
+                    from ..common.log import get_logger as _get_logger
+                    _get_logger(__name__).warning("强制终止残留线程: %s", thread)
+                    thread.terminate()
+                    thread.wait(2000)
 
-        if save_progress:
-            try:
-                self._save_active_progress()
-            except Exception:
-                from ..common.log import get_logger as _get_logger
-                _get_logger(__name__).warning("保存进度失败（可能因锁已被终止线程持有）", exc_info=True)
+            if save_progress:
+                try:
+                    self._save_active_progress()
+                except Exception:
+                    from ..common.log import get_logger as _get_logger
+                    _get_logger(__name__).warning("保存进度失败（可能因锁已被终止线程持有）", exc_info=True)
+        finally:
+            if callable(resume_auto_start):
+                resume_auto_start()
 
     def _save_active_progress(self):
         """兜底：对所有仍在活跃状态的任务强制更新 DB 为 "已暂停"。"""
@@ -242,10 +287,14 @@ class MainWindow(FluentWindow):
             self._stop_all_transfers()
             self._force_cleanup_tasks()
             if self.pan:
-                self.pan.password = ""
-                self.pan.authorization = ""
-                self.pan.close()
+                old_pan = self.pan
+                self.pan = None  # P1-11: 先替换为 None，使异步任务 stale 检查能发现变化
+                self.file_interface.pan = None
+                old_pan.password = ""
+                old_pan.authorization = ""
+                old_pan.close()
             self.clear_login_config()
+            self.hide()
             dlg = LoginDialog(self)
             if dlg.exec() == QDialog.DialogCode.Accepted:
                 self.pan = dlg.get_pan()
@@ -254,12 +303,14 @@ class MainWindow(FluentWindow):
                 self.cloud_interface.set_pan(self.pan)
                 self.file_interface.pan = self.pan
                 self.file_interface.reload()
+                self.show()
             else:
                 self.close()
             dlg.deleteLater()
 
     def _force_cleanup_tasks(self):
         """M7: 强制清理所有残留任务状态，防止重登后线程冲突。"""
+        db = Database.instance()
         for task in self.transfer_interface.upload_tasks:
             if task.thread is not None:
                 try:
@@ -275,6 +326,12 @@ class MainWindow(FluentWindow):
                 except TypeError:
                     pass
                 task.thread = None
+            if task.status in DOWNLOAD_ACTIVE_STATUSES:
+                if getattr(task, "resume_id", ""):
+                    db.delete_download_task(task.resume_id)
+                    cleanup_temp_dir(task.resume_id)
+                task.status = "已取消"
+                continue
             task.status = "已取消"
         self.transfer_interface.upload_threads.clear()
         self.transfer_interface.download_threads.clear()

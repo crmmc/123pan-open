@@ -1,4 +1,5 @@
 import hashlib
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -362,6 +363,8 @@ def test_stream_download_pause_then_resume_from_last_completed_part(tmp_path, mo
         def __init__(self):
             self.pause_requested = False
             self.is_cancelled = False
+            self._active_response = None
+            self._response_lock = threading.Lock()
 
     pause_task = _PauseTask()
 
@@ -604,7 +607,7 @@ def test_download_part_memory_buffer_no_partial_file_on_pause(tmp_path, monkeypa
     aggregator = MagicMock()
     aggregator.record = MagicMock()
 
-    task = SimpleNamespace(is_cancelled=False, pause_requested=False)
+    task = SimpleNamespace(is_cancelled=False, pause_requested=False, _active_response=None, _response_lock=threading.Lock())
 
     small_chunk = 512
     chunks_yielded = 0
@@ -669,7 +672,7 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
 
     part = {"index": 0, "start": 0, "end": part_size - 1, "expected_size": part_size}
     aggregator = MagicMock()
-    task = SimpleNamespace(is_cancelled=False, pause_requested=False)
+    task = SimpleNamespace(is_cancelled=False, pause_requested=False, _active_response=None, _response_lock=threading.Lock())
 
     class _OkResponse:
         status_code = 200
@@ -706,6 +709,166 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
     parts = db.get_download_parts(resume_id)
     assert len(parts) == 1
     assert parts[0]["part_index"] == 0
+
+
+def test_single_stream_cancel_with_cleanup_deletes_download_record(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    out_path = tmp_path / "single-cancel.bin"
+    task = _make_resume_task(out_path, "")
+    db.save_download_task({
+        "resume_id": task.resume_id,
+        "account_name": "alice",
+        "file_name": out_path.name,
+        "file_size": 4,
+        "file_id": task.file_id,
+        "save_path": str(out_path),
+        "status": "下载中",
+        "progress": 50,
+    })
+    cancel_task = SimpleNamespace(
+        is_cancelled=False,
+        pause_requested=False,
+        cleanup_on_cancel=True,
+        _active_response=None,
+        _response_lock=threading.Lock(),
+    )
+
+    def fake_probe(_url):
+        return 4, False, False
+
+    class _CancelMidStreamResponse(_MockResponse):
+        def iter_content(self, chunk_size=8192):
+            cancel_task.is_cancelled = True
+            yield b"data"
+
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: _CancelMidStreamResponse(status_code=200)
+    monkeypatch.setattr(download_resume, "_probe_download", fake_probe)
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = stream_download_from_url(
+        "https://example.test/download",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+        task=cancel_task,
+    )
+
+    assert result == "已取消"
+    assert db.get_download_task(task.resume_id) is None
+
+
+def test_single_stream_verifies_md5_before_replacing_output(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    content = b"good-data"
+    out_path = tmp_path / "single-ok.bin"
+    task = _make_resume_task(out_path, hashlib.md5(content).hexdigest())
+
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (len(content), False, False))
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: _MockResponse(
+        body=content,
+        status_code=200,
+        headers={"Content-Length": str(len(content))},
+    )
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = stream_download_from_url(
+        "https://example.test/download",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+    )
+
+    assert result == out_path
+    assert out_path.read_bytes() == content
+
+
+def test_single_stream_md5_mismatch_does_not_replace_output(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    content = b"good-data"
+    out_path = tmp_path / "single-bad.bin"
+    task = _make_resume_task(out_path, hashlib.md5(b"other-data").hexdigest())
+
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (len(content), False, False))
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: _MockResponse(
+        body=content,
+        status_code=200,
+        headers={"Content-Length": str(len(content))},
+    )
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    with pytest.raises(RuntimeError, match="整文件校验失败"):
+        stream_download_from_url(
+            "https://example.test/download",
+            out_path,
+            overwrite=True,
+            resume_task=task,
+        )
+
+    assert not out_path.exists()
+
+
+def test_single_stream_403_refresh_success(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    content = b"refresh-ok"
+    out_path = tmp_path / "single-refresh-ok.bin"
+    task = _make_resume_task(out_path, hashlib.md5(content).hexdigest())
+    urls = []
+
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (len(content), False, False))
+
+    def fake_get(url, **_kwargs):
+        urls.append(url)
+        if len(urls) == 1:
+            return _MockResponse(status_code=403)
+        return _MockResponse(
+            body=content,
+            status_code=200,
+            headers={"Content-Length": str(len(content))},
+        )
+
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = stream_download_from_url(
+        "https://example.test/expired",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+        refresh_url_fn=lambda: "https://example.test/refreshed",
+    )
+
+    assert result == out_path
+    assert urls == [
+        "https://example.test/expired",
+        "https://example.test/refreshed",
+    ]
+    assert out_path.read_bytes() == content
+
+
+def test_single_stream_403_refresh_failure_raises_clear_error(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    out_path = tmp_path / "single-refresh-fail.bin"
+    task = _make_resume_task(out_path, "")
+
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (4, False, False))
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: _MockResponse(status_code=403)
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    with pytest.raises(RuntimeError, match="下载链接已过期或刷新失败"):
+        stream_download_from_url(
+            "https://example.test/expired",
+            out_path,
+            overwrite=True,
+            resume_task=task,
+            refresh_url_fn=lambda: "https://example.test/refreshed",
+        )
+
+    assert not out_path.exists()
 
 
 # ---- 3a. _build_parts ----

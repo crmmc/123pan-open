@@ -306,17 +306,31 @@ class SettingInterface(ScrollArea):
         """ask download location changed slot"""
         Database.instance().set_config("askDownloadLocation", checked)
 
+    def __currentPan(self):
+        window = self.window()
+        return getattr(window, "pan", None)
+
     def __onRememberPasswordChanged(self, checked):
         Database.instance().set_config("rememberPassword", checked)
-        if not checked:
-            from ..common.credential_store import delete_credential
-            delete_credential("passWord")
+        from ..common.credential_store import delete_credential, save_credential
+        if checked:
+            pan = self.__currentPan()
+            password = getattr(pan, "password", "") if pan else ""
+            if password:
+                save_credential("passWord", password)
+            return
+        delete_credential("passWord")
 
     def __onStayLoggedInChanged(self, checked):
         Database.instance().set_config("stayLoggedIn", checked)
-        if not checked:
-            from ..common.credential_store import delete_credential
-            delete_credential("authorization")
+        from ..common.credential_store import delete_credential, save_credential
+        if checked:
+            pan = self.__currentPan()
+            authorization = getattr(pan, "authorization", "") if pan else ""
+            if authorization:
+                save_credential("authorization", authorization)
+            return
+        delete_credential("authorization")
 
     def __onDownloadThreadsChanged(self, value):
         Database.instance().set_config("maxDownloadThreads", value)
@@ -397,3 +411,43 @@ class SettingInterface(ScrollArea):
         self.aboutCard.clicked.connect(
             lambda: QDesktopServices.openUrl(QUrl(ABOUT_URL))
         )
+
+    def refresh_from_db(self):
+        """P1-13: 从 DB 重新读取所有配置值刷新 UI 控件。"""
+        db = Database.instance()
+        self.downloadFolderCard.setContent(
+            db.get_config("defaultDownloadPath", str(Path.home() / "Downloads"))
+        )
+        self.askDownloadLocationCard.setChecked(
+            db.get_config("askDownloadLocation", True)
+        )
+        self.rememberPasswordCard.setChecked(
+            db.get_config("rememberPassword", False)
+        )
+        self.stayLoggedInCard.setChecked(
+            db.get_config("stayLoggedIn", True)
+        )
+        self.downloadThreadsSpinBox.setValue(
+            _read_int_config("maxDownloadThreads", 1, 1, 16)
+        )
+        self.uploadThreadsSpinBox.setValue(
+            _read_int_config("maxUploadThreads", 16, 1, 16)
+        )
+        self.concurrentDownloadsSpinBox.setValue(
+            _read_int_config("maxConcurrentDownloads", 5, 1, 5)
+        )
+        self.concurrentUploadsSpinBox.setValue(
+            _read_int_config("maxConcurrentUploads", 3, 1, 5)
+        )
+        self.retryAttemptsComboBox.setCurrentIndex(
+            _read_int_config("retryMaxAttempts", 3, 0, 5)
+        )
+        self.downloadPartSizeSpinBox.setValue(
+            _read_int_config("downloadPartSizeMB", 5, 4, 32)
+        )
+        self.uploadPartSizeSpinBox.setValue(
+            _read_int_config("uploadPartSizeMB", 5, 5, 16)
+        )
+        current_level = db.get_config("logLevel", "INFO")
+        if current_level in self._LOG_LEVELS:
+            self.logLevelComboBox.setCurrentIndex(self._LOG_LEVELS.index(current_level))

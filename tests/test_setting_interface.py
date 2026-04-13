@@ -43,6 +43,34 @@ def test_setting_interface_clears_password_and_token_when_switches_disabled(tmp_
     assert db.get_config("stayLoggedIn", None) is False
 
 
+def test_setting_interface_saves_current_password_when_remember_enabled(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    interface = SettingInterface.__new__(SettingInterface)
+    interface.window = lambda: type("_Window", (), {"pan": type("_Pan", (), {"password": "secret"})()})()
+
+    with patch("src.app.common.credential_store.save_credential") as mock_save:
+        interface._SettingInterface__onRememberPasswordChanged(True)
+
+    assert db.get_config("rememberPassword", None) is True
+    mock_save.assert_called_once_with("passWord", "secret")
+
+
+def test_setting_interface_saves_current_authorization_when_stay_logged_in_enabled(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    interface = SettingInterface.__new__(SettingInterface)
+    interface.window = lambda: type(
+        "_Window",
+        (),
+        {"pan": type("_Pan", (), {"authorization": "Bearer token"})()},
+    )()
+
+    with patch("src.app.common.credential_store.save_credential") as mock_save:
+        interface._SettingInterface__onStayLoggedInChanged(True)
+
+    assert db.get_config("stayLoggedIn", None) is True
+    mock_save.assert_called_once_with("authorization", "Bearer token")
+
+
 def test_setting_interface_clamps_invalid_numeric_config(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_many_config({

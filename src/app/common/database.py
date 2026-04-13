@@ -26,13 +26,13 @@ def get_download_part_size() -> int:
     mb = _safe_int(Database.instance().get_config("downloadPartSizeMB", 5), 5, 4, 32)
     return mb * 1024 * 1024
 
-CURRENT_SCHEMA_VERSION = 4
+CURRENT_SCHEMA_VERSION = 5
 
 _DOWNLOAD_TASK_COLUMNS = frozenset({
     "account_name", "file_name", "file_id", "file_type",
     "file_size", "save_path", "current_dir_id", "etag", "s3key_flag",
     "status", "progress", "error", "supports_resume", "metadata_version",
-    "created_at", "updated_at",
+    "part_size", "created_at", "updated_at",
 })
 
 _UPLOAD_TASK_COLUMNS = frozenset({
@@ -83,7 +83,10 @@ class Database:
         self._db_path = db_path
         self._lock = threading.RLock()
         self._closed = False
-        self._conn = sqlite3.connect(str(db_path), check_same_thread=False)
+        # P2-21: 显式设置 isolation_level 确保与 Python 3.12+ 兼容
+        self._conn = sqlite3.connect(
+            str(db_path), check_same_thread=False, isolation_level="DEFERRED"
+        )
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode = WAL")
         self._conn.execute("PRAGMA foreign_keys = ON")
@@ -114,8 +117,13 @@ class Database:
             if _db_instance is not None:
                 inst = _db_instance
                 with inst._lock:
-                    inst._closed = True
                     conn = inst._conn
+                    if conn is not None:
+                        try:
+                            conn.commit()
+                        except Exception:
+                            pass  # P1-10: commit 失败也继续清除单例
+                    inst._closed = True
                     inst._conn = None  # 解除引用，防止旧引用访问
                 _db_instance = None
         # 锁外关闭连接，减少锁持有时间
@@ -249,8 +257,20 @@ class Database:
                             "ALTER TABLE upload_tasks ADD COLUMN file_mtime "
                             "REAL NOT NULL DEFAULT 0"
                         )
-                self._conn.commit()
+                if version < 5:
+                    # P1-9: 持久化下载分片大小
+                    columns = {
+                        row[1]
+                        for row in self._conn.execute("PRAGMA table_info(download_tasks)").fetchall()
+                    }
+                    if "part_size" not in columns:
+                        self._conn.execute(
+                            "ALTER TABLE download_tasks ADD COLUMN part_size "
+                            "INTEGER NOT NULL DEFAULT 0"
+                        )
+                # P2-20: 在 commit 之前写入 user_version，确保在同一事务内
                 self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")
+                self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
@@ -342,8 +362,8 @@ class Database:
                 (resume_id, account_name, file_name, file_id, file_type,
                  file_size, save_path, current_dir_id, etag, s3key_flag,
                  status, progress, error, supports_resume, metadata_version,
-                 created_at, updated_at)
-                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                 part_size, created_at, updated_at)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(resume_id) DO UPDATE SET
                     account_name = excluded.account_name,
                     file_name = excluded.file_name,
@@ -359,6 +379,7 @@ class Database:
                     error = excluded.error,
                     supports_resume = excluded.supports_resume,
                     metadata_version = excluded.metadata_version,
+                    part_size = excluded.part_size,
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -370,7 +391,8 @@ class Database:
                     task.get("status", "等待中"), task.get("progress", 0),
                     task.get("error", ""),
                     int(task.get("supports_resume", 0)),
-                    task.get("metadata_version", 2), now, now,
+                    task.get("metadata_version", 2),
+                    task.get("part_size", 0), now, now,
                 ),
             )
             self._conn.commit()

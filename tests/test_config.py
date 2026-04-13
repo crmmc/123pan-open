@@ -1,3 +1,7 @@
+import sqlite3
+
+import pytest
+
 from src.app.common import database as database_module
 from src.app.common.database import Database, _safe_int, _safe_float, get_upload_part_size, get_download_part_size
 
@@ -346,6 +350,67 @@ def test_delete_upload_task_cascades_parts(tmp_path, monkeypatch):
     db.record_upload_part("up3", 0, "e")
     db.delete_upload_task("up3")
     assert db.get_upload_parts("up3") == []
+
+
+def test_reset_commits_unflushed_download_parts(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.save_download_task({
+        "resume_id": "dl-reset",
+        "account_name": "a",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+    db.record_download_part("dl-reset", {
+        "index": 0,
+        "start": 0,
+        "end": 9,
+        "expected_size": 10,
+        "actual_size": 10,
+        "md5": "hash-0",
+    }, commit=False)
+
+    Database.reset()
+    db2 = Database.instance()
+
+    parts = db2.get_download_parts("dl-reset")
+    assert len(parts) == 1
+    assert parts[0]["md5"] == "hash-0"
+
+
+def test_reset_commits_unflushed_upload_parts(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.save_upload_task({"task_id": "up-reset", "account_name": "a", "file_name": "f", "local_path": "/f"})
+    db.record_upload_part("up-reset", 0, "etag-0", commit=False)
+
+    Database.reset()
+    db2 = Database.instance()
+
+    parts = db2.get_upload_parts("up-reset")
+    assert len(parts) == 1
+    assert parts[0]["etag"] == "etag-0"
+
+
+def test_reset_raises_when_commit_fails(tmp_path, monkeypatch):
+    """P1-10: commit 失败时 reset() 不再抛异常，但仍清除单例引用。"""
+    db = _use_temp_db(tmp_path, monkeypatch)
+    real_conn = db._conn
+
+    class _FailingConn:
+        def commit(self):
+            raise sqlite3.OperationalError("commit failed")
+
+        def close(self):
+            return None
+
+    db._conn = _FailingConn()
+
+    # P1-10: commit 失败不再抛异常
+    Database.reset()
+
+    # 单例已被清除，重新创建
+    import src.app.common.database as db_mod
+    assert db_mod._db_instance is None
 
 
 # ---- 1f. get_upload_part_size / get_download_part_size ----

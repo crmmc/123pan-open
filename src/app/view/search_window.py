@@ -138,15 +138,24 @@ class SearchDialog(QDialog):
 
     def accept(self):
         self._closed = True
+        self._cancel_pending_tasks()
         super().accept()
 
     def reject(self):
         self._closed = True
+        self._cancel_pending_tasks()
         super().reject()
 
     def closeEvent(self, event):
         self._closed = True
+        self._cancel_pending_tasks()
         super().closeEvent(event)
+
+    def _cancel_pending_tasks(self):
+        """P2-25: 标记所有待执行任务为已取消。"""
+        for sig in self._pending_signals:
+            if hasattr(sig, '_cancelled'):
+                sig._cancelled = True
 
     def __doSearch(self, text):
         if not text.strip():
@@ -158,6 +167,7 @@ class SearchDialog(QDialog):
 
         class SearchSignals(QObject):
             finished = Signal(object, str)
+            _cancelled = False  # P2-25
 
         class SearchTask(QRunnable):
             def __init__(self, pan, text, signals):
@@ -167,13 +177,21 @@ class SearchDialog(QDialog):
                 self.signals = signals
 
             def run(self):
+                if self.signals._cancelled:
+                    return
                 try:
                     code, items = self.pan.get_dir_by_id(
                         0, all=True, limit=100, search_data=self.text
                     )
-                    self.signals.finished.emit(items if code == 0 else [], "")
+                    if self.signals._cancelled:
+                        return
+                    if code != 0:
+                        self.signals.finished.emit([], f"搜索失败，返回码: {code}")
+                        return
+                    self.signals.finished.emit(items, "")
                 except Exception as e:
-                    self.signals.finished.emit([], str(e))
+                    if not self.signals._cancelled:
+                        self.signals.finished.emit([], str(e))
 
         self._search_signals = SearchSignals()
         self._pending_signals.append(self._search_signals)
@@ -223,6 +241,7 @@ class SearchDialog(QDialog):
 
         class PathSignals(QObject):
             finished = Signal(object)
+            _cancelled = False  # P2-25
 
         class FetchPathsTask(QRunnable):
             def __init__(self, pan, pid_to_fid, signals):
@@ -232,10 +251,13 @@ class SearchDialog(QDialog):
                 self.signals = signals
 
             def run(self):
+                if self.signals._cancelled:
+                    return
                 result = {}
                 for pid, fid in self.pid_to_fid.items():
+                    if self.signals._cancelled:
+                        return
                     try:
-                        # 对文件本身调 file_details，paths 返回完整父目录链
                         details = self.pan.file_details([fid])
                         if details:
                             path_list = details.get("paths", [])
@@ -243,7 +265,8 @@ class SearchDialog(QDialog):
                             result[pid] = names
                     except Exception as e:
                         logger.warning("获取路径失败 (fid=%s): %s", fid, e)
-                self.signals.finished.emit(result)
+                if not self.signals._cancelled:
+                    self.signals.finished.emit(result)
 
         self._path_signals = PathSignals()
         self._pending_signals.append(self._path_signals)
