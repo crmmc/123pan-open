@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import shiboken6
 from PySide6.QtCore import Qt
 from PySide6.QtCore import QEvent, QRunnable, QThreadPool, Signal, QObject
 from PySide6.QtWidgets import (
@@ -510,6 +511,8 @@ class FileInterface(QWidget):
             if sig in self._pending_signals:
                 self._pending_signals.remove(sig)
             self.is_loading_tree = False
+            if not shiboken6.isValid(self) or not shiboken6.isValid(_item):
+                return
             _item.takeChildren()
             if error:
                 logger.warning("异步加载树节点失败: %s", error)
@@ -598,6 +601,8 @@ class FileInterface(QWidget):
         self._pending_signals.append(signals)
 
         def _on_finished(items, err, rid=current_request_id, sig=signals):
+            if not shiboken6.isValid(self):
+                return
             self.__onLoadListFinished(items, err, rid)
             if sig in self._pending_signals:
                 self._pending_signals.remove(sig)
@@ -734,6 +739,8 @@ class FileInterface(QWidget):
         }
 
     def __isAsyncContextStale(self, context, *, require_same_dir=False):
+        if not shiboken6.isValid(self):
+            return True
         if context is None:
             return False
         if self.pan is not context["pan"]:
@@ -1600,6 +1607,8 @@ class FileInterface(QWidget):
 
         if select_file_id is not None:
             def on_loaded(file_items, err, rid=current_request_id):
+                if not shiboken6.isValid(self):
+                    return
                 self.__onLoadListFinished(file_items, err, rid)
                 if not err:
                     for row in range(self.fileTable.rowCount()):

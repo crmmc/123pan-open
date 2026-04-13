@@ -1,10 +1,18 @@
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
+import pytest
 from PySide6.QtCore import QEvent
 
 from src.app.view import file_interface as fi_module
 from src.app.view.file_interface import FileInterface
+
+
+@pytest.fixture(autouse=True)
+def _bypass_shiboken_valid(monkeypatch):
+    """测试中 FileInterface.__new__ 创建的对象没有 C++ 侧初始化，
+    shiboken6.isValid 会返回 False。这里 patch 掉以避免误判。"""
+    monkeypatch.setattr("src.app.view.file_interface.shiboken6.isValid", lambda _obj: True)
 
 
 class _FakeUrl:

@@ -1,5 +1,6 @@
 """二维码登录页面 widget。"""
 
+import shiboken6
 import qrcode
 from PIL.ImageQt import ImageQt
 
@@ -195,7 +196,7 @@ class QRLoginPage(QWidget):
     def _on_qr_generated(self, flow_id, data):
         """二维码生成成功回调。"""
         pan_temp = data.pop("_pan_temp", None)
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             if pan_temp is not None:
                 pan_temp.close()
             return
@@ -226,7 +227,7 @@ class QRLoginPage(QWidget):
 
     def _on_qr_generate_error(self, flow_id, error_msg):
         """二维码生成失败回调。"""
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             return
         logger.error("获取二维码失败: %s", error_msg)
         self.status_label.setText("获取二维码失败，请重试")
@@ -264,7 +265,7 @@ class QRLoginPage(QWidget):
 
     def _on_poll_error(self, flow_id):
         """轮询网络错误回调。"""
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             return
         self._poll_in_flight = False
         self._consecutive_errors += 1
@@ -278,7 +279,7 @@ class QRLoginPage(QWidget):
 
     def _on_poll_result(self, flow_id, result):
         """轮询结果回调。"""
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             return
         self._poll_in_flight = False
         self._consecutive_errors = 0
@@ -333,13 +334,13 @@ class QRLoginPage(QWidget):
 
     def _on_login_verified(self, flow_id, pan):
         """登录验证成功回调。"""
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             return
         self.loginSuccess.emit(pan)
 
     def _on_login_verify_error(self, flow_id, error_msg):
         """登录验证失败回调。"""
-        if flow_id != self._qr_flow_id:
+        if not shiboken6.isValid(self) or flow_id != self._qr_flow_id:
             return
         if "暂不支持" in error_msg:
             self.status_label.setText(error_msg)

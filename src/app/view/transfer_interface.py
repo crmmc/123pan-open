@@ -129,6 +129,9 @@ class TransferTask:
         self.speed_bps = 0.0
         self.eta_seconds = -1.0
         self.speed_tracker = SpeedTracker()
+        self.start_time: float = 0.0
+        self.finish_duration: float = -1.0
+        self.finish_avg_speed: float = 0.0
 
 
 class UploadTask(TransferTask):
@@ -275,7 +278,6 @@ class UploadThread(QThread):
                 return
             self.progress_updated.emit(100)
             self.status_updated.emit("已完成")
-            self.finished.emit()
         except Exception as exc:
             logger.error("上传错误: %s", exc, exc_info=True)
             self.error.emit(str(exc))
@@ -373,7 +375,6 @@ class DownloadThread(QThread):
                 return
             self.progress_updated.emit(100)
             self.status_updated.emit("已完成")
-            self.finished.emit()
         except Exception as exc:
             logger.error("下载错误: %s", exc)
             self.error.emit(str(exc))
@@ -767,6 +768,10 @@ class TransferInterface(QWidget):
         task.last_error = ""
         task.active_workers = 0
         task.max_workers = 0
+        task._finish_handled = False
+        task.finish_duration = -1.0
+        task.finish_avg_speed = 0.0
+        task.start_time = time.monotonic()
         task.speed_tracker.reset()
         thread = UploadThread(task, self.pan)
         task.thread = thread
@@ -787,7 +792,7 @@ class TransferInterface(QWidget):
     ):
         account_name = self.current_account_name
         resume_id = build_resume_id(account_name, file_id, save_path)
-        existing = next((t for t in self.download_tasks if t.resume_id == resume_id), None)
+        existing = next((t for t in self.download_tasks if t.resume_id == resume_id and t.status not in ("已完成", "已取消")), None)
         if existing:
             return existing
         task = DownloadTask(
@@ -822,6 +827,10 @@ class TransferInterface(QWidget):
         task.cleanup_on_cancel = False
         task.delete_requested = False
         task.last_error = ""
+        task._finish_handled = False
+        task.finish_duration = -1.0
+        task.finish_avg_speed = 0.0
+        task.start_time = time.monotonic()
         task.speed_tracker.reset()
         thread = DownloadThread(task, self.pan)
         task.thread = thread
@@ -941,7 +950,7 @@ class TransferInterface(QWidget):
                 task.speed_bps = task.speed_tracker.speed()
                 task.eta_seconds = task.speed_tracker.eta(remaining)
                 upload_dirty.append(task)
-            elif task.speed_bps != 0.0:
+            elif task.speed_bps != 0.0 and task.status != "已完成":
                 task.speed_bps = 0.0
                 task.eta_seconds = -1.0
                 upload_dirty.append(task)
@@ -954,7 +963,7 @@ class TransferInterface(QWidget):
                 task.speed_bps = task.speed_tracker.speed()
                 task.eta_seconds = task.speed_tracker.eta(remaining)
                 download_dirty.append(task)
-            elif task.speed_bps != 0.0:
+            elif task.speed_bps != 0.0 and task.status != "已完成":
                 task.speed_bps = 0.0
                 task.eta_seconds = -1.0
                 download_dirty.append(task)
@@ -1043,6 +1052,17 @@ class TransferInterface(QWidget):
         self.__refresh_task_cells(table, row, task)
 
     def __task_finished(self, task, task_type):
+        # 防重入：status_updated 和 QThread.finished 都会触发此方法
+        if getattr(task, "_finish_handled", False):
+            return
+        task._finish_handled = True
+
+        # 计算耗时和平均速度
+        if task.start_time > 0:
+            task.finish_duration = time.monotonic() - task.start_time
+            if task.finish_duration > 0 and task.file_size > 0:
+                task.finish_avg_speed = task.file_size / task.finish_duration
+
         if task_type == "upload":
             if task.delete_requested:
                 return
@@ -1050,11 +1070,9 @@ class TransferInterface(QWidget):
                 return
             if task.status == "已完成":
                 InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
-                # P2-23: 上传完成后清理 DB 记录和列表，与下载行为对齐
                 if task.db_task_id:
                     Database.instance().delete_upload_task(task.db_task_id)
-                if task in self.upload_tasks:
-                    self.upload_tasks.remove(task)
+                    task.db_task_id = None
                 self.__update_upload_table()
             return
         # ---- 以下为下载逻辑 ----
@@ -1066,8 +1084,6 @@ class TransferInterface(QWidget):
         task.eta_seconds = -1.0
         task.speed_tracker = None
         Database.instance().delete_download_task(task.resume_id)
-        if task in self.download_tasks:
-            self.download_tasks.remove(task)
         self.__update_download_table()
 
     def __task_error(self, task, error):
@@ -1521,8 +1537,14 @@ class TransferInterface(QWidget):
             return
         center = Qt.AlignmentFlag.AlignCenter
         self.__set_table_item_text(table, row, COL_PERCENT, f"{task.progress}%", center)
-        self.__set_table_item_text(table, row, COL_SPEED, format_speed(task.speed_bps), center)
-        self.__set_table_item_text(table, row, COL_ETA, format_eta(task.eta_seconds), center)
+        if task.status == "已完成" and task.finish_avg_speed > 0:
+            self.__set_table_item_text(table, row, COL_SPEED, f"均速 {format_speed(task.finish_avg_speed)}", center)
+        else:
+            self.__set_table_item_text(table, row, COL_SPEED, format_speed(task.speed_bps), center)
+        if task.status == "已完成" and task.finish_duration > 0:
+            self.__set_table_item_text(table, row, COL_ETA, f"耗时 {format_eta(task.finish_duration)}", center)
+        else:
+            self.__set_table_item_text(table, row, COL_ETA, format_eta(task.eta_seconds), center)
         conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
         self.__set_table_item_text(table, row, COL_CONN, conn, center)
 
@@ -1542,8 +1564,14 @@ class TransferInterface(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, task.db_task_id or "")
             self.__set_table_item_text(self.uploadTable, row, COL_SIZE, format_file_size(task.file_size))
             self.__set_table_item_text(self.uploadTable, row, COL_PERCENT, f"{task.progress}%", center)
-            self.__set_table_item_text(self.uploadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
-            self.__set_table_item_text(self.uploadTable, row, COL_ETA, format_eta(task.eta_seconds), center)
+            if task.status == "已完成" and task.finish_avg_speed > 0:
+                self.__set_table_item_text(self.uploadTable, row, COL_SPEED, f"均速 {format_speed(task.finish_avg_speed)}", center)
+            else:
+                self.__set_table_item_text(self.uploadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
+            if task.status == "已完成" and task.finish_duration > 0:
+                self.__set_table_item_text(self.uploadTable, row, COL_ETA, f"耗时 {format_eta(task.finish_duration)}", center)
+            else:
+                self.__set_table_item_text(self.uploadTable, row, COL_ETA, format_eta(task.eta_seconds), center)
             self.__set_table_item_text(self.uploadTable, row, COL_STATUS, task.status)
             conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
             self.__set_table_item_text(self.uploadTable, row, COL_CONN, conn, center)
@@ -1564,8 +1592,14 @@ class TransferInterface(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, task.resume_id or "")
             self.__set_table_item_text(self.downloadTable, row, COL_SIZE, format_file_size(task.file_size))
             self.__set_table_item_text(self.downloadTable, row, COL_PERCENT, f"{task.progress}%", center)
-            self.__set_table_item_text(self.downloadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
-            self.__set_table_item_text(self.downloadTable, row, COL_ETA, format_eta(task.eta_seconds), center)
+            if task.status == "已完成" and task.finish_avg_speed > 0:
+                self.__set_table_item_text(self.downloadTable, row, COL_SPEED, f"均速 {format_speed(task.finish_avg_speed)}", center)
+            else:
+                self.__set_table_item_text(self.downloadTable, row, COL_SPEED, format_speed(task.speed_bps), center)
+            if task.status == "已完成" and task.finish_duration > 0:
+                self.__set_table_item_text(self.downloadTable, row, COL_ETA, f"耗时 {format_eta(task.finish_duration)}", center)
+            else:
+                self.__set_table_item_text(self.downloadTable, row, COL_ETA, format_eta(task.eta_seconds), center)
             self.__set_table_item_text(self.downloadTable, row, COL_STATUS, task.status)
             conn = f"{task.active_workers}/{task.max_workers}" if task.active_workers or task.max_workers else "-"
             self.__set_table_item_text(self.downloadTable, row, COL_CONN, conn, center)

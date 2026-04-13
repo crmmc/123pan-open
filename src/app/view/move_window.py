@@ -1,3 +1,4 @@
+import shiboken6
 from PySide6.QtCore import Qt, QObject, Signal, QRunnable, QThreadPool
 from PySide6.QtWidgets import QVBoxLayout, QHBoxLayout, QDialog, QTreeWidgetItem
 
@@ -149,6 +150,8 @@ class MoveDialog(QDialog):
 
     def _onExpandFinished(self, item, dir_id, items, error):
         if self._closed:
+            return
+        if not shiboken6.isValid(item):
             return
         # 查找并移除 loading 占位项
         for i in range(item.childCount()):

@@ -24,8 +24,6 @@ from ..common import resource  # noqa: F401 -- 触发 qInitResources()
 from ..common.database import Database
 from ..common.download_resume import cleanup_temp_dir
 
-from PySide6.QtCore import QRunnable, QThreadPool, QObject, Signal as QSignal
-
 
 class MainWindow(FluentWindow):
     def __init__(self):
@@ -88,37 +86,13 @@ class MainWindow(FluentWindow):
         db = Database.instance()
         self.pan = None
 
-        # P1-16: 异步执行 token 探测，避免阻塞窗口创建
         stay_logged_in = bool(db.get_config("stayLoggedIn", True))
         if stay_logged_in:
-            self._try_async_token_probe(db)
-        else:
-            self._show_login_dialog()
-
-    def _try_async_token_probe(self, db):
-        """P1-16: 异步 token 探测，成功后进入主界面。"""
-        class _ProbeSignals(QObject):
-            success = QSignal(object)
-            failed = QSignal()
-
-        class _ProbeTask(QRunnable):
-            def __init__(self, db, signals):
-                super().__init__()
-                self.db = db
-                self.signals = signals
-            def run(self):
-                pan = try_token_probe(self.db)
-                if pan is not None:
-                    self.signals.success.emit(pan)
-                else:
-                    self.signals.failed.emit()
-
-        signals = _ProbeSignals()
-        self._probe_signals = signals  # prevent GC
-        signals.success.connect(self._on_probe_success)
-        signals.failed.connect(self._show_login_dialog)
-        task = _ProbeTask(db, signals)
-        QThreadPool.globalInstance().start(task)
+            pan = try_token_probe(db)
+            if pan is not None:
+                self._on_probe_success(pan)
+                return
+        self._show_login_dialog()
 
     def _on_probe_success(self, pan):
         self.pan = pan
