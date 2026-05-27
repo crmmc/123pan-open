@@ -4,7 +4,13 @@ from unittest.mock import MagicMock
 from src.app.common import database as database_module
 from src.app.common.database import Database
 from src.app.common.download_resume import get_merged_path, get_part_path
-from src.app.view.transfer_interface import DownloadTask, DownloadThread, TransferInterface, UploadTask
+from src.app.view.transfer_interface import (
+    DownloadTask,
+    DownloadThread,
+    TransferInterface,
+    UploadTask,
+    _UploadTaskStore,
+)
 
 
 class _FakeSignal:
@@ -53,8 +59,10 @@ def _make_interface(tmp_path, monkeypatch):
     interface.upload_threads = []
     interface.download_threads = []
     interface.download_status_filter = "全部"
+    interface.upload_status_filter = "全部"
     interface.current_account_name = "alice"
     interface.pan = None
+    interface._upload_store = _UploadTaskStore()
     interface._TransferInterface__update_download_table = lambda: None
     interface._TransferInterface__update_upload_table = lambda: None
     interface._TransferInterface__try_start_pending_downloads = lambda: None
@@ -66,6 +74,98 @@ def _make_interface(tmp_path, monkeypatch):
     )()
     monkeypatch.setattr("src.app.view.transfer_interface.Database.instance", lambda: db)
     return interface, db
+
+
+def test_upload_task_store_create_task_persists_db_record(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    task = UploadTask("demo.bin", 12, str(tmp_path / "demo.bin"), 7)
+    store = _UploadTaskStore()
+
+    store.create_task(task, "alice")
+
+    assert task.db_task_id
+    stored = db.get_upload_task(task.db_task_id)
+    assert stored is not None
+    assert stored["account_name"] == "alice"
+    assert stored["file_name"] == "demo.bin"
+    assert stored["status"] == "等待中"
+    assert stored["delete_requested"] == 0
+
+
+def test_upload_task_store_update_session_persists_resume_fields(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    task = UploadTask("demo.bin", 12, str(tmp_path / "demo.bin"), 7)
+    store = _UploadTaskStore()
+    store.create_task(task, "alice")
+    task.bucket = "bucket"
+    task.storage_node = "node"
+    task.upload_key = "key"
+    task.upload_id_s3 = "upload-id"
+    task.up_file_id = 123
+    task.total_parts = 4
+    task.block_size = 5
+    task.etag = "etag"
+    task.file_mtime = 123.4
+
+    store.update_session(task)
+
+    stored = db.get_upload_task(task.db_task_id)
+    assert stored is not None
+    assert stored["bucket"] == "bucket"
+    assert stored["storage_node"] == "node"
+    assert stored["upload_key"] == "key"
+    assert stored["upload_id_s3"] == "upload-id"
+    assert stored["up_file_id"] == 123
+    assert stored["total_parts"] == 4
+    assert stored["block_size"] == 5
+    assert stored["etag"] == "etag"
+    assert stored["file_mtime"] == 123.4
+
+
+def test_upload_task_store_reset_session_clears_parts_and_keeps_progress_when_requested(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    task = UploadTask("demo.bin", 12, str(tmp_path / "demo.bin"), 7)
+    store = _UploadTaskStore()
+    store.create_task(task, "alice")
+    task.progress = 66
+    task.bucket = "bucket"
+    task.storage_node = "node"
+    task.upload_key = "key"
+    task.upload_id_s3 = "upload-id"
+    task.up_file_id = 123
+    task.total_parts = 4
+    task.block_size = 5
+    task.etag = "etag"
+    db.record_upload_part(task.db_task_id, 1, "etag-1")
+
+    store.reset_session(task, clear_progress=False)
+
+    stored = db.get_upload_task(task.db_task_id)
+    assert stored is not None
+    assert stored["progress"] == 66
+    assert stored["bucket"] == ""
+    assert stored["upload_key"] == ""
+    assert stored["upload_id_s3"] == ""
+    assert stored["up_file_id"] == 0
+    assert stored["total_parts"] == 0
+    assert stored["block_size"] == task.block_size
+    assert stored["etag"] == ""
+    assert db.get_upload_parts(task.db_task_id) == []
+
+
+def test_upload_task_store_delete_task_discards_pending_parts(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    task = UploadTask("demo.bin", 12, str(tmp_path / "demo.bin"), 7)
+    store = _UploadTaskStore()
+    store.create_task(task, "alice")
+    task_id = task.db_task_id
+    task._pending_upload_parts = [(1, "etag-1")]
+
+    store.delete_task(task)
+
+    assert task.db_task_id is None
+    assert task._pending_upload_parts == []
+    assert db.get_upload_task(task_id) is None
 
 
 def test_task_finished_deletes_download_record(tmp_path, monkeypatch):
@@ -569,6 +669,136 @@ def test_upload_task_error_persists_error_message(tmp_path, monkeypatch):
     assert stored["status"] == "失败"
     assert stored["error"] == "boom"
     assert task.last_error == "boom"
+
+
+def test_upload_progress_db_updates_are_throttled(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+    interface._TransferInterface__partial_refresh = lambda _task: None
+
+    calls = []
+
+    def fake_update(task_id, **fields):
+        calls.append((task_id, fields))
+
+    monkeypatch.setattr(db, "update_upload_task", fake_update)
+    times = iter([100.0, 100.1, 100.2, 102.3])
+    monkeypatch.setattr("src.app.view.transfer_interface.time.time", lambda: next(times))
+
+    interface._TransferInterface__update_task_progress(task, 10)
+    interface._TransferInterface__update_task_progress(task, 10)
+    interface._TransferInterface__update_task_progress(task, 10)
+    interface._TransferInterface__update_task_progress(task, 10)
+
+    assert [fields["progress"] for _task_id, fields in calls] == [10, 10]
+
+
+def test_upload_part_done_is_buffered_until_flush(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+    calls = []
+
+    def fake_record(task_id, part_index, etag="", *, commit=True):
+        calls.append((task_id, part_index, etag, commit))
+
+    monkeypatch.setattr(db, "record_upload_part", fake_record)
+
+    interface._TransferInterface__on_upload_part_done(task, 1, "etag-1")
+
+    assert calls == []
+    assert task._pending_upload_parts == [(1, "etag-1")]
+
+
+def test_tick_speed_flushes_buffered_upload_parts(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+    task.status = "上传中"
+    task._pending_upload_parts = [(1, "etag-1"), (2, "etag-2")]
+    interface.download_tasks = []
+    interface.uploadTable = type("_Table", (), {"rowCount": lambda self: 0})()
+    interface._upload_batch_btns = {"speed": type("_Label", (), {"setText": lambda self, text: None})()}
+
+    records = []
+    flushes = []
+    monkeypatch.setattr(
+        db,
+        "record_upload_part",
+        lambda task_id, part_index, etag="", *, commit=True:
+        records.append((task_id, part_index, etag, commit)),
+    )
+    monkeypatch.setattr(db, "flush", lambda: flushes.append(True))
+
+    interface._TransferInterface__tick_speed()
+
+    assert records == [
+        (task.db_task_id, 1, "etag-1", False),
+        (task.db_task_id, 2, "etag-2", False),
+    ]
+    assert flushes == [True]
+    assert task._pending_upload_parts == []
+
+
+def test_upload_terminal_status_flushes_buffered_parts(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+    task._pending_upload_parts = [(1, "etag-1")]
+    records = []
+    monkeypatch.setattr(
+        db,
+        "record_upload_part",
+        lambda task_id, part_index, etag="", *, commit=True:
+        records.append((task_id, part_index, etag, commit)),
+    )
+    monkeypatch.setattr(db, "flush", lambda: None)
+    monkeypatch.setattr("src.app.view.transfer_interface.InfoBar.error", lambda **_kwargs: None)
+
+    interface._TransferInterface__update_task_status(task, "失败")
+
+    assert records == [(task.db_task_id, 1, "etag-1", False)]
+    assert task._pending_upload_parts == []
+
+
+def test_cancelled_upload_discards_buffered_parts(tmp_path, monkeypatch):
+    interface, db = _make_interface(tmp_path, monkeypatch)
+    task = interface.add_upload_task(
+        "demo.bin",
+        12,
+        str(tmp_path / "demo.bin"),
+        7,
+    )
+    task._pending_upload_parts = [(1, "etag-1")]
+    records = []
+    monkeypatch.setattr(
+        db,
+        "record_upload_part",
+        lambda task_id, part_index, etag="", *, commit=True:
+        records.append((task_id, part_index, etag, commit)),
+    )
+
+    interface._TransferInterface__update_task_status(task, "已取消")
+
+    assert records == []
+    assert task._pending_upload_parts == []
 
 
 def test_download_task_error_keeps_thread_until_terminal_cleanup(tmp_path, monkeypatch):

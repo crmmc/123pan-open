@@ -158,6 +158,132 @@ class UploadTask(TransferTask):
         self.block_size = get_upload_part_size()
         self.etag = ""
         self.file_mtime = 0.0
+        self._last_db_progress = -1
+        self._last_db_progress_time = 0.0
+        self._pending_upload_parts = []
+
+
+class _UploadTaskStore:
+    """上传任务持久化封装。"""
+
+    def create_task(self, task, account_name):
+        if not task.db_task_id:
+            task.db_task_id = uuid.uuid4().hex
+        Database.instance().save_upload_task({
+            "task_id": task.db_task_id,
+            "account_name": account_name,
+            "file_name": task.file_name,
+            "file_size": task.file_size,
+            "local_path": task.local_path,
+            "target_dir_id": task.target_dir_id,
+            "status": task.status,
+            "progress": task.progress,
+            "error": task.last_error,
+            "bucket": task.bucket,
+            "storage_node": task.storage_node,
+            "upload_key": task.upload_key,
+            "upload_id_s3": task.upload_id_s3,
+            "up_file_id": task.up_file_id,
+            "total_parts": task.total_parts,
+            "block_size": task.block_size,
+            "etag": task.etag,
+            "file_mtime": task.file_mtime,
+            "delete_requested": int(task.delete_requested),
+        })
+
+    def update_progress(self, task, progress):
+        if not task.db_task_id:
+            return
+        now = time.time()
+        last_p = getattr(task, "_last_db_progress", -1)
+        last_t = getattr(task, "_last_db_progress_time", 0.0)
+        if abs(progress - last_p) >= 1 or (now - last_t) > 2.0:
+            Database.instance().update_upload_task(task.db_task_id, progress=progress)
+            task._last_db_progress = progress
+            task._last_db_progress_time = now
+
+    def update_status(self, task, status, error="", delete_requested=False):
+        if not task.db_task_id:
+            return
+        Database.instance().update_upload_task(
+            task.db_task_id,
+            status=status,
+            progress=task.progress,
+            error=error,
+            delete_requested=int(delete_requested),
+        )
+
+    def update_session(self, task):
+        if not task.db_task_id:
+            return
+        Database.instance().update_upload_task(
+            task.db_task_id,
+            bucket=task.bucket,
+            storage_node=task.storage_node,
+            upload_key=task.upload_key,
+            upload_id_s3=task.upload_id_s3,
+            up_file_id=task.up_file_id,
+            total_parts=task.total_parts,
+            block_size=task.block_size,
+            etag=task.etag,
+            file_mtime=task.file_mtime,
+        )
+
+    def buffer_part(self, task, part_index, etag):
+        task._pending_upload_parts.append((part_index, etag))
+
+    def flush_parts(self, task):
+        if not task.db_task_id:
+            return
+        pending = getattr(task, "_pending_upload_parts", [])
+        if not pending:
+            return
+        task._pending_upload_parts = []
+        db = Database.instance()
+        for part_index, etag in pending:
+            db.record_upload_part(task.db_task_id, part_index, etag, commit=False)
+        db.flush()
+
+    def discard_parts(self, task):
+        task._pending_upload_parts = []
+
+    def reset_session(self, task, *, clear_progress):
+        task.bucket = ""
+        task.storage_node = ""
+        task.upload_key = ""
+        task.upload_id_s3 = ""
+        task.up_file_id = 0
+        task.total_parts = 0
+        task.block_size = get_upload_part_size()
+        task.etag = ""
+        if clear_progress:
+            task.progress = 0
+        self.discard_parts(task)
+        if not task.db_task_id:
+            return
+        db = Database.instance()
+        db.delete_upload_parts(task.db_task_id)
+        db.update_upload_task(
+            task.db_task_id,
+            bucket="",
+            storage_node="",
+            upload_key="",
+            upload_id_s3="",
+            up_file_id=0,
+            total_parts=0,
+            block_size=task.block_size,
+            etag="",
+            progress=task.progress,
+            delete_requested=int(task.delete_requested),
+        )
+
+    def delete_task(self, task):
+        task_id = task.db_task_id
+        self.discard_parts(task)
+        if not task_id:
+            return
+        Database.instance().delete_upload_task(task_id)
+        task.db_task_id = None
 
 
 class DownloadTask(TransferTask):
@@ -399,6 +525,7 @@ class TransferInterface(QWidget):
         self.download_status_filter = "全部"
         self.upload_status_filter = "全部"
         self._auto_start_suppressed = False
+        self._upload_store = _UploadTaskStore()
         self.__createTopBar()
         self.__createContent()
         self.__initWidget()
@@ -652,7 +779,14 @@ class TransferInterface(QWidget):
         db = Database.instance()
         for record in db.get_upload_tasks(account_name=self.current_account_name):
             if record["status"] in ("已完成", "已取消") or record.get("delete_requested", 0):
-                db.delete_upload_task(record["task_id"])
+                task = UploadTask(
+                    file_name=record["file_name"],
+                    file_size=record.get("file_size", 0),
+                    local_path=record["local_path"],
+                    target_dir_id=record.get("target_dir_id", 0),
+                )
+                task.db_task_id = record["task_id"]
+                self._upload_store.delete_task(task)
                 continue
             task = UploadTask(
                 file_name=record["file_name"],
@@ -666,8 +800,7 @@ class TransferInterface(QWidget):
             task.last_error = record.get("error", "")
             if task.status in UPLOAD_ACTIVE_STATUSES:
                 task.status = "已暂停"
-                if task.db_task_id:
-                    db.update_upload_task(task.db_task_id, status="已暂停")
+                self._upload_store.update_status(task, "已暂停", error=task.last_error)
             # 恢复 S3 session 字段
             task.bucket = record.get("bucket", "")
             task.storage_node = record.get("storage_node", "")
@@ -741,18 +874,7 @@ class TransferInterface(QWidget):
             if t.local_path == local_path and t.target_dir_id == target_dir_id and t.status not in ("已完成", "已取消"):
                 return t
         task = UploadTask(file_name, file_size, local_path, target_dir_id)
-        task.db_task_id = uuid.uuid4().hex
-        db = Database.instance()
-        db.save_upload_task({
-            "task_id": task.db_task_id,
-            "account_name": self.current_account_name,
-            "file_name": file_name,
-            "file_size": file_size,
-            "local_path": local_path,
-            "target_dir_id": target_dir_id,
-            "status": "等待中",
-            "delete_requested": 0,
-        })
+        self._upload_store.create_task(task, self.current_account_name)
         self.upload_tasks.append(task)
         self.__update_upload_table()
         if self.pan:
@@ -855,13 +977,18 @@ class TransferInterface(QWidget):
                 Database.instance().update_download_task(task.resume_id, progress=progress)
                 task._last_db_progress = progress
                 task._last_db_progress_time = now
-        elif isinstance(task, UploadTask) and task.db_task_id:
-            Database.instance().update_upload_task(task.db_task_id, progress=progress)
+        elif isinstance(task, UploadTask):
+            self._upload_store.update_progress(task, progress)
         self.__partial_refresh(task)
 
     def __update_task_status(self, task, status):
         task.status = status
         terminal = status in {"失败", "已完成", "已取消", "已暂停"}
+        if terminal and isinstance(task, UploadTask):
+            if status == "已取消" or task.delete_requested:
+                self._upload_store.discard_parts(task)
+            else:
+                self._upload_store.flush_parts(task)
         if terminal:
             # H7: 从线程列表中移除，防止内存泄漏
             if task.thread:
@@ -899,17 +1026,14 @@ class TransferInterface(QWidget):
                 )
         elif isinstance(task, UploadTask) and task.db_task_id:
             if task.delete_requested and terminal:
-                Database.instance().delete_upload_task(task.db_task_id)
-                task.db_task_id = None
+                self._upload_store.delete_task(task)
                 if task in self.upload_tasks:
                     self.upload_tasks.remove(task)
             else:
-                Database.instance().update_upload_task(
-                    task.db_task_id,
-                    status=status,
-                    progress=task.progress,
+                self._upload_store.update_status(
+                    task, status,
                     error=task.last_error,
-                    delete_requested=int(task.delete_requested),
+                    delete_requested=task.delete_requested,
                 )
         if isinstance(task, UploadTask):
             self.__update_upload_table()
@@ -949,6 +1073,7 @@ class TransferInterface(QWidget):
                 remaining = task.file_size - int(task.file_size * task.progress / 100) if task.file_size else 0
                 task.speed_bps = task.speed_tracker.speed()
                 task.eta_seconds = task.speed_tracker.eta(remaining)
+                self._upload_store.flush_parts(task)
                 upload_dirty.append(task)
             elif task.speed_bps != 0.0 and task.status != "已完成":
                 task.speed_bps = 0.0
@@ -998,47 +1123,17 @@ class TransferInterface(QWidget):
         task.block_size = info.get("block_size", UPLOAD_PART_SIZE)
         task.etag = info.get("etag", "")
         task.file_mtime = info.get("file_mtime", 0)
-        if task.db_task_id:
-            Database.instance().update_upload_task(
-                task.db_task_id,
-                bucket=task.bucket, storage_node=task.storage_node,
-                upload_key=task.upload_key, upload_id_s3=task.upload_id_s3,
-                up_file_id=task.up_file_id, total_parts=task.total_parts,
-                block_size=task.block_size, etag=task.etag,
-                file_mtime=task.file_mtime,
-            )
+        self._upload_store.update_session(task)
 
     def __on_upload_part_done(self, task, part_index, etag):
-        if task.db_task_id:
-            Database.instance().record_upload_part(task.db_task_id, part_index, etag, commit=False)
+        self._upload_store.buffer_part(task, part_index, etag)
+
+    def __flush_upload_parts(self, task):
+        if isinstance(task, UploadTask):
+            self._upload_store.flush_parts(task)
 
     def __reset_upload_session(self, task, *, clear_progress):
-        task.bucket = ""
-        task.storage_node = ""
-        task.upload_key = ""
-        task.upload_id_s3 = ""
-        task.up_file_id = 0
-        task.total_parts = 0
-        task.block_size = get_upload_part_size()
-        task.etag = ""
-        if clear_progress:
-            task.progress = 0
-        if task.db_task_id:
-            db = Database.instance()
-            db.delete_upload_parts(task.db_task_id)
-            db.update_upload_task(
-                task.db_task_id,
-                bucket="",
-                storage_node="",
-                upload_key="",
-                upload_id_s3="",
-                up_file_id=0,
-                total_parts=0,
-                block_size=task.block_size,
-                etag="",
-                progress=task.progress,
-                delete_requested=int(task.delete_requested),
-            )
+        self._upload_store.reset_session(task, clear_progress=clear_progress)
 
     def __partial_refresh(self, task):
         """局部刷新单个 task 的 speed/ETA/conn/percent 列。"""
@@ -1070,9 +1165,7 @@ class TransferInterface(QWidget):
                 return
             if task.status == "已完成":
                 InfoBar.success(title="上传完成", content=f"文件 '{task.file_name}' 上传成功", parent=self)
-                if task.db_task_id:
-                    Database.instance().delete_upload_task(task.db_task_id)
-                    task.db_task_id = None
+                self._upload_store.delete_task(task)
                 self.__update_upload_table()
             return
         # ---- 以下为下载逻辑 ----
@@ -1096,13 +1189,7 @@ class TransferInterface(QWidget):
         task.last_error = error
         task.status = "失败"
         InfoBar.error(title="上传失败", content=f"{task.file_name}: {error}", parent=self)
-        if task.db_task_id:
-            Database.instance().update_upload_task(
-                task.db_task_id,
-                status="失败",
-                error=error,
-                progress=task.progress,
-            )
+        self._upload_store.update_status(task, "失败", error=error)
         self.__update_upload_table()
 
     def __mark_download_failed(self, task, error, notify):
@@ -1134,8 +1221,7 @@ class TransferInterface(QWidget):
         task.status = "已暂停"
         task.active_workers = 0
         task.max_workers = 0
-        if task.db_task_id:
-            Database.instance().update_upload_task(task.db_task_id, status="已暂停")
+        self._upload_store.update_status(task, "已暂停", error=task.last_error)
         self.__update_upload_table()
 
     def __retry_upload(self, task):
@@ -1152,13 +1238,7 @@ class TransferInterface(QWidget):
         has_valid_session = bool(task.bucket and task.upload_id_s3)
         if not has_valid_session:
             self.__reset_upload_session(task, clear_progress=False)
-        if task.db_task_id:
-            Database.instance().update_upload_task(
-                task.db_task_id,
-                status="等待中",
-                error="",
-                progress=task.progress,
-            )
+        self._upload_store.update_status(task, "等待中", error="")
         self.__update_upload_table()
         self.__try_start_pending_uploads()
 
@@ -1213,16 +1293,15 @@ class TransferInterface(QWidget):
                 task.is_cancelled = True
                 task.pause_requested = False
                 task.status = "已取消"
-                if task.db_task_id:
-                    Database.instance().update_upload_task(
-                        task.db_task_id,
-                        status="已取消",
-                        delete_requested=1,
-                    )
+                self._upload_store.discard_parts(task)
+                self._upload_store.update_status(
+                    task, "已取消",
+                    error=task.last_error,
+                    delete_requested=True,
+                )
                 self.__update_upload_table()
             elif task.db_task_id:
-                Database.instance().delete_upload_task(task.db_task_id)
-                task.db_task_id = None
+                self._upload_store.delete_task(task)
                 if task in self.upload_tasks:
                     self.upload_tasks.remove(task)
                     self.__update_upload_table()
@@ -1311,18 +1390,13 @@ class TransferInterface(QWidget):
                 if task.status == "已暂停" and task.thread is None:
                     task.status = "等待中"
                     if task.db_task_id:
-                        Database.instance().update_upload_task(task.db_task_id, status="等待中")
+                        self._upload_store.update_status(
+                            task, "等待中",
+                            error=task.last_error,
+                            delete_requested=task.delete_requested,
+                        )
                     else:
-                        task.db_task_id = uuid.uuid4().hex
-                        Database.instance().save_upload_task({
-                            "task_id": task.db_task_id,
-                            "account_name": self.current_account_name,
-                            "file_name": task.file_name,
-                            "file_size": task.file_size,
-                            "local_path": task.local_path,
-                            "target_dir_id": task.target_dir_id,
-                            "status": "等待中",
-                        })
+                        self._upload_store.create_task(task, self.current_account_name)
                     count += 1
                 elif task.status == "失败" and task.thread is None:
                     self.__retry_upload(task)
