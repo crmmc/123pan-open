@@ -26,6 +26,14 @@ def get_download_part_size() -> int:
     mb = _safe_int(Database.instance().get_config("downloadPartSizeMB", 5), 5, 4, 32)
     return mb * 1024 * 1024
 
+
+def get_download_part_mode() -> str:
+    """运行时下载分片模式: auto 或 fixed。"""
+    mode = Database.instance().get_config("downloadPartMode", "auto")
+    if mode not in ("auto", "fixed"):
+        return "auto"
+    return mode
+
 CURRENT_SCHEMA_VERSION = 5
 
 _DOWNLOAD_TASK_COLUMNS = frozenset({
@@ -289,6 +297,7 @@ class Database:
             "retryMaxAttempts": 3,
             "uploadPartSizeMB": 5,
             "downloadPartSizeMB": 5,
+            "downloadPartMode": "auto",
             "logLevel": "INFO",
         }
         with self._lock:

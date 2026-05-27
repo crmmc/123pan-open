@@ -101,6 +101,7 @@ def test_download_task_records_are_isolated_by_account(tmp_path, monkeypatch):
 def test_stream_download_reuses_good_parts_and_redownloads_bad_part(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("maxDownloadThreads", 2)
+    db.set_config("downloadPartMode", "fixed")
 
     total_size = PART_SIZE + 512
     content = (b"a" * PART_SIZE) + (b"b" * 512)
@@ -143,7 +144,7 @@ def test_stream_download_reuses_good_parts_and_redownloads_bad_part(tmp_path, mo
 
     requested_ranges = []
 
-    def fake_head(url, allow_redirects=True, timeout=30):
+    def fake_head(url, headers=None, allow_redirects=True, timeout=30):
         return _MockResponse(
             headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"}
         )
@@ -182,13 +183,14 @@ def test_stream_download_reuses_good_parts_and_redownloads_bad_part(tmp_path, mo
 def test_stream_download_raises_on_final_hash_mismatch(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("maxDownloadThreads", 1)
+    db.set_config("downloadPartMode", "fixed")
 
     total_size = PART_SIZE
     content = b"z" * total_size
     out_path = tmp_path / "broken.bin"
     task = _make_resume_task(out_path, "0000000000000000deadbeef00000000")
 
-    def fake_head(url, allow_redirects=True, timeout=30):
+    def fake_head(url, headers=None, allow_redirects=True, timeout=30):
         return _MockResponse(
             headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"}
         )
@@ -245,6 +247,7 @@ def test_stream_download_failure_keeps_existing_output_when_overwriting(tmp_path
 def test_stream_download_requeues_part_after_retryable_failure(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("maxDownloadThreads", 1)
+    db.set_config("downloadPartMode", "fixed")
 
     total_size = PART_SIZE + 512
     content = (b"a" * PART_SIZE) + (b"b" * 512)
@@ -254,7 +257,7 @@ def test_stream_download_requeues_part_after_retryable_failure(tmp_path, monkeyp
     attempts = {part_retry_range: 0}
     requested_ranges = []
 
-    def fake_head(url, allow_redirects=True, timeout=30):
+    def fake_head(url, headers=None, allow_redirects=True, timeout=30):
         return _MockResponse(
             headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"}
         )
@@ -298,6 +301,7 @@ def test_stream_download_requeues_part_after_retryable_failure(tmp_path, monkeyp
 def test_stream_download_requeues_rate_limited_part(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("maxDownloadThreads", 1)
+    db.set_config("downloadPartMode", "fixed")
     monkeypatch.setattr(download_resume.time, "sleep", lambda *_args, **_kwargs: None)
 
     total_size = PART_SIZE + 512
@@ -308,7 +312,7 @@ def test_stream_download_requeues_rate_limited_part(tmp_path, monkeypatch):
     attempts = {first_range: 0}
     requested_ranges = []
 
-    def fake_head(url, allow_redirects=True, timeout=30):
+    def fake_head(url, headers=None, allow_redirects=True, timeout=30):
         return _MockResponse(
             headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"}
         )
@@ -351,6 +355,7 @@ def test_stream_download_requeues_rate_limited_part(tmp_path, monkeypatch):
 def test_stream_download_pause_then_resume_from_last_completed_part(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("maxDownloadThreads", 1)
+    db.set_config("downloadPartMode", "fixed")
 
     total_size = PART_SIZE + 512
     content = (b"a" * PART_SIZE) + (b"b" * 512)
@@ -377,7 +382,7 @@ def test_stream_download_pause_then_resume_from_last_completed_part(tmp_path, mo
                     first = False
                 yield self.body[offset: offset + chunk_size]
 
-    def fake_head(url, allow_redirects=True, timeout=30):
+    def fake_head(url, headers=None, allow_redirects=True, timeout=30):
         return _MockResponse(
             headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"}
         )
@@ -711,6 +716,108 @@ def test_download_part_writes_disk_only_after_size_validation(tmp_path, monkeypa
     assert parts[0]["part_index"] == 0
 
 
+def test_download_part_waits_when_refresh_returns_none(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "refresh-none"
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(download_resume.time, "sleep", lambda *_args, **_kwargs: None)
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+
+    part = {"index": 0, "start": 0, "end": 3, "expected_size": 4}
+    aggregator = MagicMock()
+    aggregator.record = MagicMock()
+    task = SimpleNamespace(
+        is_cancelled=False,
+        pause_requested=False,
+        _active_response=None,
+        _response_lock=threading.Lock(),
+    )
+    calls = []
+
+    def fake_get(url, **_kwargs):
+        calls.append(url)
+        if len(calls) <= 2:
+            return _MockResponse(status_code=403)
+        return _MockResponse(body=b"data", status_code=206)
+
+    refresh_results = iter([None, "https://example.test/refreshed"])
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = _download_part(
+        ["https://example.test/expired"],
+        part,
+        resume_id,
+        aggregator,
+        None,
+        4,
+        task,
+        refresh_url_fn=lambda: next(refresh_results),
+    )
+
+    assert result == "ok"
+    assert calls == [
+        "https://example.test/expired",
+        "https://example.test/expired",
+        "https://example.test/refreshed",
+    ]
+
+
+def test_download_part_sends_minimal_download_headers(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    resume_id = "download-headers"
+    monkeypatch.setattr(download_resume, "CONFIG_DIR", tmp_path)
+
+    db.save_download_task({
+        "resume_id": resume_id,
+        "account_name": "alice",
+        "file_name": "f.bin",
+        "file_id": 1,
+        "save_path": str(tmp_path / "f.bin"),
+    })
+
+    part = {"index": 0, "start": 0, "end": 3, "expected_size": 4}
+    aggregator = MagicMock()
+    aggregator.record = MagicMock()
+    task = SimpleNamespace(
+        is_cancelled=False,
+        pause_requested=False,
+        _active_response=None,
+        _response_lock=threading.Lock(),
+    )
+    seen_headers = []
+
+    def fake_get(_url, headers=None, **_kwargs):
+        seen_headers.append(headers or {})
+        return _MockResponse(body=b"data", status_code=206)
+
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    assert _download_part(
+        ["https://example.test/file"],
+        part,
+        resume_id,
+        aggregator,
+        None,
+        4,
+        task,
+    ) == "ok"
+    assert seen_headers == [{
+        "User-Agent": "123pan-open/1.0",
+        "Range": "bytes=0-3",
+    }]
+
+
 def test_single_stream_cancel_with_cleanup_deletes_download_record(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     out_path = tmp_path / "single-cancel.bin"
@@ -849,6 +956,73 @@ def test_single_stream_403_refresh_success(tmp_path, monkeypatch):
     assert out_path.read_bytes() == content
 
 
+def test_single_stream_waits_when_refresh_returns_none(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    content = b"refresh-ok"
+    out_path = tmp_path / "single-refresh-none.bin"
+    task = _make_resume_task(out_path, hashlib.md5(content).hexdigest())
+    urls = []
+    monkeypatch.setattr(download_resume.time, "sleep", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (len(content), False, False))
+
+    def fake_get(url, **_kwargs):
+        urls.append(url)
+        if len(urls) <= 2:
+            return _MockResponse(status_code=403)
+        return _MockResponse(
+            body=content,
+            status_code=200,
+            headers={"Content-Length": str(len(content))},
+        )
+
+    refresh_results = iter([None, "https://example.test/refreshed"])
+    mock_session = MagicMock()
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = stream_download_from_url(
+        "https://example.test/expired",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+        refresh_url_fn=lambda: next(refresh_results),
+    )
+
+    assert result == out_path
+    assert urls == [
+        "https://example.test/expired",
+        "https://example.test/expired",
+        "https://example.test/refreshed",
+    ]
+
+
+def test_single_stream_records_speed_by_chunk_delta(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    out_path = tmp_path / "single-speed.bin"
+    task = _make_resume_task(out_path, "")
+    content = b"abcd"
+    speed_tracker = MagicMock()
+
+    monkeypatch.setattr(download_resume, "_probe_download", lambda _url: (len(content), False, False))
+    mock_session = MagicMock()
+    mock_session.get = lambda *_args, **_kwargs: _MockResponse(
+        body=content,
+        status_code=200,
+        headers={"Content-Length": str(len(content))},
+    )
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    stream_download_from_url(
+        "https://example.test/file",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+        speed_tracker=speed_tracker,
+    )
+
+    assert [call.args[0] for call in speed_tracker.record.call_args_list] == [4]
+
+
 def test_single_stream_403_refresh_failure_raises_clear_error(tmp_path, monkeypatch):
     _use_temp_db(tmp_path, monkeypatch)
     out_path = tmp_path / "single-refresh-fail.bin"
@@ -900,8 +1074,115 @@ def test_build_parts_with_remainder():
 def test_build_parts_default_part_size(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("downloadPartSizeMB", 5)
+    db.set_config("downloadPartMode", "fixed")
     parts = _build_parts(10 * 1024 * 1024)
     assert len(parts) == 2
+
+
+def test_build_parts_auto_small_file_single_part(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("downloadPartMode", "auto")
+
+    parts = _build_parts(9 * 1024 * 1024)
+
+    assert len(parts) == 1
+    assert parts[0]["expected_size"] == 9 * 1024 * 1024
+
+
+def test_build_parts_auto_caps_large_part_size(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("downloadPartMode", "auto")
+
+    parts = _build_parts(1024 * 1024 * 1024)
+
+    assert parts[0]["expected_size"] == 32 * 1024 * 1024
+
+
+def test_verify_remote_file_false_when_size_differs(monkeypatch):
+    mock_session = MagicMock()
+    mock_session.head.return_value = _MockResponse(
+        status_code=200,
+        headers={"Content-Length": "8", "ETag": '"abc"'},
+    )
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    assert download_resume._verify_remote_file("https://example.test/file", 4, "abc") is False
+
+
+def test_verify_remote_file_allows_head_failure(monkeypatch):
+    mock_session = MagicMock()
+    mock_session.head.side_effect = download_resume.requests.Timeout()
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    assert download_resume._verify_remote_file("https://example.test/file", 4, "abc") is True
+
+
+def test_stream_download_clears_stored_parts_when_remote_head_differs(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("maxDownloadThreads", 1)
+    db.set_config("downloadPartMode", "fixed")
+
+    total_size = PART_SIZE + 512
+    content = (b"a" * PART_SIZE) + (b"b" * 512)
+    out_path = tmp_path / "remote-changed.bin"
+    task = _make_resume_task(out_path, hashlib.md5(content).hexdigest())
+    part0_path = get_part_path(task.resume_id, 0)
+    part0_path.parent.mkdir(parents=True, exist_ok=True)
+    part0_path.write_bytes(content[:PART_SIZE])
+
+    db.save_download_task({
+        "resume_id": task.resume_id,
+        "account_name": "alice",
+        "file_name": out_path.name,
+        "file_size": total_size,
+        "file_id": task.file_id,
+        "file_type": task.file_type,
+        "save_path": str(out_path),
+        "etag": task.etag,
+        "status": "失败",
+        "supports_resume": 1,
+    })
+    db.record_download_part(task.resume_id, {
+        "index": 0,
+        "start": 0,
+        "end": PART_SIZE - 1,
+        "expected_size": PART_SIZE,
+        "actual_size": PART_SIZE,
+        "md5": hashlib.md5(content[:PART_SIZE]).hexdigest(),
+    })
+
+    requested_ranges = []
+    head_calls: list[None] = []
+
+    def fake_head(_url, **_kwargs):
+        head_calls.append(None)
+        if len(head_calls) == 1:
+            return _MockResponse(headers={"Content-Length": str(total_size), "Accept-Ranges": "bytes"})
+        return _MockResponse(headers={"Content-Length": str(total_size + 1), "Accept-Ranges": "bytes"})
+
+    def fake_get(_url, headers=None, **_kwargs):
+        headers = headers or {}
+        requested_ranges.append(headers["Range"])
+        start_text, end_text = headers["Range"].split("=")[1].split("-")
+        start = int(start_text)
+        end = int(end_text)
+        return _MockResponse(body=content[start: end + 1], status_code=206)
+
+    mock_session = MagicMock()
+    mock_session.head = fake_head
+    mock_session.get = fake_get
+    monkeypatch.setattr(download_resume, "_dl_session", mock_session)
+
+    result = stream_download_from_url(
+        "https://example.test/download",
+        out_path,
+        overwrite=True,
+        resume_task=task,
+    )
+
+    assert result == out_path
+    assert f"bytes=0-{PART_SIZE - 1}" in requested_ranges
+    assert f"bytes={PART_SIZE}-{total_size - 1}" in requested_ranges
 
 
 # ---- 3b. 状态判断 ----

@@ -3,7 +3,14 @@ import sqlite3
 import pytest
 
 from src.app.common import database as database_module
-from src.app.common.database import Database, _safe_int, _safe_float, get_upload_part_size, get_download_part_size
+from src.app.common.database import (
+    Database,
+    _safe_float,
+    _safe_int,
+    get_download_part_mode,
+    get_download_part_size,
+    get_upload_part_size,
+)
 
 
 def _use_temp_db(tmp_path, monkeypatch):
@@ -21,6 +28,7 @@ def test_database_initializes_default_config(tmp_path, monkeypatch):
     assert db.get_config("defaultDownloadPath", "")
     assert db.get_config("maxDownloadThreads", None) == 1
     assert db.get_config("retryMaxAttempts", None) == 3
+    assert db.get_config("downloadPartMode", None) == "auto"
 
 
 def test_database_set_and_get_config(tmp_path, monkeypatch):
@@ -434,3 +442,17 @@ def test_get_download_part_size_reads_config(tmp_path, monkeypatch):
     db = _use_temp_db(tmp_path, monkeypatch)
     db.set_config("downloadPartSizeMB", 10)
     assert get_download_part_size() == 10 * 1024 * 1024
+
+
+def test_get_download_part_mode_reads_config(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("downloadPartMode", "fixed")
+
+    assert get_download_part_mode() == "fixed"
+
+
+def test_get_download_part_mode_defaults_invalid_to_auto(tmp_path, monkeypatch):
+    db = _use_temp_db(tmp_path, monkeypatch)
+    db.set_config("downloadPartMode", "bad")
+
+    assert get_download_part_mode() == "auto"

@@ -480,11 +480,24 @@ class DownloadThread(QThread):
                     self.conn_info = self._SignalProxy(thread.conn_info_updated)
                     self.status = self._SignalProxy(thread.status_updated)
 
+            _url_refresh_lock = threading.Lock()
+            _URL_REFRESH_COOLDOWN = 30.0
+            _last_refresh_time = [-_URL_REFRESH_COOLDOWN]
+            _last_refresh_url = [None]
+
             def _refresh_url():
-                new_url = self.pan.link_by_fileDetail(file_detail, showlink=False)
-                if isinstance(new_url, int):
-                    return None
-                return new_url
+                with _url_refresh_lock:
+                    now = time.monotonic()
+                    if now - _last_refresh_time[0] < _URL_REFRESH_COOLDOWN:
+                        return _last_refresh_url[0]
+
+                    new_url = self.pan.link_by_fileDetail(file_detail, showlink=False)
+                    _last_refresh_time[0] = time.monotonic()
+                    if isinstance(new_url, int):
+                        return None
+
+                    _last_refresh_url[0] = new_url
+                    return new_url
 
             result = _stream_download_from_url(
                 download_url, Path(self.task.save_path),

@@ -18,7 +18,7 @@ from .concurrency import (
     RATE_LIMIT_CODES, MAX_RATE_LIMITS, RATE_LIMIT_BACKOFF,
     PROGRESS_INTERVAL, slow_start_scheduler, _ProgressAggregator,
 )
-from .database import Database, get_download_part_size, _safe_int
+from .database import Database, get_download_part_mode, get_download_part_size, _safe_int
 from .log import get_logger
 
 logger = get_logger(__name__)
@@ -31,6 +31,7 @@ SINGLE_STREAM_READ_TIMEOUT = 60
 
 _dl_session = requests.Session()
 _dl_session.mount("https://", HTTPAdapter(pool_connections=4, pool_maxsize=16, max_retries=1))
+_DOWNLOAD_HEADERS = {"User-Agent": "123pan-open/1.0"}
 
 
 def build_resume_id(account_name, file_id, save_path):
@@ -174,7 +175,7 @@ def _cleanup_parts(resume_id, part_indexes):
 
 
 def _verify_completed_download(file_path, total, resume_task):
-    expected_etag = (resume_task.etag or "").strip().strip('"').lower()
+    expected_etag = _normalize_etag(resume_task.etag)
     if expected_etag and "-" not in expected_etag:
         actual_etag = _compute_md5(file_path).lower()
         if actual_etag != expected_etag:
@@ -187,12 +188,51 @@ def _verify_completed_download(file_path, total, resume_task):
         logger.info("ETag 无法作为整文件 MD5，仅执行大小校验: %s", expected_etag)
 
 
+def _normalize_etag(value):
+    return (value or "").strip().strip('"').lower()
+
+
+def _verify_remote_file(url, expected_total, expected_etag):
+    try:
+        head = _dl_session.head(
+            url, headers=_DOWNLOAD_HEADERS, allow_redirects=True, timeout=15
+        )
+        if head.status_code >= 400:
+            return True
+        remote_size = int(head.headers.get("Content-Length", 0) or 0)
+        if expected_total and remote_size and remote_size != expected_total:
+            return False
+        remote_etag = _normalize_etag(head.headers.get("ETag", ""))
+        local_etag = _normalize_etag(expected_etag)
+        if remote_etag and local_etag and remote_etag != local_etag:
+            return False
+        return True
+    except Exception:
+        return True
+
+
 # ---- part plan ----
+
+def _auto_download_part_size(total):
+    mb = 1024 * 1024
+    if total < 10 * mb:
+        return total
+    if total < 100 * mb:
+        return 8 * mb
+    if total < 512 * mb:
+        return 16 * mb
+    return 32 * mb
+
 
 def _build_parts(total, part_size=None):
     if total <= 0:
         return []
-    ps = part_size or get_download_part_size()
+    if part_size is not None:
+        ps = part_size
+    elif get_download_part_mode() == "auto":
+        ps = _auto_download_part_size(total)
+    else:
+        ps = get_download_part_size()
     part_count = math.ceil(total / ps)
     parts = []
     for index in range(part_count):
@@ -274,7 +314,7 @@ def _validate_existing_parts(resume_id, part_plan):
     return downloaded, reusable_indexes
 
 
-def _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled):
+def _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled, part_size=None):
     if not resume_task:
         return None
     db = Database.instance()
@@ -301,7 +341,7 @@ def _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled):
         "error": resume_task.last_error,
         "supports_resume": effective_supports_resume,
         "metadata_version": getattr(resume_task, "metadata_version", 2),
-        "part_size": get_download_part_size(),  # P1-9: 持久化分片大小
+        "part_size": part_size if part_size is not None else get_download_part_size(),
     }
     db.save_download_task(task_data)
     return task_data
@@ -313,7 +353,9 @@ def _probe_download(redirect_url):
     total = 0
     accept_ranges = False
     try:
-        head = _dl_session.head(redirect_url, allow_redirects=True, timeout=30)
+        head = _dl_session.head(
+            redirect_url, headers=_DOWNLOAD_HEADERS, allow_redirects=True, timeout=30
+        )
         if head.status_code in RATE_LIMIT_CODES:
             logger.debug("下载探测 HEAD 被限流: %s", head.status_code)
             return 0, False, False
@@ -328,7 +370,9 @@ def _probe_download(redirect_url):
         return 0, False, True
     except requests.RequestException:
         try:
-            with _dl_session.get(redirect_url, stream=True, timeout=30) as r:
+            with _dl_session.get(
+                redirect_url, headers=_DOWNLOAD_HEADERS, stream=True, timeout=30
+            ) as r:
                 if r.status_code in RATE_LIMIT_CODES:
                     logger.debug("下载探测 GET 被限流: %s", r.status_code)
                     return 0, False, False
@@ -355,7 +399,7 @@ def _download_part(
     end = int(part["end"])
     part_path = get_part_path(resume_id, index)
     part_path.parent.mkdir(parents=True, exist_ok=True)
-    headers = {"Range": f"bytes={start}-{end}"}
+    headers = {**_DOWNLOAD_HEADERS, "Range": f"bytes={start}-{end}"}
     queue_attempt = int(part.get("attempt", 0))
     io_chunk_size = min(IO_CHUNK_SIZE, max(8192, int(part["expected_size"] / 100) or 8192))
     max_retries = _safe_int(
@@ -385,14 +429,17 @@ def _download_part(
                         if refresh_url_fn:
                             try:
                                 new_url = refresh_url_fn()
+                                refresh_403_count += 1
+                                if refresh_403_count > max_refresh_403:
+                                    logger.warning("分片 %d 连续 %d 次 403 refresh 仍失败", index, refresh_403_count)
+                                    return "url_expired"
                                 if new_url and not isinstance(new_url, int):
                                     url_holder[0] = new_url
-                                    refresh_403_count += 1
-                                    if refresh_403_count > max_refresh_403:
-                                        logger.warning("分片 %d 连续 %d 次 403 refresh 仍失败", index, refresh_403_count)
-                                        return "url_expired"
                                     logger.debug("分片 %d URL 已刷新，重试 (%d/%d)", index, refresh_403_count, max_refresh_403)
-                                    continue
+                                else:
+                                    logger.debug("分片 %d URL 刷新冷却或失败，等待后重试 (%d/%d)", index, refresh_403_count, max_refresh_403)
+                                    time.sleep(2)
+                                continue
                             except Exception as exc:
                                 logger.warning("分片 %d 刷新 URL 失败: %s", index, exc)
                         return "url_expired"
@@ -478,7 +525,16 @@ def _download_with_resume(redirect_url, out_path, total, signals, task, resume_t
             if stored_part_size is None and stored_parts:
                 stored_part_size = stored_parts[0]["expected_size"]
     part_plan = _build_parts(total, part_size=stored_part_size)
-    _prepare_resume_metadata(out_path, total, resume_task, True)
+    effective_part_size = part_plan[0]["expected_size"] if part_plan else stored_part_size
+    _prepare_resume_metadata(out_path, total, resume_task, True, part_size=effective_part_size)
+
+    stored_parts = db.get_download_parts(resume_id)
+    if stored_parts and not _verify_remote_file(redirect_url, total, resume_task.etag):
+        logger.info("远端文件已变更，清除旧分片重新下载: %s", resume_id[:8])
+        for stored_part in stored_parts:
+            db.remove_download_part(resume_id, stored_part["part_index"])
+        cleanup_temp_dir(resume_id)
+        get_temp_dir(resume_id).mkdir(parents=True, exist_ok=True)
 
     reused_bytes, reusable_indexes = _validate_existing_parts(resume_id, part_plan)
     reusable = set(reusable_indexes)
@@ -726,19 +782,26 @@ def _download_single_stream(
     _notify_status(signals, "下载中")
     try:
         while True:
-            with _dl_session.get(current_url, stream=True, timeout=(5, SINGLE_STREAM_READ_TIMEOUT)) as response:
+            with _dl_session.get(
+                current_url,
+                headers=_DOWNLOAD_HEADERS,
+                stream=True,
+                timeout=(5, SINGLE_STREAM_READ_TIMEOUT),
+            ) as response:
                 if task is not None:
                     with task._response_lock:
                         task._active_response = response
                 if response.status_code == 403:
                     if refresh_url_fn:
+                        refresh_403_count += 1
+                        if refresh_403_count > max_refresh_403:
+                            raise RuntimeError("下载链接已过期或刷新失败")
                         new_url = refresh_url_fn()
                         if new_url and not isinstance(new_url, int):
-                            refresh_403_count += 1
-                            if refresh_403_count > max_refresh_403:
-                                raise RuntimeError("下载链接已过期或刷新失败")
                             current_url = new_url
-                            continue
+                        else:
+                            time.sleep(2)
+                        continue
                     raise RuntimeError("下载链接已过期或刷新失败")
                 if response.status_code in RATE_LIMIT_CODES:
                     raise RuntimeError("下载被限流，请稍后重试")
@@ -763,7 +826,7 @@ def _download_single_stream(
                         f.write(chunk)
                         done += len(chunk)
                         if speed_tracker:
-                            speed_tracker.record(done)
+                            speed_tracker.record(len(chunk))
                         now = time.time()
                         if now - last_t > PROGRESS_INTERVAL:
                             _notify_progress(signals, total, done)
@@ -851,7 +914,7 @@ def stream_download_from_url(
         raise ConnectionError("下载探测失败，无法连接服务器")
     multi_part_enabled = bool(accept_ranges and total and total > MIN_PARALLEL_SIZE)
 
-    if resume_task:
+    if resume_task and not multi_part_enabled:
         _prepare_resume_metadata(out_path, total, resume_task, multi_part_enabled)
 
     try:

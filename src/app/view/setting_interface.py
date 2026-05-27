@@ -180,6 +180,23 @@ class SettingInterface(ScrollArea):
         self.downloadPartSizeCard.hBoxLayout.addWidget(self.downloadPartSizeSpinBox)
         self.downloadPartSizeCard.hBoxLayout.addSpacing(16)
 
+        # 下载分片模式
+        self.downloadPartModeCard = SettingCard(
+            FIF.DOWNLOAD,
+            self.tr("下载分片模式"),
+            self.tr("自动按文件大小选择分片，或使用固定分片大小"),
+            self.musicInThisPCGroup,
+        )
+        self.downloadPartModeComboBox = ComboBox(self.downloadPartModeCard)
+        self.downloadPartModeComboBox.addItems([self.tr("自动"), self.tr("固定大小")])
+        current_part_mode = Database.instance().get_config("downloadPartMode", "auto")
+        self.downloadPartModeComboBox.setCurrentIndex(
+            1 if current_part_mode == "fixed" else 0
+        )
+        self.downloadPartModeComboBox.setFixedWidth(120)
+        self.downloadPartModeCard.hBoxLayout.addWidget(self.downloadPartModeComboBox)
+        self.downloadPartModeCard.hBoxLayout.addSpacing(16)
+
         # 上传分片大小
         self.uploadPartSizeCard = SettingCard(
             FIF.UP,
@@ -278,6 +295,7 @@ class SettingInterface(ScrollArea):
         self.musicInThisPCGroup.addSettingCard(self.concurrentUploadsCard)
         self.musicInThisPCGroup.addSettingCard(self.retryAttemptsCard)
         self.musicInThisPCGroup.addSettingCard(self.downloadPartSizeCard)
+        self.musicInThisPCGroup.addSettingCard(self.downloadPartModeCard)
         self.musicInThisPCGroup.addSettingCard(self.uploadPartSizeCard)
 
         self.personalGroup.addSettingCard(self.micaCard)
@@ -350,6 +368,10 @@ class SettingInterface(ScrollArea):
     def __onDownloadPartSizeChanged(self, value):
         Database.instance().set_config("downloadPartSizeMB", value)
 
+    def __onDownloadPartModeChanged(self, index):
+        mode = "auto" if index == 0 else "fixed"
+        Database.instance().set_config("downloadPartMode", mode)
+
     def __onUploadPartSizeChanged(self, value):
         Database.instance().set_config("uploadPartSizeMB", value)
 
@@ -393,6 +415,9 @@ class SettingInterface(ScrollArea):
         )
         self.downloadPartSizeSpinBox.valueChanged.connect(
             self.__onDownloadPartSizeChanged
+        )
+        self.downloadPartModeComboBox.currentIndexChanged.connect(
+            self.__onDownloadPartModeChanged
         )
         self.uploadPartSizeSpinBox.valueChanged.connect(
             self.__onUploadPartSizeChanged
@@ -444,6 +469,9 @@ class SettingInterface(ScrollArea):
         )
         self.downloadPartSizeSpinBox.setValue(
             _read_int_config("downloadPartSizeMB", 5, 4, 32)
+        )
+        self.downloadPartModeComboBox.setCurrentIndex(
+            1 if db.get_config("downloadPartMode", "auto") == "fixed" else 0
         )
         self.uploadPartSizeSpinBox.setValue(
             _read_int_config("uploadPartSizeMB", 5, 5, 16)

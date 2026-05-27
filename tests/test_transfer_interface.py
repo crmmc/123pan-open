@@ -1,4 +1,5 @@
 from pathlib import Path
+import threading
 from unittest.mock import MagicMock
 
 from src.app.common import database as database_module
@@ -633,6 +634,63 @@ def test_resolve_download_detail_clears_old_parts_when_remote_version_changes(tm
     assert stored is not None
     assert stored["progress"] == 0
     assert stored["etag"] == "new-etag-2"
+
+
+def test_download_thread_refresh_url_uses_cooldown_for_failure_and_success(tmp_path, monkeypatch):
+    _use_temp_db(tmp_path, monkeypatch)
+    task = DownloadTask(
+        file_name="demo.bin",
+        file_size=12,
+        file_id=1,
+        save_path=str(tmp_path / "demo.bin"),
+        account_name="alice",
+    )
+    file_detail = {
+        "FileId": task.file_id,
+        "FileName": task.file_name,
+        "Type": 0,
+        "Size": 12,
+        "Etag": "etag",
+        "S3KeyFlag": False,
+    }
+    monkeypatch.setattr(
+        "src.app.view.transfer_interface.resolve_download_file_detail",
+        lambda *_args, **_kwargs: file_detail,
+    )
+    pan = MagicMock()
+    pan.link_by_fileDetail.side_effect = [
+        "https://example.test/initial",
+        403,
+        "https://example.test/refreshed",
+    ]
+    refresh_callbacks = []
+
+    def fake_stream_download_from_url(*_args, **kwargs):
+        refresh_callbacks.append(kwargs["refresh_url_fn"])
+        return "已取消"
+
+    monkeypatch.setattr(
+        "src.app.view.transfer_interface._stream_download_from_url",
+        fake_stream_download_from_url,
+    )
+    now = [100.0]
+    monkeypatch.setattr(
+        "src.app.view.transfer_interface.time.monotonic",
+        lambda: now[0],
+    )
+
+    thread = DownloadThread(task, pan=pan)
+    thread.run()
+    refresh_url = refresh_callbacks[0]
+
+    assert refresh_url() is None
+    assert refresh_url() is None
+    assert pan.link_by_fileDetail.call_count == 2
+
+    now[0] += 31
+    assert refresh_url() == "https://example.test/refreshed"
+    assert refresh_url() == "https://example.test/refreshed"
+    assert pan.link_by_fileDetail.call_count == 3
 
 
 def test_reload_download_tasks_drops_cancelled_records(tmp_path, monkeypatch):
