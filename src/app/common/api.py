@@ -75,7 +75,7 @@ class _ProgressFileIO:
     _REPORT_SIZE = 256 * 1024
 
     def __init__(self, file_path, offset, size, callback):
-        self._f = open(file_path, "rb")  # noqa: SIM115
+        self._f = open(file_path, "rb")  # pylint: disable=consider-using-with  # noqa: SIM115
         self._f.seek(offset)
         self._size = size
         self._remaining = size

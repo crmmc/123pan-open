@@ -1353,7 +1353,8 @@ class FileInterface(QWidget):
         self._pending_signals.append(signals)
         callback_context = self.__buildAsyncContext(dir_id=target_dir_id)
 
-        def _on_folder_prepare_done(
+        # 默认参数用于闭包早绑定（规避晚绑定陷阱），非可变默认值滥用
+        def _on_folder_prepare_done(  # pylint: disable=dangerous-default-value
             folder_uploads, folder_items, created_dir_count, folder_error,
             sig=signals,
             _context=callback_context,
@@ -2218,7 +2219,7 @@ class FileInterface(QWidget):
         self._pending_signals.append(signals)
         context = self.__buildAsyncContext()
 
-        def _on_finished(info, sig=signals, ctx=context):
+        def _on_finished(info, sig=signals, ctx=context):  # pylint: disable=dangerous-default-value
             if not self.__isAsyncContextStale(ctx):
                 self.update_storage_info(info)
             if sig in self._pending_signals:

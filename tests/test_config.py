@@ -67,7 +67,7 @@ class TestAutoLoginMigration:
 
     def _create_legacy_db(self, db_path, auto_login_value):
         """创建旧版 DB（schema version 1，含 autoLogin 键）"""
-        import sqlite3, json
+        import sqlite3, json  # pylint: disable=reimported
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA user_version = 1")
         conn.execute(
@@ -114,7 +114,7 @@ class TestAutoLoginMigration:
         monkeypatch.setattr(database_module, "_get_db_path", lambda: db_path)
         Database.reset()
 
-        import sqlite3
+        import sqlite3  # pylint: disable=reimported
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA user_version = 1")
         conn.execute(
@@ -425,7 +425,7 @@ def test_reset_raises_when_commit_fails(tmp_path, monkeypatch):
     Database.reset()
 
     # 单例已被清除，重新创建
-    import src.app.common.database as db_mod
+    import src.app.common.database as db_mod  # pylint: disable=reimported
     assert db_mod._db_instance is None
 
 

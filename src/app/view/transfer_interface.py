@@ -1141,7 +1141,8 @@ class TransferInterface(QWidget):
     def __on_upload_part_done(self, task, part_index, etag):
         self._upload_store.buffer_part(task, part_index, etag)
 
-    def __flush_upload_parts(self, task):
+    # 生产路径经 _UploadTaskStore.flush_parts 间接实现；保留供测试直调
+    def __flush_upload_parts(self, task):  # pylint: disable=unused-private-member
         if isinstance(task, UploadTask):
             self._upload_store.flush_parts(task)
 

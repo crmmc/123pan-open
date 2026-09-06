@@ -242,7 +242,7 @@ def test_show_relogin_dialog_stops_old_transfers_before_switching_pan():
     assert events[1] == ("set_pan", new_pan, True)
     assert old_pan.on_token_expired is None
     assert old_pan.close.call_count == 1
-    assert new_pan.on_token_expired == window._handle_token_expired
+    assert new_pan.on_token_expired == window._handle_token_expired  # pylint: disable=comparison-with-callable
     login_dialog.deleteLater.assert_called_once()
 
 
