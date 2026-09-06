@@ -1,5 +1,6 @@
 import queue
 import threading
+import time
 from unittest.mock import MagicMock
 
 from src.app.common.concurrency import _ProgressAggregator, slow_start_scheduler
@@ -147,3 +148,229 @@ def test_slow_start_scheduler_exits_on_is_stopped():
         is_stopped_fn=lambda: True,
         notify_conn_fn=lambda active, allowed: None,
     )
+
+
+# ---- 4c. slow_start_scheduler 调度行为（伪线程串行执行，确定性覆盖） ----
+
+
+class _FakeThread:
+    """串行伪线程：start() 立即在当前线程执行 target，join() 可触发延迟动作。
+
+    用于把调度器的事件循环变成确定性顺序执行；deferred 回调模拟真实线程
+    在 join 等待窗口内收尾（如把失败分片放回队列）的竞态。
+    """
+
+    current: "_FakeThread | None" = None
+
+    def __init__(self, target, name=None, daemon=None):
+        self._target = target
+        self._deferred = None
+        self.name = name or ""
+
+    def defer_until_join(self, fn):
+        self._deferred = fn
+
+    def start(self):
+        _FakeThread.current = self
+        try:
+            self._target()
+        finally:
+            _FakeThread.current = None
+
+    def join(self, timeout=None):
+        if self._deferred is not None:
+            deferred, self._deferred = self._deferred, None
+            deferred()
+
+
+def _fake_current_name() -> str:
+    """当前伪线程名（仅在 start() 执行目标期间调用）。"""
+    current = _FakeThread.current
+    assert current is not None
+    return current.name
+
+
+def _make_serial_worker(active_workers, allowed_workers, probe_thread_name,
+                        part_queue, consumed, worker_feedback, max_workers):
+    """构造 worker_fn：probe 收到首字节后转正（allowed+1、清空 probe 槽位）。
+
+    伪线程串行执行，无真实并发，因此不持有 progress_lock。
+    """
+
+    def worker_fn():
+        active_workers[0] += 1
+        if probe_thread_name[0] == _fake_current_name():
+            probe_thread_name[0] = None
+            allowed_workers[0] = min(allowed_workers[0] + 1, max_workers)
+        try:
+            item = part_queue.get_nowait()
+        except queue.Empty:
+            item = None
+        if item is not None:
+            consumed.append(item["index"])
+        active_workers[0] -= 1
+        worker_feedback.set()
+
+    return worker_fn
+
+
+def _run_scheduler(**kwargs):
+    defaults = {
+        "max_workers": 4,
+        "progress_lock": threading.Lock(),
+        "active_workers": [0],
+        "allowed_workers": [1],
+        "failed": [False],
+        "probe_thread_name": [None],
+        "worker_feedback": threading.Event(),
+        "is_stopped_fn": lambda: False,
+        "notify_conn_fn": lambda active, allowed: None,
+    }
+    defaults.update(kwargs)
+    slow_start_scheduler(**defaults)
+
+
+def test_slow_start_scheduler_spawns_workers_and_replaces_probe(monkeypatch):
+    """57-66 补充 normal worker；68-82 探测转正后启动新 probe。"""
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    part_queue: queue.Queue[dict] = queue.Queue()
+    for index in range(4):
+        part_queue.put({"index": index})
+    active_workers = [0]
+    allowed_workers = [1]
+    probe_thread_name = [None]
+    worker_feedback = threading.Event()
+    consumed: list[int] = []
+
+    _run_scheduler(
+        worker_fn=_make_serial_worker(
+            active_workers, allowed_workers, probe_thread_name,
+            part_queue, consumed, worker_feedback, 4,
+        ),
+        part_queue=part_queue,
+        active_workers=active_workers,
+        allowed_workers=allowed_workers,
+        probe_thread_name=probe_thread_name,
+        worker_feedback=worker_feedback,
+    )
+
+    assert sorted(consumed) == [0, 1, 2, 3]
+    assert part_queue.empty()
+    assert active_workers[0] == 0
+
+
+def test_slow_start_scheduler_safety_net_restarts_worker_as_probe(monkeypatch):
+    """89-100 行：无活跃 worker 但队列非空时安全网补位，并接管 probe 角色。"""
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    part_queue: queue.Queue[dict] = queue.Queue()
+    for index in range(5):
+        part_queue.put({"index": index})
+    active_workers = [0]
+    allowed_workers = [1]
+    probe_thread_name = [None]
+    worker_feedback = threading.Event()
+    consumed: list[int] = []
+
+    _run_scheduler(
+        worker_fn=_make_serial_worker(
+            active_workers, allowed_workers, probe_thread_name,
+            part_queue, consumed, worker_feedback, 4,
+        ),
+        part_queue=part_queue,
+        active_workers=active_workers,
+        allowed_workers=allowed_workers,
+        probe_thread_name=probe_thread_name,
+        worker_feedback=worker_feedback,
+    )
+
+    assert sorted(consumed) == [0, 1, 2, 3, 4]
+    assert part_queue.empty()
+    assert active_workers[0] == 0
+    assert allowed_workers[0] == 4
+
+
+def test_slow_start_scheduler_resumes_after_part_requeued_during_join(monkeypatch):
+    """102-113 行：join 期间 worker 把失败分片放回队列 → 重新调度而非退出。"""
+    monkeypatch.setattr(threading, "Thread", _FakeThread)
+    part_queue: queue.Queue[dict] = queue.Queue()
+    for index in range(2):
+        part_queue.put({"index": index})
+    active_workers = [0]
+    allowed_workers = [1]
+    probe_thread_name = [None]
+    worker_feedback = threading.Event()
+    consumed = []
+
+    def worker_fn():
+        active_workers[0] += 1
+        current_name = _fake_current_name()
+        is_probe = probe_thread_name[0] == current_name
+        if is_probe:
+            probe_thread_name[0] = None
+            allowed_workers[0] = min(allowed_workers[0] + 1, 4)
+        item = part_queue.get_nowait()
+        consumed.append(item["index"])
+        active_workers[0] -= 1
+        worker_feedback.set()
+        if is_probe and not item.get("requeued"):
+            # 模拟 probe 收尾失败：延迟到调度器 join 时才把分片放回队列
+            thread = _FakeThread.current
+            assert thread is not None
+            thread.defer_until_join(
+                lambda: part_queue.put({"index": item["index"], "requeued": True})
+            )
+
+    _run_scheduler(
+        worker_fn=worker_fn,
+        part_queue=part_queue,
+        active_workers=active_workers,
+        allowed_workers=allowed_workers,
+        probe_thread_name=probe_thread_name,
+        worker_feedback=worker_feedback,
+    )
+
+    assert sorted(consumed) == [0, 0, 1]
+    assert part_queue.empty()
+    assert active_workers[0] == 0
+
+
+# ---- 4d. _ProgressAggregator 批量排空与竞态防御 ----
+
+
+class _RacyEmptyQueue(queue.Queue):
+    """empty() 永远返回 False，模拟多线程排空竞态，覆盖 except Empty 分支。"""
+
+    def empty(self):
+        return False
+
+
+def test_aggregator_emit_final_tolerates_empty_race():
+    """161-162 行：排空中 get_nowait 抛 Empty 时安全退出。"""
+    signals = MagicMock()
+    agg = _ProgressAggregator(1000, None, signals, 0.1)
+    agg._queue = _RacyEmptyQueue()
+    agg.record(250)
+
+    agg.emit_final()
+
+    assert agg.cumulative == 250
+    signals.progress.emit.assert_called_once_with(25)
+
+
+def test_aggregator_run_records_speed_and_emits_progress():
+    """179-180 / 184 / 188 行：_run 批量排空、上报速度并按间隔发射进度。"""
+    tracker = MagicMock()
+    signals = MagicMock()
+    agg = _ProgressAggregator(1000, tracker, signals, 0.0)
+    agg._queue = _RacyEmptyQueue()
+    agg.record(100)
+
+    agg.start()
+    deadline = time.monotonic() + 2
+    while agg.cumulative != 100 and time.monotonic() < deadline:
+        time.sleep(0.005)
+    agg.stop()
+
+    assert agg.cumulative == 100
+    tracker.record.assert_called_once_with(100)
+    signals.progress.emit.assert_called_once_with(10)

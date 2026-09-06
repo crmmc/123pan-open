@@ -28,10 +28,10 @@ def _trim_utf8_name(name: str, max_bytes: int) -> str:
         if stem:
             stem = stem[:-1]
             continue
-        if ext:
+        if ext:  # pragma: no cover - 防御性分支：pathlib 语义下 stem 为空则 ext 必为空，此组合不可达
             ext = ext[:-1]
             continue
-        break
+        break  # pragma: no cover - 防御性兜底：stem/ext 均为空时 0 字节不可能超过 max_bytes
     trimmed = stem + ext
     return trimmed or "_unnamed"
 

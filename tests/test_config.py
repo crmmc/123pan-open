@@ -1,9 +1,17 @@
+import importlib
+import os
 import sqlite3
+import sys
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 
+from src.app.common import config as config_module
 from src.app.common import database as database_module
 from src.app.common.database import (
+    CURRENT_SCHEMA_VERSION,
     Database,
     _safe_float,
     _safe_int,
@@ -456,3 +464,266 @@ def test_get_download_part_mode_defaults_invalid_to_auto(tmp_path, monkeypatch):
     db.set_config("downloadPartMode", "bad")
 
     assert get_download_part_mode() == "auto"
+
+
+# ---- 1g. update_*_task 入参守卫 ----
+
+
+def test_update_download_task_noop_without_fields(temp_db):
+    temp_db.update_download_task("no-such-id")  # 无字段时直接返回，不抛异常
+
+
+def test_update_download_task_rejects_unknown_columns(temp_db):
+    with pytest.raises(ValueError, match="Unknown download task columns"):
+        temp_db.update_download_task("rid", not_a_column=1)
+
+
+def test_update_upload_task_noop_without_fields(temp_db):
+    temp_db.update_upload_task("no-such-id")
+
+
+def test_update_upload_task_rejects_unknown_columns(temp_db):
+    with pytest.raises(ValueError, match="Unknown upload task columns"):
+        temp_db.update_upload_task("tid", not_a_column=1)
+
+
+# ---- 1h. get_config / get_all_config 对非法 JSON 的防御 ----
+
+
+def test_get_config_returns_default_for_invalid_json(temp_db):
+    temp_db._conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES ('bad', 'not-json')"
+    )
+    temp_db._conn.commit()
+
+    assert temp_db.get_config("bad", "fallback") == "fallback"
+
+
+def test_get_all_config_skips_invalid_json_rows(temp_db):
+    temp_db.set_config("good", 1)
+    temp_db._conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES ('bad', '{oops')"
+    )
+    temp_db._conn.commit()
+
+    result = temp_db.get_all_config()
+
+    assert result["good"] == 1
+    assert "bad" not in result
+
+
+# ---- 1i. _get_db_path / reset / closed 防御 ----
+
+
+def test_get_db_path_creates_config_dir(tmp_path, monkeypatch):
+    target_dir = tmp_path / "cfg"
+    monkeypatch.setattr(config_module, "CONFIG_DIR", target_dir)
+
+    path = database_module._get_db_path()
+
+    assert path == target_dir / "123pan-open.db"
+    assert target_dir.exists()
+
+
+def test_reset_swallows_close_failure(tmp_path, monkeypatch):
+    """141-142 行：conn.close() 抛异常时 reset() 仍清除单例且不抛出。"""
+    db = _use_temp_db(tmp_path, monkeypatch)
+
+    class _CloseFailingConn:
+        def commit(self):
+            return None
+
+        def close(self):
+            raise sqlite3.OperationalError("close failed")
+
+    db._conn = _CloseFailingConn()
+
+    Database.reset()
+
+    assert database_module._db_instance is None
+
+
+def test_config_access_after_reset_raises(tmp_path, monkeypatch):
+    """146 行：reset 后旧实例上的操作应抛 RuntimeError。"""
+    db = _use_temp_db(tmp_path, monkeypatch)
+
+    Database.reset()  # 旧实例被标记为 closed
+
+    with pytest.raises(RuntimeError, match="Database connection is closed"):
+        db.get_config("rememberPassword", None)
+
+
+# ---- 1j. _migrate 补列与回滚 ----
+
+
+def test_migrate_maps_invalid_auto_login_json_to_false(tmp_path, monkeypatch):
+    """237-238 行：autoLogin 值不是合法 JSON 时按 False 迁移。"""
+    db_path = tmp_path / "123pan-open.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "CREATE TABLE config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO config (key, value) VALUES ('autoLogin', 'not-json')")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(database_module, "_get_db_path", lambda: db_path)
+    Database.reset()
+    db = Database.instance()
+
+    assert db.get_config("rememberPassword", None) is False
+    assert db.get_config("stayLoggedIn", None) is True
+
+
+def test_migrate_adds_missing_columns_from_v2_schema(tmp_path, monkeypatch):
+    """254/264 行：v2 旧库缺 delete_requested / file_mtime / part_size 时补列。"""
+    db_path = tmp_path / "123pan-open.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA user_version = 2")
+    conn.execute(
+        "CREATE TABLE config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE upload_tasks ("
+        "account_name TEXT NOT NULL DEFAULT '', "
+        "task_id TEXT PRIMARY KEY, file_name TEXT NOT NULL, local_path TEXT NOT NULL)"
+    )
+    conn.execute(
+        "CREATE TABLE download_tasks ("
+        "account_name TEXT NOT NULL DEFAULT '', "
+        "resume_id TEXT PRIMARY KEY, file_name TEXT NOT NULL, save_path TEXT NOT NULL)"
+    )
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(database_module, "_get_db_path", lambda: db_path)
+    Database.reset()
+    db = Database.instance()
+
+    upload_cols = {
+        row[1] for row in db._conn.execute("PRAGMA table_info(upload_tasks)").fetchall()
+    }
+    assert {"delete_requested", "file_mtime"} <= upload_cols
+    download_cols = {
+        row[1]
+        for row in db._conn.execute("PRAGMA table_info(download_tasks)").fetchall()
+    }
+    assert "part_size" in download_cols
+    assert db._conn.execute("PRAGMA user_version").fetchone()[0] == CURRENT_SCHEMA_VERSION
+
+
+class _MigrationBoomConn:
+    """代理真实连接：仅在写入 user_version 的 PRAGMA 上抛错，触发 _migrate 回滚。"""
+
+    def __init__(self, real_conn):
+        self._real = real_conn
+
+    def execute(self, sql, *args, **kwargs):
+        if sql.startswith("PRAGMA user_version ="):
+            raise sqlite3.OperationalError("simulated migration failure")
+        return self._real.execute(sql, *args, **kwargs)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+def test_migrate_rolls_back_and_reraises_on_failure(tmp_path, monkeypatch):
+    """282-284 行：迁移中途失败时回滚事务并向上抛出。"""
+    db_path = tmp_path / "123pan-open.db"
+    conn = sqlite3.connect(str(db_path))
+    conn.execute("PRAGMA user_version = 1")
+    conn.execute(
+        "CREATE TABLE config (key TEXT PRIMARY KEY NOT NULL, value TEXT NOT NULL)"
+    )
+    conn.execute("INSERT INTO config (key, value) VALUES ('autoLogin', 'true')")
+    conn.commit()
+    conn.close()
+
+    monkeypatch.setattr(database_module, "_get_db_path", lambda: db_path)
+    real_connect = sqlite3.connect
+
+    def _connect(path, *args, **kwargs):
+        return _MigrationBoomConn(real_connect(path, *args, **kwargs))
+
+    monkeypatch.setattr(database_module.sqlite3, "connect", _connect)
+    Database.reset()
+
+    with pytest.raises(sqlite3.OperationalError):
+        Database.instance()
+
+    assert database_module._db_instance is None
+    # 回滚校验：user_version 与 autoLogin 保持原样，迁移产物不存在
+    raw = real_connect(str(db_path))
+    assert raw.execute("PRAGMA user_version").fetchone()[0] == 1
+    assert (
+        raw.execute("SELECT value FROM config WHERE key = 'autoLogin'").fetchone()[0]
+        == "true"
+    )
+    assert (
+        raw.execute(
+            "SELECT COUNT(*) FROM config WHERE key = 'rememberPassword'"
+        ).fetchone()[0]
+        == 0
+    )
+    raw.close()
+
+
+# ---- 1k. config.py：isWin11 与 CONFIG_DIR 平台分支 ----
+
+
+@pytest.mark.parametrize(
+    ("platform_name", "win_build", "expected"),
+    [
+        ("darwin", None, False),
+        ("win32", 22631, True),
+        ("win32", 19045, False),
+        ("win32", None, False),  # getwindowsversion 缺失 → AttributeError 防御分支
+    ],
+)
+def test_is_win11_build_matrix(monkeypatch, platform_name, win_build, expected):
+    monkeypatch.setattr(sys, "platform", platform_name)
+    if win_build is None:
+        monkeypatch.delattr(sys, "getwindowsversion", raising=False)
+    else:
+        monkeypatch.setattr(
+            sys, "getwindowsversion", lambda: SimpleNamespace(build=win_build),
+            raising=False,
+        )
+
+    assert config_module.isWin11() is expected
+
+
+def test_config_dir_windows_uses_appdata(tmp_path):
+    """18 行：Windows 下 CONFIG_DIR 取 APPDATA。"""
+    original = config_module.CONFIG_DIR
+    with patch.object(config_module.platform, "system", return_value="Windows"), \
+         patch.dict(os.environ, {"APPDATA": str(tmp_path / "roaming")}):
+        module = importlib.reload(config_module)
+        assert module.CONFIG_DIR == Path(tmp_path / "roaming") / "123pan-open"
+    importlib.reload(config_module)  # 恢复当前平台分支
+    assert config_module.CONFIG_DIR == original
+
+
+def test_config_dir_linux_uses_xdg(tmp_path):
+    """25-26 行：Linux 下优先 XDG_CONFIG_HOME。"""
+    original = config_module.CONFIG_DIR
+    xdg_dir = tmp_path / "xdg"
+    with patch.object(config_module.platform, "system", return_value="Linux"), \
+         patch.dict(os.environ, {"XDG_CONFIG_HOME": str(xdg_dir)}):
+        module = importlib.reload(config_module)
+        assert module.CONFIG_DIR == xdg_dir / "123pan-open"
+    importlib.reload(config_module)
+    assert config_module.CONFIG_DIR == original
+
+
+def test_config_dir_linux_falls_back_to_home():
+    """26 行：无 XDG_CONFIG_HOME 时回退 ~/.config。"""
+    original = config_module.CONFIG_DIR
+    with patch.object(config_module.platform, "system", return_value="Linux"), \
+         patch.dict(os.environ):
+        os.environ.pop("XDG_CONFIG_HOME", None)
+        module = importlib.reload(config_module)
+        assert module.CONFIG_DIR == Path.home() / ".config" / "123pan-open"
+    importlib.reload(config_module)
+    assert config_module.CONFIG_DIR == original

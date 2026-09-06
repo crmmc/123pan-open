@@ -139,3 +139,31 @@ def test_reset_clears_all_state():
     assert tracker._ema_speed == 0.0
     assert tracker._last_time is None
     assert tracker._last_cumulative == 0
+
+
+def test_resume_refreshes_time_base_and_keeps_ema_speed():
+    """81-85 行：暂停恢复后仅重置时间基准，EMA 速度保留。"""
+    tracker = SpeedTracker()
+    with patch("src.app.common.speed_tracker.time.monotonic", return_value=100.0):
+        tracker.record(100)
+    with patch("src.app.common.speed_tracker.time.monotonic", return_value=101.0):
+        tracker.record(200)
+    speed_before = tracker.speed()
+    assert speed_before > 0
+
+    with patch("src.app.common.speed_tracker.time.monotonic", return_value=500.0):
+        tracker.resume()
+
+    assert tracker._last_time == 500.0
+    assert tracker.speed() == speed_before
+
+
+def test_resume_skipped_when_not_initialized():
+    """84 行：未初始化时 resume 不设置时间基准。"""
+    tracker = SpeedTracker()
+
+    with patch("src.app.common.speed_tracker.time.monotonic", return_value=100.0):
+        tracker.resume()
+
+    assert tracker._last_time is None
+    assert tracker._initialized is False

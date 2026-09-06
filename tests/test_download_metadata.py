@@ -181,3 +181,29 @@ def test_snapshot_restore_roundtrip():
     assert pan.file_page == 7
     assert pan.all_file is True
     assert pan.total == 99
+
+
+# ---- 2e. resolve 错误路径 ----
+
+
+class _FailingDirPan(_FakePan):
+    """get_dir_by_id 返回非 0 返回码。"""
+
+    def get_dir_by_id(self, file_id, all=False, limit=100):
+        return 2, []
+
+
+def test_resolve_download_file_detail_raises_when_directory_code_nonzero():
+    """64 行：目录接口返回码非 0 时抛 DownloadMetadataError。"""
+    pan = _FailingDirPan()
+
+    with pytest.raises(DownloadMetadataError, match="返回码"):
+        resolve_download_file_detail(pan, 1, current_dir_id=3)
+
+
+def test_resolve_download_file_detail_raises_when_file_not_found():
+    """86 行：所有候选目录都找不到目标文件时抛 MISSING 错误。"""
+    pan = _FakePan(directory_items={})
+
+    with pytest.raises(DownloadMetadataError, match="无法获取文件的原始元数据"):
+        resolve_download_file_detail(pan, 404, current_dir_id=0)

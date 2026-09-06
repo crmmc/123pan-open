@@ -1768,7 +1768,7 @@ class Pan123:
             raise RuntimeError(
                 "上传完成确认失败: " + json.dumps(cr, ensure_ascii=False)
             )
-        return up_file_id
+        return up_file_id  # pragma: no cover — 防御性兜底：range(5) 末轮必 return/raise，此行不可达
 
 
 # ==================== 工具函数和任务管理模块 ====================
