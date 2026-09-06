@@ -14,6 +14,7 @@ try:
     _use_keyring = True
 except Exception:
     _use_keyring = False
+    logger.info("keyring 不可用，凭证将存储在 SQLite 中")
 
 
 def _db_save(key: str, value: str) -> None:
@@ -31,43 +32,34 @@ def _db_delete(key: str) -> None:
     Database.instance().set_config(f"_cred_{key}", "")
 
 
-if _use_keyring:
-    def save_credential(key: str, value: str) -> None:
-        if value:
-            try:
-                keyring.set_password(_SERVICE_NAME, key, value)
-            except Exception:
-                logger.warning("keyring 写入 %s 失败，回退到 SQLite", key)
-                _db_save(key, value)
-        else:
-            delete_credential(key)
+def save_credential(key: str, value: str) -> None:
+    if not value:
+        delete_credential(key)
+        return
+    if _use_keyring:
+        try:
+            keyring.set_password(_SERVICE_NAME, key, value)
+            return
+        except Exception:
+            logger.warning("keyring 写入 %s 失败，回退到 SQLite", key)
+    _db_save(key, value)
 
-    def load_credential(key: str) -> str:
+
+def load_credential(key: str) -> str:
+    if _use_keyring:
         try:
             val = keyring.get_password(_SERVICE_NAME, key) or ""
             if val:
                 return val
         except Exception:
             logger.warning("keyring 读取 %s 失败，回退到 SQLite", key)
-        return _db_load(key)
+    return _db_load(key)
 
-    def delete_credential(key: str) -> None:
+
+def delete_credential(key: str) -> None:
+    if _use_keyring:
         try:
             keyring.delete_password(_SERVICE_NAME, key)
         except Exception:
             pass
-        _db_delete(key)
-else:
-    logger.info("keyring 不可用，凭证将存储在 SQLite 中")
-
-    def save_credential(key: str, value: str) -> None:
-        if value:
-            _db_save(key, value)
-        else:
-            delete_credential(key)
-
-    def load_credential(key: str) -> str:
-        return _db_load(key)
-
-    def delete_credential(key: str) -> None:
-        _db_delete(key)
+    _db_delete(key)

@@ -21,11 +21,12 @@ def test_db_load_missing_key_returns_empty_string(temp_db):
     assert credential_store._db_load("missing") == ""
 
 
-# ---- keyring 分支（本机导入时探测成功，走 if _use_keyring 定义） ----
+# ---- keyring 分支（显式置 _use_keyring=True，平台无关） ----
 
 
 def test_save_credential_writes_keyring(monkeypatch):
     kr = MagicMock()
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
 
     credential_store.save_credential("token", "v")
@@ -36,6 +37,7 @@ def test_save_credential_writes_keyring(monkeypatch):
 def test_save_credential_empty_value_deletes(temp_db, monkeypatch):
     """43 行：空值等价于删除（keyring + SQLite 双清）。"""
     kr = MagicMock()
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
     credential_store._db_save("token", "old")
 
@@ -49,6 +51,7 @@ def test_save_credential_falls_back_to_db_on_keyring_error(temp_db, monkeypatch)
     """39-41 行：keyring 写入失败时回退 SQLite。"""
     kr = MagicMock()
     kr.set_password.side_effect = RuntimeError("keyring broken")
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
 
     credential_store.save_credential("token", "v")
@@ -59,6 +62,7 @@ def test_save_credential_falls_back_to_db_on_keyring_error(temp_db, monkeypatch)
 def test_load_credential_returns_keyring_value(monkeypatch):
     kr = MagicMock()
     kr.get_password.return_value = "from-keyring"
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
 
     assert credential_store.load_credential("token") == "from-keyring"
@@ -68,6 +72,7 @@ def test_load_credential_falls_back_to_db_on_keyring_error(temp_db, monkeypatch)
     """50-52 行：keyring 读取抛异常时回退 SQLite。"""
     kr = MagicMock()
     kr.get_password.side_effect = RuntimeError("keyring broken")
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
     credential_store._db_save("token", "from-db")
 
@@ -78,6 +83,7 @@ def test_load_credential_falls_back_to_db_when_keyring_empty(temp_db, monkeypatc
     """48-49 行：keyring 返回空时继续查 SQLite。"""
     kr = MagicMock()
     kr.get_password.return_value = None
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
     credential_store._db_save("token", "from-db")
 
@@ -88,6 +94,7 @@ def test_delete_credential_swallows_keyring_error(temp_db, monkeypatch):
     """57-58 行：keyring 删除失败不影响 SQLite 清理。"""
     kr = MagicMock()
     kr.delete_password.side_effect = RuntimeError("keyring broken")
+    monkeypatch.setattr(credential_store, "_use_keyring", True)
     monkeypatch.setattr(credential_store, "keyring", kr)
     credential_store._db_save("token", "v")
 
