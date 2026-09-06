@@ -67,7 +67,8 @@ def try_token_probe(db):
         _clear_saved_token()
         return None
     except Exception as exc:
-        logger.warning("Token 探测异常: %s", exc)
+        # 记录的是异常对象而非凭据；requests 异常不含 token 内容
+        logger.warning("Token 探测异常: %s", exc)  # nosemgrep: python-logger-credential-disclosure
         _clear_saved_token()
     return None
 

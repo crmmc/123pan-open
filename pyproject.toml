@@ -44,10 +44,12 @@ disable_error_code = ["attr-defined"]
 
 [tool.coverage.run]
 source = ["src/app"]
+branch = true
 
 [tool.coverage.report]
 show_missing = true
 precision = 1
+fail_under = 95
 exclude_lines = [
   "pragma: no cover",
   "if TYPE_CHECKING:",
