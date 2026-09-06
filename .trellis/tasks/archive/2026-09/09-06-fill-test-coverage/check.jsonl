@@ -1,0 +1,5 @@
+{"file": ".trellis/tasks/09-06-fill-test-coverage/research/test-conventions.md", "reason": "审查新测试是否符合存量测试约定（禁止真实网络、mock 模式、命名）"}
+{"file": ".trellis/tasks/09-06-fill-test-coverage/research/coverage-baseline.md", "reason": "对照基线核对覆盖率达标情况与 pragma 合理性"}
+{"file": ".trellis/spec/backend/index.md", "reason": "Quality Check 入口：验证命令与规范清单"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "质量红线审查（当前为模板，若有内容须遵循）"}
+{"file": ".trellis/spec/guides/cross-layer-thinking-guide.md", "reason": "跨层一致性：common 业务层与 view 界面层测试契约的一致性审查"}

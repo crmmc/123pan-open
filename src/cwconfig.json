@@ -1,0 +1,8 @@
+{
+  "indexing": {
+    "includePatterns": [
+      "src/**"
+    ],
+    "ignorePatterns": []
+  }
+}

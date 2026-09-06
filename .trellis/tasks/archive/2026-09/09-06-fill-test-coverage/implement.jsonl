@@ -1,0 +1,6 @@
+{"file": ".trellis/tasks/09-06-fill-test-coverage/research/test-conventions.md", "reason": "存量 312 测试的写法约定（mock 手法、Qt 测试模式、接缝注入、命令入口），新测试必须沿用"}
+{"file": ".trellis/tasks/09-06-fill-test-coverage/research/coverage-baseline.md", "reason": "分文件覆盖率基线与代码结构事实，确定各批次要覆盖的目标行"}
+{"file": ".trellis/spec/backend/index.md", "reason": "后端层规范入口（Pre-Development Checklist + Quality Check）"}
+{"file": ".trellis/spec/backend/quality-guidelines.md", "reason": "代码质量规范（当前为模板，若有内容须遵循）"}
+{"file": ".trellis/spec/backend/error-handling.md", "reason": "错误处理规范（测试异常路径时对齐源码的错误处理约定）"}
+{"file": ".trellis/spec/guides/code-reuse-thinking-guide.md", "reason": "复用思维指南：conftest fixture 与测试工具函数的共享化设计"}
