@@ -278,7 +278,7 @@ class Database:
                         )
                 # P2-20: 在 commit 之前写入 user_version，确保在同一事务内
                 # CURRENT_SCHEMA_VERSION 为模块内整型常量，非外部输入
-                self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")  # nosemgrep: formatted-sql-query sqlalchemy-execute-raw-query
+                self._conn.execute(f"PRAGMA user_version = {CURRENT_SCHEMA_VERSION}")  # nosemgrep
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -441,7 +441,7 @@ class Database:
         with self._lock:
             self._check_closed()
             # 列名经 _DOWNLOAD_TASK_COLUMNS 白名单校验，值全参数化
-            self._conn.execute(  # nosemgrep: sqlalchemy-execute-raw-query
+            self._conn.execute(  # nosemgrep
                 f"UPDATE download_tasks SET {set_clause} WHERE resume_id = ?",
                 values,
             )
@@ -578,7 +578,7 @@ class Database:
         with self._lock:
             self._check_closed()
             # 列名经 _UPLOAD_TASK_COLUMNS 白名单校验，值全参数化
-            self._conn.execute(  # nosemgrep: sqlalchemy-execute-raw-query
+            self._conn.execute(  # nosemgrep
                 f"UPDATE upload_tasks SET {set_clause} WHERE task_id = ?",
                 values,
             )
