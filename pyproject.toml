@@ -41,3 +41,15 @@ ignore_missing_imports = true
 [[tool.mypy.overrides]]
 module = "tests.*"
 disable_error_code = ["attr-defined"]
+
+[tool.coverage.run]
+source = ["src/app"]
+
+[tool.coverage.report]
+show_missing = true
+precision = 1
+exclude_lines = [
+  "pragma: no cover",
+  "if TYPE_CHECKING:",
+  "raise NotImplementedError",
+]

@@ -31,3 +31,20 @@ $(ARCHIVE): $(PACKAGE_INPUTS) FORCE
 	"$(SEVEN_Z)" a -t7z "$(ARCHIVE)" $(PACKAGE_INPUTS) $(PACKAGE_EXCLUDES)
 
 FORCE:
+
+# ---- Tests / quality gates ----
+# NOTE: coverage 命令必须用 `uv run python -m pytest`（本机 `uv run pytest`
+# 会解析到 Homebrew 的 pytest，加载不到 venv 的 pytest-cov）。
+.PHONY: test coverage lint mypy
+
+test:
+	uv run python -m pytest tests/ -q
+
+coverage:
+	uv run python -m pytest tests/ -q --cov=src/app --cov-report=term-missing
+
+lint:
+	bash script/lint.sh
+
+mypy:
+	bash script/mypy.sh
